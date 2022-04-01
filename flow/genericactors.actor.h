@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2018 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -80,7 +80,7 @@ Future<Optional<T>> stopAfter(Future<T> what) {
 		ret = Optional<T>(_);
 	} catch (Error& e) {
 		bool ok = e.code() == error_code_please_reboot || e.code() == error_code_please_reboot_delete ||
-		          e.code() == error_code_actor_cancelled;
+		          e.code() == error_code_actor_cancelled || e.code() == error_code_please_reboot_remote_kv_store;
 		TraceEvent(ok ? SevInfo : SevError, "StopAfterError").error(e);
 		if (!ok) {
 			fprintf(stderr, "Fatal Error: %s\n", e.what());

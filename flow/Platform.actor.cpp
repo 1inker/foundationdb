@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2018 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -33,6 +33,7 @@
 
 #if (!defined(TLS_DISABLED) && !defined(_WIN32))
 #include "flow/StreamCipher.h"
+#include "flow/BlobCipher.h"
 #endif
 #include "flow/Trace.h"
 #include "flow/Error.h"
@@ -3501,6 +3502,7 @@ void crashHandler(int sig) {
 #if (!defined(TLS_DISABLED) && !defined(_WIN32))
 	StreamCipherKey::cleanup();
 	StreamCipher::cleanup();
+	BlobCipherKeyCache::cleanup();
 #endif
 
 	fflush(stdout);
@@ -3752,6 +3754,40 @@ void fdb_probe_actor_exit(const char* name, unsigned long id, int index) {
 	FDB_TRACE_PROBE(actor_exit, name, id, index);
 }
 #endif
+
+void throwExecPathError(Error e, char path[]) {
+	Severity sev = e.code() == error_code_io_error ? SevError : SevWarnAlways;
+	TraceEvent(sev, "GetPathError").error(e).detail("Path", path);
+	throw e;
+}
+
+std::string getExecPath() {
+	char path[1024];
+	uint32_t size = sizeof(path);
+#if defined(__APPLE__)
+	if (_NSGetExecutablePath(path, &size) == 0) {
+		return std::string(path);
+	} else {
+		throwExecPathError(platform_error(), path);
+	}
+#elif defined(__linux__)
+	ssize_t len = ::readlink("/proc/self/exe", path, size);
+	if (len != -1) {
+		path[len] = '\0';
+		return std::string(path);
+	} else {
+		throwExecPathError(platform_error(), path);
+	}
+#elif defined(_WIN32)
+	auto len = GetModuleFileName(nullptr, path, size);
+	if (len != 0) {
+		return std::string(path);
+	} else {
+		throwExecPathError(platform_error(), path);
+	}
+#endif
+	return "unsupported OS";
+}
 
 void setupRunLoopProfiler() {
 #ifdef __linux__
