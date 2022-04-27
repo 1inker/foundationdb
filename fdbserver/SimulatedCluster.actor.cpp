@@ -636,7 +636,8 @@ ACTOR Future<ISimulator::KillType> simulatedFDBDRebooter(Reference<IClusterConne
 					printf("SimulatedFDBDTerminated: %s\n", e.what());
 				ASSERT(destructed ||
 				       g_simulator.getCurrentProcess() == process); // simulatedFDBD catch called on different process
-				TraceEvent(e.code() == error_code_actor_cancelled || e.code() == error_code_file_not_found || destructed
+				TraceEvent(e.code() == error_code_actor_cancelled || e.code() == error_code_file_not_found ||
+				                   e.code() == error_code_incompatible_software_version || destructed
 				               ? SevInfo
 				               : SevError,
 				           "SimulatedFDBDTerminated")
@@ -1979,8 +1980,8 @@ void setupSimulatedSystem(std::vector<Future<Void>>* systemActors,
 	TEST(useIPv6); // Use IPv6
 	TEST(!useIPv6); // Use IPv4
 
-	// Use hostname 25% of the time, unless it is disabled
-	bool useHostname = !testConfig.disableHostname && deterministicRandom()->random01() < 0.25;
+	// TODO(renxuan): Use hostname 25% of the time, unless it is disabled
+	bool useHostname = false; // !testConfig.disableHostname && deterministicRandom()->random01() < 0.25;
 	TEST(useHostname); // Use hostname
 	TEST(!useHostname); // Use IP address
 	NetworkAddressFromHostname fromHostname =
