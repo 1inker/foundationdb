@@ -32,7 +32,7 @@ public class MappedKeyValue extends KeyValue {
 	private final byte[] rangeEnd;
 	private final List<KeyValue> rangeResult;
 
-	MappedKeyValue(byte[] key, byte[] value, byte[] rangeBegin, byte[] rangeEnd, List<KeyValue> rangeResult) {
+	public MappedKeyValue(byte[] key, byte[] value, byte[] rangeBegin, byte[] rangeEnd, List<KeyValue> rangeResult) {
 		super(key, value);
 		this.rangeBegin = rangeBegin;
 		this.rangeEnd = rangeEnd;
@@ -82,6 +82,27 @@ public class MappedKeyValue extends KeyValue {
 		offset.lengths++;
 		offset.bytes += len;
 		return b;
+	}
+
+	@Override
+	public boolean equals(Object obj) {
+		if (obj == null)
+			return false;
+		if (obj == this)
+			return true;
+		if (!(obj instanceof MappedKeyValue))
+			return false;
+
+		MappedKeyValue rhs = (MappedKeyValue) obj;
+		return Arrays.equals(rangeBegin, rhs.rangeBegin) 
+				&& Arrays.equals(rangeEnd, rhs.rangeEnd)
+				&& Objects.equals(rangeResult, rhs.rangeResult);
+	}
+
+	@Override
+	public int hashCode() {
+		int hashForResult = rangeResult == null ? 0 : rangeResult.hashCode();
+		return 17 + (29 * hashForResult + 37 * Arrays.hashCode(rangeBegin) + Arrays.hashCode(rangeEnd));
 	}
 
 	@Override
