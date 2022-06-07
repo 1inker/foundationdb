@@ -134,6 +134,51 @@ jobs:
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+  test_deploy:
+    needs: [calc_ver, build_linux]
+    runs-on: ubuntu-latest
+    env:
+      RHEL_IMAGE_NAME: "registry.access.redhat.com/ubi8/ubi:latest"
+      UBUNTU_IMAGE_NAME: "ubuntu:21.10"
+
+    steps:
+      - name: Download RPMs and DEBs packages
+        uses: actions/download-artifact@v3
+        id: download_packages
+
+      - name: Echo download path
+        run: echo ${{steps.download_packages.outputs.download-path}}
+
+      - name: Display structure of downloaded files
+        run: ls -R
+        working-directory: ${{github.workspace}}
+
+      - name: Download RHEL and Ubuntu images
+        run: |
+          podman pull ${{ env.RHEL_IMAGE_NAME }}
+          podman pull ${{ env.UBUNTU_IMAGE_NAME }}
+
+      - name: Test RPMs deploy
+        shell: bash
+        run: |
+          MY_ARCH=`uname -m`
+          curr_path="${{ github.workspace }}"
+          server="foundation-server-${{ needs.calc_ver.outputs.full_ver }}.el8.${MY_ARCH}.rpm"
+          clients="packages/foundation-clients-${{ needs.calc_ver.outputs.full_ver }}.el8.${MY_ARCH}.rpm"
+          podman run --rm -v ${base_path}/${server}:/home/${server} ${{ env.RHEL_IMAGE_NAME }} /bin/bash -c "yum update && yum install -y pkgconfig && rpm -i /home/${server}" && { echo "Installation $server have to fail"; exit 1; }
+          podman run --rm -v ${base_path}/${server}:/home/${server} -v ${base_path}/${clients}:/home/${clients} ${{ env.RHEL_IMAGE_NAME }} /bin/bash -c "yum update && yum install -y pkgconfig && rpm -i /home/${server} /home/${clients}" || { echo "Installation $server and $clients have to success"; exit 2; }
+
+      - name: Test DEBs deploy
+        working-directory: ${{github.workspace}}/bld
+        shell: bash
+        run: |
+          MY_ARCH=`dpkg-architecture -q DEB_BUILD_ARCH`
+          curr_path="${{ github.workspace }}"
+          server="foundation-server-${{ needs.calc_ver.outputs.full_ver }}_${MY_ARCH}.deb"
+          clients="packages/foundation-clients-${{ needs.calc_ver.outputs.full_ver }}_${MY_ARCH}.deb"
+          podman run --rm -v ${base_path}/${server}:/home/${server} ${{ env.UBUNTU_IMAGE_NAME }} /bin/bash -c "dpkg -i /home/${server}" && { echo "Installation $server have to fail"; exit 1; }
+          podman run --rm -v ${base_path}/${server}:/home/${server} -v ${base_path}/${clients}:/home/${clients} ${{ env.UBUNTU_IMAGE_NAME }} /bin/bash -c "dpkg -i /home/${server} /home/${clients}" || { echo "Installation $server and $clients have to success"; exit 1; }
+
   release:
     needs: [calc_ver, build_linux]
     if: ${{ needs.calc_ver.outputs.release_flag == 'ON' }}
