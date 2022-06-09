@@ -169,7 +169,6 @@ jobs:
           podman run --rm -v ${curr_path}/${server}/${server}:/home/${server} -v ${curr_path}/${clients}/${clients}:/home/${clients} ${{ env.RHEL_IMAGE_NAME }} /bin/bash -c "yum update && yum install -y pkgconfig && rpm -i /home/${server} /home/${clients}" || { echo "Installation $server and $clients have to success"; exit 2; }
 
       - name: Test DEBs deploy
-        working-directory: ${{github.workspace}}/bld
         shell: bash
         run: |
           MY_ARCH=`dpkg-architecture -q DEB_BUILD_ARCH`
