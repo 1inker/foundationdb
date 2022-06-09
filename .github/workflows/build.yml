@@ -165,8 +165,8 @@ jobs:
           curr_path="${{ github.workspace }}"
           server="foundationdb-server-${{ needs.calc_ver.outputs.full_ver }}.el8.${MY_ARCH}.rpm"
           clients="foundationdb-clients-${{ needs.calc_ver.outputs.full_ver }}.el8.${MY_ARCH}.rpm"
-          podman run --rm -v ${curr_path}/${server}:/home/${server} ${{ env.RHEL_IMAGE_NAME }} /bin/bash -c "yum update && yum install -y pkgconfig && rpm -i /home/${server}" && { echo "Installation $server have to fail"; exit 1; }
-          podman run --rm -v ${curr_path}/${server}:/home/${server} -v ${curr_path}/${clients}:/home/${clients} ${{ env.RHEL_IMAGE_NAME }} /bin/bash -c "yum update && yum install -y pkgconfig && rpm -i /home/${server} /home/${clients}" || { echo "Installation $server and $clients have to success"; exit 2; }
+          podman run --rm -v ${curr_path}/${server}/${server}:/home/${server} ${{ env.RHEL_IMAGE_NAME }} /bin/bash -c "yum update && yum install -y pkgconfig && rpm -i /home/${server}" && { echo "Installation $server have to fail"; exit 1; }
+          podman run --rm -v ${curr_path}/${server}/${server}:/home/${server} -v ${curr_path}/${clients}/${clients}:/home/${clients} ${{ env.RHEL_IMAGE_NAME }} /bin/bash -c "yum update && yum install -y pkgconfig && rpm -i /home/${server} /home/${clients}" || { echo "Installation $server and $clients have to success"; exit 2; }
 
       - name: Test DEBs deploy
         working-directory: ${{github.workspace}}/bld
@@ -176,8 +176,8 @@ jobs:
           curr_path="${{ github.workspace }}"
           server="foundationdb-server-${{ needs.calc_ver.outputs.full_ver }}_${MY_ARCH}.deb"
           clients="foundationdb-clients-${{ needs.calc_ver.outputs.full_ver }}_${MY_ARCH}.deb"
-          podman run --rm -v ${curr_path}/${server}:/home/${server} ${{ env.UBUNTU_IMAGE_NAME }} /bin/bash -c "dpkg -i /home/${server}" && { echo "Installation $server have to fail"; exit 1; }
-          podman run --rm -v ${curr_path}/${server}:/home/${server} -v ${curr_path}/${clients}:/home/${clients} ${{ env.UBUNTU_IMAGE_NAME }} /bin/bash -c "dpkg -i /home/${server} /home/${clients}" || { echo "Installation $server and $clients have to success"; exit 1; }
+          podman run --rm -v ${curr_path}/${server}/${server}:/home/${server} ${{ env.UBUNTU_IMAGE_NAME }} /bin/bash -c "dpkg -i /home/${server}" && { echo "Installation $server have to fail"; exit 1; }
+          podman run --rm -v ${curr_path}/${server}/${server}:/home/${server} -v ${curr_path}/${clients}/${clients}:/home/${clients} ${{ env.UBUNTU_IMAGE_NAME }} /bin/bash -c "dpkg -i /home/${server} /home/${clients}" || { echo "Installation $server and $clients have to success"; exit 2; }
 
   release:
     needs: [calc_ver, build_linux]
