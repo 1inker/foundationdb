@@ -215,7 +215,6 @@ ACTOR Future<Void> clusterWatchDatabase(ClusterControllerData* cluster,
 	state Reference<ClusterRecoveryData> recoveryData;
 	state PromiseStream<Future<Void>> addActor;
 	state Future<Void> recoveryCore;
-	state bool recoveredDisk = false;
 
 	// SOMEDAY: If there is already a non-failed master referenced by zkMasterInfo, use that one until it fails
 	// When this someday is implemented, make sure forced failures still cause the master to be recruited again
@@ -250,24 +249,13 @@ ACTOR Future<Void> clusterWatchDatabase(ClusterControllerData* cluster,
 			dbInfo.myLocality = db->serverInfo->get().myLocality;
 			dbInfo.client = ClientDBInfo();
 			dbInfo.client.tenantMode = db->config.tenantMode;
+			dbInfo.client.clusterId = db->serverInfo->get().client.clusterId;
 
 			TraceEvent("CCWDB", cluster->id)
 			    .detail("NewMaster", dbInfo.master.id().toString())
 			    .detail("Lifetime", dbInfo.masterLifetime.toString())
 			    .detail("ChangeID", dbInfo.id);
 			db->serverInfo->set(dbInfo);
-
-			if (SERVER_KNOBS->ENABLE_ENCRYPTION && !recoveredDisk) {
-				// EKP singleton recruitment waits for 'Master/Sequencer' recruitment, execute wait for
-				// 'recoveredDiskFiles' optimization once EKP recruitment is unblocked to avoid circular dependencies
-				// with StorageServer initialization. The waiting for recoveredDiskFiles is to make sure the worker
-				// server on the same process has been registered with the new CC before recruitment.
-
-				wait(recoveredDiskFiles);
-				TraceEvent("CCWDB_RecoveredDiskFiles", cluster->id).log();
-				// Need to be done for the first once in the lifetime of ClusterController
-				recoveredDisk = true;
-			}
 
 			state Future<Void> spinDelay = delay(
 			    SERVER_KNOBS
@@ -1022,7 +1010,7 @@ void clusterRegisterMaster(ClusterControllerData* self, RegisterMasterRequest co
 	// Construct the client information
 	if (db->clientInfo->get().commitProxies != req.commitProxies ||
 	    db->clientInfo->get().grvProxies != req.grvProxies ||
-	    db->clientInfo->get().tenantMode != db->config.tenantMode) {
+	    db->clientInfo->get().tenantMode != db->config.tenantMode || db->clientInfo->get().clusterId != req.clusterId) {
 		TraceEvent("PublishNewClientInfo", self->id)
 		    .detail("Master", dbInfo.master.id())
 		    .detail("GrvProxies", db->clientInfo->get().grvProxies)
@@ -1030,7 +1018,9 @@ void clusterRegisterMaster(ClusterControllerData* self, RegisterMasterRequest co
 		    .detail("CommitProxies", db->clientInfo->get().commitProxies)
 		    .detail("ReqCPs", req.commitProxies)
 		    .detail("TenantMode", db->clientInfo->get().tenantMode.toString())
-		    .detail("ReqTenantMode", db->config.tenantMode.toString());
+		    .detail("ReqTenantMode", db->config.tenantMode.toString())
+		    .detail("ClusterId", db->clientInfo->get().clusterId)
+		    .detail("ReqClusterId", req.clusterId);
 		isChanged = true;
 		// TODO why construct a new one and not just copy the old one and change proxies + id?
 		ClientDBInfo clientInfo;
@@ -1038,6 +1028,7 @@ void clusterRegisterMaster(ClusterControllerData* self, RegisterMasterRequest co
 		clientInfo.commitProxies = req.commitProxies;
 		clientInfo.grvProxies = req.grvProxies;
 		clientInfo.tenantMode = db->config.tenantMode;
+		clientInfo.clusterId = req.clusterId;
 		db->clientInfo->set(clientInfo);
 		dbInfo.client = db->clientInfo->get();
 	}
@@ -1055,11 +1046,6 @@ void clusterRegisterMaster(ClusterControllerData* self, RegisterMasterRequest co
 	if (dbInfo.recoveryCount != req.recoveryCount) {
 		isChanged = true;
 		dbInfo.recoveryCount = req.recoveryCount;
-	}
-
-	if (dbInfo.clusterId != req.clusterId) {
-		isChanged = true;
-		dbInfo.clusterId = req.clusterId;
 	}
 
 	if (isChanged) {
@@ -1143,7 +1129,8 @@ ACTOR Future<Void> registerWorker(RegisterWorkerRequest req,
 		    .detail("ZoneId", w.locality.zoneId())
 		    .detail("DataHall", w.locality.dataHallId())
 		    .detail("PClass", req.processClass.toString())
-		    .detail("Workers", self->id_worker.size());
+		    .detail("Workers", self->id_worker.size())
+		    .detail("RecoveredDiskFiles", req.recoveredDiskFiles);
 		self->goodRecruitmentTime = lowPriorityDelay(SERVER_KNOBS->WAIT_FOR_GOOD_RECRUITMENT_DELAY);
 		self->goodRemoteRecruitmentTime = lowPriorityDelay(SERVER_KNOBS->WAIT_FOR_GOOD_REMOTE_RECRUITMENT_DELAY);
 	} else {
@@ -1155,7 +1142,8 @@ ACTOR Future<Void> registerWorker(RegisterWorkerRequest req,
 		    .detail("DataHall", w.locality.dataHallId())
 		    .detail("PClass", req.processClass.toString())
 		    .detail("Workers", self->id_worker.size())
-		    .detail("Degraded", req.degraded);
+		    .detail("Degraded", req.degraded)
+		    .detail("RecoveredDiskFiles", req.recoveredDiskFiles);
 	}
 	if (w.address() == g_network->getLocalAddress()) {
 		if (self->changingDcIds.get().first) {
@@ -1208,6 +1196,7 @@ ACTOR Future<Void> registerWorker(RegisterWorkerRequest req,
 		                                                     newProcessClass,
 		                                                     newPriorityInfo,
 		                                                     req.degraded,
+		                                                     req.recoveredDiskFiles,
 		                                                     req.issues);
 		if (!self->masterProcessId.present() &&
 		    w.locality.processId() == self->db.serverInfo->get().master.locality.processId()) {
@@ -1233,6 +1222,7 @@ ACTOR Future<Void> registerWorker(RegisterWorkerRequest req,
 		info->second.priorityInfo = newPriorityInfo;
 		info->second.initialClass = req.initialClass;
 		info->second.details.degraded = req.degraded;
+		info->second.details.recoveredDiskFiles = req.recoveredDiskFiles;
 		info->second.gen = req.generation;
 		info->second.issues = req.issues;
 
