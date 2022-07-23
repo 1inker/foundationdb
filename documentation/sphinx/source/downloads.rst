@@ -21,13 +21,13 @@ The Ubuntu packages are supported on 64-bit Ubuntu 12.04+, but beware of the Lin
 * `foundationdb-server_6.3.23-1_amd64.deb <https://github.com/apple/foundationdb/releases/download/6.3.23/foundationdb-server_6.3.23-1_amd64.deb>`_ (depends on the clients package)
 
 
-RHEL/CentOS 7
+RHEL/CentOS 8
 ---------------
 
-The RHEL/CentOS EL7 packages are supported on 64-bit RHEL/CentOS 7.x.
+The RHEL/CentOS EL8 packages are supported on 64-bit RHEL/CentOS 8.x.
 
-* `foundationdb-clients-6.3.23-1.el7.x86_64.rpm <https://github.com/apple/foundationdb/releases/download/6.3.12/foundationdb-clients-6.3.23-1.el7.x86_64.rpm>`_
-* `foundationdb-server-6.3.23-1.el7.x86_64.rpm <https://github.com/apple/foundationdb/releases/download/6.3.12/foundationdb-server-6.3.23-1.el7.x86_64.rpm>`_ (depends on the clients package)
+* `foundationdb-clients-6.3.23-1.el8.x86_64.rpm <https://github.com/apple/foundationdb/releases/download/6.3.12/foundationdb-clients-6.3.23-1.el8.x86_64.rpm>`_
+* `foundationdb-server-6.3.23-1.el8.x86_64.rpm <https://github.com/apple/foundationdb/releases/download/6.3.12/foundationdb-server-6.3.23-1.el8.x86_64.rpm>`_ (depends on the clients package)
 
 Windows
 -------

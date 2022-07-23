@@ -46,10 +46,10 @@
     foundationdb-server-|release|\ -1.el6.x86_64.rpm
 
 .. |package-rpm-clients| replace::
-    foundationdb-clients-|release|\ -1.el7.x86_64.rpm
+    foundationdb-clients-|release|\ -1.el8.x86_64.rpm
 
 .. |package-rpm-server| replace::
-    foundationdb-server-|release|\ -1.el7.x86_64.rpm
+    foundationdb-server-|release|\ -1.el8.x86_64.rpm
 
 .. |package-mac| replace::
     FoundationDB-|release|.pkg
