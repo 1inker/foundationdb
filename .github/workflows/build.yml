@@ -98,7 +98,7 @@ jobs:
     - name: Build
       working-directory: ${{github.workspace}}/bld
       shell: bash
-      run: ninja -j1 $(test 'ON' = ${{steps.vers.outputs.release_flag}} && echo "packages")
+      run: ninja -j1 $(test "ON" = "${{ steps.vers.outputs.release_flag }}" && echo "packages")
 
     #- name: Minimal tests
     #  working-directory: ${{github.workspace}}/bld
