@@ -41,6 +41,7 @@
 #include "fdbclient/NativeAPI.actor.h"
 #include "fdbclient/BackupAgent.actor.h"
 #include "fdbclient/versions.h"
+#include "flow/MkCert.h"
 #include "fdbrpc/WellKnownEndpoints.h"
 #include "flow/ProtocolVersion.h"
 #include "flow/network.h"
@@ -598,6 +599,9 @@ ACTOR Future<ISimulator::KillType> simulatedFDBDRebooter(Reference<IClusterConne
 				                              1,
 				                              WLTOKEN_RESERVED_COUNT,
 				                              &allowList);
+				for (const auto& p : g_simulator.authKeys) {
+					FlowTransport::transport().addPublicKey(p.first, p.second.toPublic());
+				}
 				Sim2FileSystem::newFileSystem();
 
 				std::vector<Future<Void>> futures;
@@ -1446,8 +1450,6 @@ void SimulationConfig::setStorageEngine(const TestConfig& testConfig) {
 		TraceEvent(SevWarnAlways, "RocksDBNonDeterminism")
 		    .detail("Explanation", "The Sharded RocksDB storage engine is threaded and non-deterministic");
 		noUnseed = true;
-		auto& g_knobs = IKnobCollection::getMutableGlobalKnobCollection();
-		g_knobs.setKnob("shard_encode_location_metadata", KnobValueRef::create(bool{ true }));
 		break;
 	}
 	default:
@@ -1790,7 +1792,7 @@ void SimulationConfig::setProcessesPerMachine(const TestConfig& testConfig) {
 void SimulationConfig::setTss(const TestConfig& testConfig) {
 	int tssCount = 0;
 	// TODO: Support TSS in SHARD_ENCODE_LOCATION_METADATA mode.
-	if (!testConfig.simpleConfig && !testConfig.disableTss && !CLIENT_KNOBS->SHARD_ENCODE_LOCATION_METADATA &&
+	if (!testConfig.simpleConfig && !testConfig.disableTss && !SERVER_KNOBS->SHARD_ENCODE_LOCATION_METADATA &&
 	    deterministicRandom()->random01() < 0.25) {
 		// 1 or 2 tss
 		tssCount = deterministicRandom()->randomInt(1, 3);
@@ -2391,6 +2393,10 @@ ACTOR void setupAndRun(std::string dataFolder,
 	state bool allowDefaultTenant = testConfig.allowDefaultTenant;
 	state bool allowDisablingTenants = testConfig.allowDisablingTenants;
 	state bool allowCreatingTenants = true;
+
+	if (!SERVER_KNOBS->SHARD_ENCODE_LOCATION_METADATA) {
+		testConfig.storageEngineExcludeTypes.push_back(5);
+	}
 
 	// The RocksDB storage engine does not support the restarting tests because you cannot consistently get a clean
 	// snapshot of the storage engine without a snapshotting file system.
