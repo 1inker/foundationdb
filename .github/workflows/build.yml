@@ -65,6 +65,13 @@ jobs:
     needs: [calc_ver]
 
     steps:
+    - name: Maximize build space
+      uses: easimon/maximize-build-space@master
+      with:
+        root-reserve-mb: 512
+        swap-size-mb: 1024
+        remove-dotnet: 'true'
+
     - name: Install Dependencies
       shell: bash
       run: |
@@ -76,6 +83,8 @@ jobs:
         sudo sh -c 'echo "deb https://download.mono-project.com/repo/ubuntu stable-bionic main" > /etc/apt/sources.list.d/mono-official-stable.list'
         sudo apt update
         sudo apt install -y mono-complete
+        echo "Free space:"
+        df -h
 
     - name: Checkout
       uses: actions/checkout@v2
