@@ -5,10 +5,10 @@ on:
     branches: ["ow-fork-*"]
     tags: ["*-*ow"]
 
-env:
-  GITHUB_WORKSPACE: '/home/runner/very_big_prefix_to_appese_cpack_and_build_releases/foundationdb'
-
 jobs:
+  env:
+    GITHUB_WORKSPACE: '/home/runner/very_big_prefix_to_appese_cpack_and_build_releases/foundationdb'
+
   calc_ver:
     # calculate versions from git tags
     runs-on: ubuntu-latest
