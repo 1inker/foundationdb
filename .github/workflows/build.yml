@@ -6,7 +6,7 @@ on:
     tags: ["*-*ow"]
 
 env:
-  - SRC_ADDL: 'very_big_prefix_to_appease_cpack_and_build_releases'
+  SRC_ADDL: 'very_big_prefix_to_appease_cpack_and_build_releases'
 
 jobs:
   calc_ver:
