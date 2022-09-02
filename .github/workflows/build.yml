@@ -6,7 +6,8 @@ on:
     tags: ["*-*ow"]
 
 env:
-  BUILD_DIR_PREFIX: 'very_big_prefix_to_appease_cpack_and_build_releases'
+  BUILD_DIR_SUFFIX: 'very_big_dirname_for_build_to_appease_cpack_and_build_releases'
+  SOURCE_DIR_SUFFIX: 'very_big_dirname_for_sources_to_appease_cpack_and_build_releases'
 
 jobs:
   calc_ver:
@@ -95,41 +96,43 @@ jobs:
 
     - name: Checkout
       uses: actions/checkout@v2
+      with:
+        path: ${{ env.SOURCE_DIR_SUFFIX }}
 
     - name: Create Build Environment
       # Some projects don't allow in-source building, so create a separate build directory
       # We'll use this as our working directory for all subsequent commands
-      run: cmake -E make_directory ${{github.workspace}}/${{env.BUILD_DIR_PREFIX}}
+      run: cmake -E make_directory ${{github.workspace}}/${{env.BUILD_DIR_SUFFIX}}
 
     - name: Configure CMake
       # Use a bash shell so we can use the same syntax for environment variable
       # access regardless of the host operating system
       shell: bash
-      working-directory: ${{github.workspace}}/${{env.BUILD_DIR_PREFIX}}
+      working-directory: ${{github.workspace}}/${{env.BUILD_DIR_SUFFIX}}
       # Note the current convention is to use the -S and -B options here to specify source
       # and build directories, but this is only available with CMake 3.13 and higher.
       # The CMake binaries on the Github Actions machines are (as of this writing) 3.12
-      run: cmake -D FDB_RELEASE=ON -DBUILD_VERSION=${{needs.calc_ver.outputs.build_ver}} -G Ninja ${{github.workspace}}
+      run: cmake -D FDB_RELEASE=ON -DBUILD_VERSION=${{needs.calc_ver.outputs.build_ver}} -G Ninja ${{github.workspace}}/${{env.SOURCE_DIR_SUFFIX}}
 
     - name: Build
-      working-directory: ${{github.workspace}}/${{env.BUILD_DIR_PREFIX}}
+      working-directory: ${{github.workspace}}/${{env.BUILD_DIR_SUFFIX}}
       shell: bash
       run: ninja -j 1
 
     #- name: Minimal tests
-    #  working-directory: ${{github.workspace}}/${{env.BUILD_DIR_PREFIX}}
+    #  working-directory: ${{github.workspace}}/${{env.BUILD_DIR_SUFFIX}}
     #  shell: bash
     #  run: ctest -V
 
     - name: Build RPMs
-      working-directory: ${{github.workspace}}/${{env.BUILD_DIR_PREFIX}}
+      working-directory: ${{github.workspace}}/${{env.BUILD_DIR_SUFFIX}}
       shell: bash
       run: |
         cpack -G RPM
         for fn in packages/*.rpm; do echo "$fn:"; rpm -qpRv $fn; echo; done
 
     - name: Build DEBs
-      working-directory: ${{github.workspace}}/${{env.BUILD_DIR_PREFIX}}
+      working-directory: ${{github.workspace}}/${{env.BUILD_DIR_SUFFIX}}
       shell: bash
       run: |
         cpack -G DEB
@@ -137,13 +140,13 @@ jobs:
 
     #- name: Remove versioned
     #  shell: bash
-    #  run: rm -rf ${{github.workspace}}/${{env.BUILD_DIR_PREFIX}}/packages/*${{needs.calc_ver.outputs.full_ver}}.versioned*
+    #  run: rm -rf ${{github.workspace}}/${{env.BUILD_DIR_SUFFIX}}/packages/*${{needs.calc_ver.outputs.full_ver}}.versioned*
 
     - name: Upload result
       uses: nanoufo/action-upload-artifacts-and-release-assets@v1.4
       with:
         path: |
-          ${{github.workspace}}/${{env.BUILD_DIR_PREFIX}}/packages/*${{needs.calc_ver.outputs.full_ver}}*
+          ${{github.workspace}}/${{env.BUILD_DIR_SUFFIX}}/packages/*${{needs.calc_ver.outputs.full_ver}}*
         upload-release-files: ${{ needs.calc_ver.outputs.release_flag }}
         release-upload-url: ${{ needs.calc_ver.outputs.release_upload_url }}
         if-no-files-found: error
