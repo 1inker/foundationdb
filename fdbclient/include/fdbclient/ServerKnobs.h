@@ -316,6 +316,7 @@ public:
 	int64_t ROCKSDB_MEMTABLE_BYTES;
 	bool ROCKSDB_LEVEL_STYLE_COMPACTION;
 	bool ROCKSDB_UNSAFE_AUTO_FSYNC;
+	bool ROCKSDB_MUTE_LOGS;
 	int64_t ROCKSDB_PERIODIC_COMPACTION_SECONDS;
 	int ROCKSDB_PREFIX_LEN;
 	int64_t ROCKSDB_BLOCK_CACHE_SIZE;
@@ -635,6 +636,8 @@ public:
 	// Global tag throttler forgets about throughput from a tag once no new transactions from that
 	// tag have been received for this duration (in seconds):
 	int64_t GLOBAL_TAG_THROTTLING_TAG_EXPIRE_AFTER;
+	// Maximum duration that a transaction can be tag throttled by proxy before being rejected
+	double PROXY_MAX_TAG_THROTTLE_DURATION;
 	// Interval at which latency bands are logged for each tag on grv proxy
 	double GLOBAL_TAG_THROTTLING_PROXY_LOGGING_INTERVAL;
 
