@@ -242,6 +242,8 @@ public:
 	                                                 // in the TenantCache
 	int TENANT_CACHE_STORAGE_QUOTA_REFRESH_INTERVAL; // How often the storage quota allocated to each tenant is
 	                                                 // refreshed in the TenantCache
+	int CP_FETCH_TENANTS_OVER_STORAGE_QUOTA_INTERVAL; // How often the commit proxies send requests to the data
+	                                                  // distributor to fetch the list of tenants over storage quota
 
 	// TeamRemover to remove redundant teams
 	bool TR_FLAG_DISABLE_MACHINE_TEAM_REMOVER; // disable the machineTeamRemover actor
@@ -919,6 +921,7 @@ public:
 
 	// Server request latency measurement
 	int LATENCY_SAMPLE_SIZE;
+	int FILE_LATENCY_SAMPLE_SIZE;
 	double LATENCY_METRICS_LOGGING_INTERVAL;
 
 	// Cluster recovery
@@ -964,6 +967,7 @@ public:
 	bool BG_ENABLE_READ_DRIVEN_COMPACTION;
 	int BG_RDC_BYTES_FACTOR;
 	int BG_RDC_READ_FACTOR;
+	bool BG_WRITE_MULTIPART;
 
 	int BLOB_WORKER_INITIAL_SNAPSHOT_PARALLELISM;
 	int BLOB_WORKER_RESNAPSHOT_PARALLELISM;
