@@ -19,6 +19,7 @@ add_custom_command(OUTPUT ${venv_dir}/venv_setup
           ${CMAKE_COMMAND} -E copy ${sphinx_dir}/.pip.conf ${venv_dir}/pip.conf &&
           ${activate_script} &&
           ${python_command} -m pip install --upgrade pip &&
+          ${pip_command} install --upgrade 'wheel==0.38.4' -v &&
           ${pip_command} install --upgrade 'setuptools<=57.4.0,>=20.10.0' -v &&
           ${pip_command} install --upgrade -r ${sphinx_dir}/requirements.txt -v &&
           ${pip_command} install sphinx-autobuild && # somehow this is missing in requirements.txt
