@@ -3360,7 +3360,6 @@ ACTOR Future<Optional<Value>> getValue(Reference<TransactionState> trState,
 		span.addAttribute("tenant"_sr, trState->tenant().get());
 	}
 
-	span.addAttribute("key"_sr, key);
 	trState->cx->validateVersion(ver);
 
 	loop {
@@ -4284,7 +4283,6 @@ int64_t inline getRangeResultFamilyBytes(MappedRangeResultRef result) {
 	int64_t bytes = 0;
 	for (const MappedKeyValueRef& mappedKeyValue : result) {
 		bytes += mappedKeyValue.key.size() + mappedKeyValue.value.size();
-		bytes += sizeof(mappedKeyValue.boundaryAndExist);
 		auto& reqAndResult = mappedKeyValue.reqAndResult;
 		if (std::holds_alternative<GetValueReqAndResultRef>(reqAndResult)) {
 			auto getValue = std::get<GetValueReqAndResultRef>(reqAndResult);
@@ -4751,7 +4749,7 @@ static Future<Void> tssStreamComparison(Request request,
 				}
 				when(wait(delay(sleepTime))) {
 					++tssData.metrics->tssTimeouts;
-					CODE_PROBE(true, "Got TSS timeout in stream comparison");
+					CODE_PROBE(true, "Got TSS timeout in stream comparison", probe::decoration::rare);
 				}
 			}
 		} catch (Error& e) {
@@ -4838,7 +4836,7 @@ maybeDuplicateTSSStreamFragment(Request& req, QueueModel* model, RequestStream<R
 		Optional<TSSEndpointData> tssData = model->getTssData(ssStream->getEndpoint().token.first());
 
 		if (tssData.present()) {
-			CODE_PROBE(true, "duplicating stream to TSS", probe::decoration::rare);
+			CODE_PROBE(true, "duplicating stream to TSS");
 			resetReply(req);
 			// FIXME: optimize to avoid creating new netNotifiedQueueWithAcknowledgements for each stream duplication
 			RequestStream<Request> tssRequestStream(tssData.get().endpoint);
@@ -8387,7 +8385,7 @@ ACTOR Future<Standalone<VectorRef<BlobGranuleChunkRef>>> readBlobGranulesActor(
 						if (!results.empty() && results.back().keyRange.end != chunk.keyRange.begin) {
 							ASSERT(results.back().keyRange.end > chunk.keyRange.begin);
 							ASSERT(results.back().keyRange.end <= chunk.keyRange.end);
-							CODE_PROBE(true, "Merge while reading granule range");
+							CODE_PROBE(true, "Merge while reading granule range", probe::decoration::rare);
 							while (!results.empty() && results.back().keyRange.begin >= chunk.keyRange.begin) {
 								// TODO: we can't easily un-depend the arenas for these guys, but that's ok as this
 								// should be rare
@@ -8878,7 +8876,9 @@ Reference<TransactionLogInfo> Transaction::createTrLogInfoProbabilistically(cons
 
 void Transaction::setTransactionID(UID id) {
 	ASSERT(getSize() == 0);
-	trState->spanContext = SpanContext(id, trState->spanContext.spanID);
+	trState->spanContext = SpanContext(id, trState->spanContext.spanID, trState->spanContext.m_Flags);
+	tr.spanContext = trState->spanContext;
+	span.context = trState->spanContext;
 }
 
 void Transaction::setToken(uint64_t token) {
@@ -11033,7 +11033,7 @@ int64_t getMaxReadKeySize(KeyRef const& key) {
 }
 
 int64_t getMaxWriteKeySize(KeyRef const& key, bool hasRawAccess) {
-	int64_t tenantSize = hasRawAccess ? TenantMapEntry::PREFIX_SIZE : 0;
+	int64_t tenantSize = hasRawAccess ? TenantAPI::PREFIX_SIZE : 0;
 	return key.startsWith(systemKeys.begin) ? CLIENT_KNOBS->SYSTEM_KEY_SIZE_LIMIT
 	                                        : CLIENT_KNOBS->KEY_SIZE_LIMIT + tenantSize;
 }
