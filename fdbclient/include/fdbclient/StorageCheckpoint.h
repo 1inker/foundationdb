@@ -24,6 +24,8 @@
 
 #include "fdbclient/FDBTypes.h"
 
+const std::string checkpointBytesSampleFileName = "metadata_bytes.sst";
+
 // FDB storage checkpoint format.
 enum CheckpointFormat {
 	InvalidFormat = 0,
@@ -31,6 +33,8 @@ enum CheckpointFormat {
 	DataMoveRocksCF = 1,
 	// For RocksDB, checkpoint generated via rocksdb::Checkpoint::CreateCheckpoint().
 	RocksDB = 2,
+	// Checkpoint fetched as key-value pairs.
+	RocksDBKeyValues = 3,
 };
 
 // Metadata of a FDB checkpoint.
@@ -50,6 +54,7 @@ struct CheckpointMetaData {
 	std::vector<UID> src; // Storage server(s) on which this checkpoint is created.
 	UID checkpointID; // A unique id for this checkpoint.
 	int16_t state; // CheckpointState.
+	Optional<std::string> bytesSampleFile;
 
 	// A serialized metadata associated with format, this data can be understood by the corresponding KVS.
 	Standalone<StringRef> serializedCheckpoint;
@@ -105,14 +110,16 @@ struct CheckpointMetaData {
 		                  " [Version]: " + std::to_string(version) + " [Format]: " + std::to_string(format) +
 		                  " [Server]: " + describe(src) + " [ID]: " + checkpointID.toString() +
 		                  " [State]: " + std::to_string(static_cast<int>(state)) +
-		                  (actionId.present() ? (" [Action ID]: " + actionId.get().toString()) : "");
+		                  (actionId.present() ? (" [Action ID]: " + actionId.get().toString()) : "") +
+		                  (bytesSampleFile.present() ? " [bytesSampleFile]: " + bytesSampleFile.get() : "");
 		;
 		return res;
 	}
 
 	template <class Ar>
 	void serialize(Ar& ar) {
-		serializer(ar, version, ranges, format, state, checkpointID, src, serializedCheckpoint, actionId);
+		serializer(
+		    ar, version, ranges, format, state, checkpointID, src, serializedCheckpoint, actionId, bytesSampleFile);
 	}
 };
 
@@ -158,9 +165,9 @@ struct DataMoveMetaData {
 	void setPhase(Phase phase) { this->phase = static_cast<int16_t>(phase); }
 
 	std::string toString() const {
-		std::string res = "DataMoveMetaData: [ID]: " + id.shortString() + " [Range]: " + describe(ranges) +
-		                  " [Phase]: " + std::to_string(static_cast<int>(phase)) +
-		                  " [Source Servers]: " + describe(src) + " [Destination Servers]: " + describe(dest);
+		std::string res = "DataMoveMetaData: [ID]: " + id.shortString() + ", [Range]: " + describe(ranges) +
+		                  ", [Phase]: " + std::to_string(static_cast<int>(phase)) +
+		                  ", [Source Servers]: " + describe(src) + ", [Destination Servers]: " + describe(dest);
 		return res;
 	}
 

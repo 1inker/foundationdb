@@ -22,7 +22,7 @@
 #include "boost/lexical_cast.hpp"
 
 #include "flow/IRandom.h"
-#include "fdbclient/Tracing.h"
+#include "flow/ProcessEvents.h"
 #include "fdbclient/NativeAPI.actor.h"
 #include "fdbclient/FDBTypes.h"
 #include "fdbserver/TesterInterface.actor.h"
@@ -38,6 +38,7 @@
 #include "fdbclient/ManagementAPI.actor.h"
 #include "fdbclient/StorageServerInterface.h"
 #include "flow/network.h"
+#include "fdbrpc/SimulatorProcessInfo.h"
 
 #include "flow/actorcompiler.h" // This must be the last #include.
 
@@ -45,6 +46,18 @@
 #define SevCCheckInfo SevInfo
 
 struct ConsistencyCheckWorkload : TestWorkload {
+	struct OnTimeout {
+		ConsistencyCheckWorkload& self;
+		explicit OnTimeout(ConsistencyCheckWorkload& self) : self(self) {}
+		void operator()(StringRef name, StringRef msg, Error const& e) {
+			TraceEvent(SevError, "ConsistencyCheckFailure")
+			    .error(e)
+			    .detail("EventName", name)
+			    .detail("EventMessage", msg)
+			    .log();
+		}
+	};
+
 	static constexpr auto NAME = "ConsistencyCheck";
 	// Whether or not we should perform checks that will only pass if the database is in a quiescent state
 	bool performQuiescentChecks;
@@ -98,7 +111,11 @@ struct ConsistencyCheckWorkload : TestWorkload {
 
 	Future<Void> monitorConsistencyCheckSettingsActor;
 
-	ConsistencyCheckWorkload(WorkloadContext const& wcx) : TestWorkload(wcx) {
+	OnTimeout onTimeout;
+	ProcessEvents::Event onTimeoutEvent;
+
+	ConsistencyCheckWorkload(WorkloadContext const& wcx)
+	  : TestWorkload(wcx), onTimeout(*this), onTimeoutEvent({ "Timeout"_sr, "TracedTooManyLines"_sr }, onTimeout) {
 		performQuiescentChecks = getOption(options, "performQuiescentChecks"_sr, false);
 		performCacheCheck = getOption(options, "performCacheCheck"_sr, false);
 		performTSSCheck = getOption(options, "performTSSCheck"_sr, true);
@@ -1114,9 +1131,9 @@ struct ConsistencyCheckWorkload : TestWorkload {
 					    .detail("ReliableInfo", p->getReliableInfo())
 					    .detail("KillOrRebootProcess", p->address);
 					if (p->isReliable()) {
-						g_simulator->rebootProcess(p, ISimulator::RebootProcess);
+						g_simulator->rebootProcess(p, ISimulator::KillType::RebootProcess);
 					} else {
-						g_simulator->killProcess(p, ISimulator::KillInstantly);
+						g_simulator->killProcess(p, ISimulator::KillType::KillInstantly);
 					}
 				}
 
@@ -1565,7 +1582,7 @@ struct ConsistencyCheckWorkload : TestWorkload {
 		}
 
 		// Check EncryptKeyProxy
-		if (SERVER_KNOBS->ENABLE_ENCRYPTION && db.encryptKeyProxy.present() &&
+		if (config.encryptionAtRestMode.isEncryptionEnabled() && db.encryptKeyProxy.present() &&
 		    (!nonExcludedWorkerProcessMap.count(db.encryptKeyProxy.get().address()) ||
 		     nonExcludedWorkerProcessMap[db.encryptKeyProxy.get().address()].processClass.machineClassFitness(
 		         ProcessClass::EncryptKeyProxy) > fitnessLowerBound)) {

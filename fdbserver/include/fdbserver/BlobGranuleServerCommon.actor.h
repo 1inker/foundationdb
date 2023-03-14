@@ -97,13 +97,12 @@ ACTOR Future<ForcedPurgeState> getForcePurgedState(Transaction* tr, KeyRange key
 
 // TODO: versioned like SS has?
 struct GranuleTenantData : NonCopyable, ReferenceCounted<GranuleTenantData> {
-	TenantName name;
 	TenantMapEntry entry;
 	Reference<BlobConnectionProvider> bstore;
 	Promise<Void> bstoreLoaded;
 
 	GranuleTenantData() {}
-	GranuleTenantData(TenantName name, TenantMapEntry entry) : name(name), entry(entry) {}
+	GranuleTenantData(TenantMapEntry entry) : entry(entry) {}
 
 	void updateBStore(const BlobMetadataDetailsRef& metadata) {
 		if (bstoreLoaded.canBeSet()) {
@@ -120,7 +119,7 @@ struct GranuleTenantData : NonCopyable, ReferenceCounted<GranuleTenantData> {
 // TODO: add refreshing
 struct BGTenantMap {
 public:
-	void addTenants(std::vector<std::pair<TenantName, TenantMapEntry>>);
+	void addTenants(std::vector<std::pair<int64_t, TenantMapEntry>>);
 	void removeTenants(std::vector<int64_t> tenantIds);
 
 	Optional<TenantMapEntry> getTenantById(int64_t id);
@@ -157,15 +156,39 @@ struct BlobGranuleRestoreVersion {
 // Defines a vector for BlobGranuleVersion
 typedef Standalone<VectorRef<BlobGranuleRestoreVersion>> BlobGranuleRestoreVersionVector;
 
-ACTOR Future<Void> dumpManifest(Database db, Reference<BlobConnectionProvider> blobConn, int64_t epoch, int64_t seqNo);
+ACTOR Future<int64_t> dumpManifest(Database db,
+                                   Reference<BlobConnectionProvider> blobConn,
+                                   int64_t epoch,
+                                   int64_t seqNo);
 ACTOR Future<Void> loadManifest(Database db, Reference<BlobConnectionProvider> blobConn);
 ACTOR Future<Void> printRestoreSummary(Database db, Reference<BlobConnectionProvider> blobConn);
 ACTOR Future<BlobGranuleRestoreVersionVector> listBlobGranules(Database db, Reference<BlobConnectionProvider> blobConn);
 ACTOR Future<int64_t> lastBlobEpoc(Database db, Reference<BlobConnectionProvider> blobConn);
-ACTOR Future<bool> isFullRestoreMode(Database db, KeyRangeRef range);
-ACTOR Future<Void> updateRestoreStatus(Database db, KeyRangeRef range, BlobRestoreStatus status);
-ACTOR Future<KeyRange> getRestoringRange(Database db, KeyRangeRef keys);
-ACTOR Future<Optional<BlobRestoreStatus>> getRestoreStatus(Database db, KeyRangeRef range);
+ACTOR Future<std::string> getMutationLogUrl();
+
+using BlobRestoreRangeState = std::pair<KeyRange, BlobRestoreState>;
+class BlobRestoreController : public ReferenceCounted<BlobRestoreController> {
+public:
+	BlobRestoreController() {}
+	BlobRestoreController(Database db, KeyRangeRef range) : db_(db), range_(range) {}
+
+	ACTOR static Future<bool> isRestoring(Reference<BlobRestoreController> self);
+	ACTOR static Future<Optional<BlobRestoreState>> getState(Reference<BlobRestoreController> self);
+	ACTOR static Future<Optional<BlobRestoreArg>> getArgument(Reference<BlobRestoreController> self);
+	ACTOR static Future<Version> getTargetVersion(Reference<BlobRestoreController> self, Version defaultVersion);
+	ACTOR static Future<BlobRestoreRangeState> getRangeState(Reference<BlobRestoreController> self);
+	ACTOR static Future<Void> updateState(Reference<BlobRestoreController> self,
+	                                      Standalone<BlobRestoreState> newStatus,
+	                                      Optional<BlobRestorePhase> expectedPhase);
+	ACTOR static Future<Void> updateState(Reference<BlobRestoreController> self,
+	                                      BlobRestorePhase newPhase,
+	                                      Optional<BlobRestorePhase> expectedPhase);
+	ACTOR static Future<Void> updateError(Reference<BlobRestoreController> self, Standalone<StringRef> errorMessage);
+
+private:
+	Database db_;
+	Standalone<KeyRangeRef> range_;
+};
 #include "flow/unactorcompiler.h"
 
 #endif
