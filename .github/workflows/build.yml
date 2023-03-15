@@ -307,7 +307,7 @@ jobs:
           queries: +security-and-quality
 
       - name: Configurre & build
-                shell: bash
+        shell: bash
         run: |
           sudo apt update
           sudo DEBIAN_FRONTEND=noninteractive apt install -y sudo git cmake g++ build-essential libssl-dev default-jdk python3 python3-pip liblz4-dev ninja-build rpm clang-10 clang python3-venv
