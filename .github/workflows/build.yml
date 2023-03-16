@@ -320,7 +320,7 @@ jobs:
           cmake -E make_directory ${{github.workspace}}/bld
           cd ${{github.workspace}}/bld
           CC=clang-15 CXX=clang++-15 cmake -DFDB_RELEASE=${{needs.calc_ver.outputs.release_flag}} -DBUILD_VERSION=${{needs.calc_ver.outputs.build_ver}} -DGENERATE_DEBUG_PACKAGES=OFF -DUSE_LIBCXX=OFF -DSTATIC_LINK_LIBCXX=ON -DENABLE_SIMULATION_TESTS=ON -G Ninja ${{github.workspace}}
-          ninja -j 3 all documentation/package_html
+          ninja -j 2
 
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@v2
