@@ -86,6 +86,7 @@ public:
 	double DESIRED_GET_MORE_DELAY;
 	int CONCURRENT_LOG_ROUTER_READS;
 	int LOG_ROUTER_PEEK_FROM_SATELLITES_PREFERRED; // 0==peek from primary, non-zero==peek from satellites
+	double LOG_ROUTER_PEEK_SWITCH_DC_TIME;
 	double DISK_QUEUE_ADAPTER_MIN_SWITCH_TIME;
 	double DISK_QUEUE_ADAPTER_MAX_SWITCH_TIME;
 	int64_t TLOG_SPILL_REFERENCE_MAX_PEEK_MEMORY_BYTES;
@@ -116,6 +117,7 @@ public:
 	bool PEEK_BATCHING_EMPTY_MSG;
 	double PEEK_BATCHING_EMPTY_MSG_INTERVAL;
 	double POP_FROM_LOG_DELAY;
+	double TLOG_PULL_ASYNC_DATA_WARNING_TIMEOUT_SECS;
 
 	// Data distribution queue
 	double HEALTH_POLL_TIME;
@@ -240,6 +242,7 @@ public:
 
 	double DD_FAILURE_TIME;
 	double DD_ZERO_HEALTHY_TEAM_DELAY;
+	int DD_BUILD_EXTRA_TEAMS_OVERRIDE; // build extra teams to allow data movement to progress. must be larger than 0
 
 	// Run storage enginee on a child process on the same machine with storage process
 	bool REMOTE_KV_STORE;
@@ -303,6 +306,10 @@ public:
 	bool ROCKSDB_UNSAFE_AUTO_FSYNC;
 	int64_t ROCKSDB_PERIODIC_COMPACTION_SECONDS;
 	int ROCKSDB_PREFIX_LEN;
+	double ROCKSDB_MEMTABLE_PREFIX_BLOOM_SIZE_RATIO;
+	int ROCKSDB_BLOOM_BITS_PER_KEY;
+	bool ROCKSDB_BLOOM_WHOLE_KEY_FILTERING;
+	int ROCKSDB_MAX_AUTO_READAHEAD_SIZE;
 	int64_t ROCKSDB_BLOCK_CACHE_SIZE;
 	double ROCKSDB_METRICS_DELAY;
 	double ROCKSDB_READ_VALUE_TIMEOUT;
@@ -330,12 +337,18 @@ public:
 	int64_t ROCKSDB_SOFT_PENDING_COMPACT_BYTES_LIMIT;
 	int64_t ROCKSDB_HARD_PENDING_COMPACT_BYTES_LIMIT;
 	int64_t ROCKSDB_CAN_COMMIT_COMPACT_BYTES_LIMIT;
+	bool ROCKSDB_PARANOID_FILE_CHECKS;
 	int ROCKSDB_CAN_COMMIT_DELAY_ON_OVERLOAD;
 	int ROCKSDB_CAN_COMMIT_DELAY_TIMES_ON_OVERLOAD;
 	bool ROCKSDB_DISABLE_WAL_EXPERIMENTAL;
 	bool ROCKSDB_SINGLEKEY_DELETES_ON_CLEARRANGE;
-	int64_t ROCKSDB_SINGLEKEY_DELETES_BYTES_LIMIT;
+	int ROCKSDB_SINGLEKEY_DELETES_MAX;
 	bool ROCKSDB_ENABLE_CLEAR_RANGE_EAGER_READS;
+	bool ROCKSDB_FORCE_DELETERANGE_FOR_CLEARRANGE;
+	bool ROCKSDB_ENABLE_COMPACT_ON_DELETION;
+	int64_t ROCKSDB_CDCF_SLIDING_WINDOW_SIZE; // CDCF: CompactOnDeletionCollectorFactory
+	int64_t ROCKSDB_CDCF_DELETION_TRIGGER; // CDCF: CompactOnDeletionCollectorFactory
+	double ROCKSDB_CDCF_DELETION_RATIO; // CDCF: CompactOnDeletionCollectorFactory
 	int ROCKSDB_STATS_LEVEL;
 	int64_t ROCKSDB_COMPACTION_READAHEAD_SIZE;
 	int64_t ROCKSDB_BLOCK_SIZE;
@@ -497,6 +510,8 @@ public:
 	                                             // be determined as degraded worker.
 	int CC_SATELLITE_DEGRADATION_MIN_BAD_SERVER; // The minimum amount of degraded server in satellite DC to be
 	                                             // determined as degraded satellite.
+	bool CC_ENABLE_REMOTE_LOG_ROUTER_MONITORING; // When enabled, gray failure tries to detect whether the remote log
+	                                             // router is degraded and may use trigger recovery to recover from it.
 	double CC_THROTTLE_SINGLETON_RERECRUIT_INTERVAL; // The interval to prevent re-recruiting the same singleton if a
 	                                                 // recruiting fight between two cluster controllers occurs.
 

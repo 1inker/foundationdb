@@ -2389,7 +2389,7 @@ ACTOR Future<Void> dbInfoUpdater(ClusterControllerData* self) {
 			when(wait(dbInfoChange)) {}
 		}
 
-		UpdateServerDBInfoRequest req;
+		state UpdateServerDBInfoRequest req;
 		if (dbInfoChange.isReady()) {
 			for (auto& it : self->id_worker) {
 				req.broadcastInfo.push_back(it.second.details.interf.updateServerDBInfo.getEndpoint());
@@ -2411,7 +2411,9 @@ ACTOR Future<Void> dbInfoUpdater(ClusterControllerData* self) {
 		req.serializedDbInfo =
 		    BinaryWriter::toValue(self->db.serverInfo->get(), AssumeVersion(g_network->protocolVersion()));
 
-		TraceEvent("DBInfoStartBroadcast", self->id).log();
+		TraceEvent("DBInfoStartBroadcast", self->id)
+		    .detail("MasterLifetime", self->db.serverInfo->get().masterLifetime.toString());
+		;
 		choose {
 			when(std::vector<Endpoint> notUpdated =
 			         wait(broadcastDBInfoRequest(req, SERVER_KNOBS->DBINFO_SEND_AMOUNT, Optional<Endpoint>(), false))) {
@@ -2422,6 +2424,11 @@ ACTOR Future<Void> dbInfoUpdater(ClusterControllerData* self) {
 				}
 			}
 			when(wait(dbInfoChange)) {}
+			when(wait(updateDBInfo)) {
+				// The current round of broadcast hasn't finished yet. So we need to include all the current broadcast
+				// endpoints in the new round as well.
+				self->updateDBInfoEndpoints.insert(req.broadcastInfo.begin(), req.broadcastInfo.end());
+			}
 		}
 	}
 }
@@ -3081,14 +3088,11 @@ TEST_CASE("/fdbserver/clustercontroller/shouldTriggerRecoveryDueToDegradedServer
 
 	TLogInterface localTLogInterf;
 	localTLogInterf.peekMessages = RequestStream<struct TLogPeekRequest>(Endpoint({ tlog }, testUID));
-	TLogInterface localLogRouterInterf;
-	localLogRouterInterf.peekMessages = RequestStream<struct TLogPeekRequest>(Endpoint({ logRouter }, testUID));
 	BackupInterface backupInterf;
 	backupInterf.waitFailure = RequestStream<ReplyPromise<Void>>(Endpoint({ backup }, testUID));
 	TLogSet localTLogSet;
 	localTLogSet.isLocal = true;
 	localTLogSet.tLogs.push_back(OptionalInterface(localTLogInterf));
-	localTLogSet.logRouters.push_back(OptionalInterface(localLogRouterInterf));
 	localTLogSet.backupWorkers.push_back(OptionalInterface(backupInterf));
 	testDbInfo.logSystemConfig.tLogs.push_back(localTLogSet);
 
@@ -3102,9 +3106,12 @@ TEST_CASE("/fdbserver/clustercontroller/shouldTriggerRecoveryDueToDegradedServer
 
 	TLogInterface remoteTLogInterf;
 	remoteTLogInterf.peekMessages = RequestStream<struct TLogPeekRequest>(Endpoint({ remoteTlog }, testUID));
+	TLogInterface remoteLogRouterInterf;
+	remoteLogRouterInterf.peekMessages = RequestStream<struct TLogPeekRequest>(Endpoint({ logRouter }, testUID));
 	TLogSet remoteTLogSet;
 	remoteTLogSet.isLocal = false;
 	remoteTLogSet.tLogs.push_back(OptionalInterface(remoteTLogInterf));
+	remoteTLogSet.logRouters.push_back(OptionalInterface(remoteLogRouterInterf));
 	testDbInfo.logSystemConfig.tLogs.push_back(remoteTLogSet);
 
 	GrvProxyInterface proxyInterf;
@@ -3141,8 +3148,10 @@ TEST_CASE("/fdbserver/clustercontroller/shouldTriggerRecoveryDueToDegradedServer
 	data.degradationInfo.degradedServers.insert(satelliteTlog);
 	ASSERT(!data.shouldTriggerRecoveryDueToDegradedServers());
 	data.degradationInfo.degradedServers.clear();
+
+	// Trigger recovery when satellite Tlog is disconnected.
 	data.degradationInfo.disconnectedServers.insert(satelliteTlog);
-	ASSERT(!data.shouldTriggerRecoveryDueToDegradedServers());
+	ASSERT(data.shouldTriggerRecoveryDueToDegradedServers());
 	data.degradationInfo.disconnectedServers.clear();
 
 	// No recovery when remote tlog is degraded.
@@ -3153,12 +3162,14 @@ TEST_CASE("/fdbserver/clustercontroller/shouldTriggerRecoveryDueToDegradedServer
 	ASSERT(!data.shouldTriggerRecoveryDueToDegradedServers());
 	data.degradationInfo.disconnectedServers.clear();
 
-	// No recovery when log router is degraded.
+	// No recovery when remote log router is degraded.
 	data.degradationInfo.degradedServers.insert(logRouter);
 	ASSERT(!data.shouldTriggerRecoveryDueToDegradedServers());
 	data.degradationInfo.degradedServers.clear();
+
+	// Trigger recovery when remote log router is disconnected.
 	data.degradationInfo.disconnectedServers.insert(logRouter);
-	ASSERT(!data.shouldTriggerRecoveryDueToDegradedServers());
+	ASSERT(data.shouldTriggerRecoveryDueToDegradedServers());
 	data.degradationInfo.disconnectedServers.clear();
 
 	// No recovery when backup worker is degraded.

@@ -569,6 +569,7 @@ public:
 	// Histograms of requests sent to KVS.
 	Reference<Histogram> readRangeBytesReturnedHistogram;
 	Reference<Histogram> readRangeBytesLimitHistogram;
+	Reference<Histogram> readRangeKVPairsReturnedHistogram;
 
 	// watch map operations
 	Reference<ServerWatchMetadata> getWatchMetadata(KeyRef key) const;
@@ -880,9 +881,14 @@ public:
 
 	struct Counters {
 		CounterCollection cc;
-		Counter allQueries, getKeyQueries, getValueQueries, getRangeQueries, getMappedRangeQueries,
+		Counter allQueries, systemKeyQueries, getKeyQueries, getValueQueries, getRangeQueries, getRangeSystemKeyQueries,
 		    getRangeStreamQueries, finishedQueries, lowPriorityQueries, rowsQueried, bytesQueried, watchQueries,
-		    emptyQueries, feedRowsQueried, feedBytesQueried, feedStreamQueries, feedVersionQueries;
+		    emptyQueries, feedRowsQueried, feedBytesQueried, feedStreamQueries, rejectedFeedStreamQueries,
+		    feedVersionQueries;
+
+		// counters related to getMappedRange queries
+		Counter getMappedRangeBytesQueried, finishedGetMappedRangeSecondaryQueries, getMappedRangeQueries,
+		    finishedGetMappedRangeQueries;
 
 		// Bytes of the mutations that have been added to the memory of the storage server. When the data is durable
 		// and cleared from the memory, we do not subtract it but add it to bytesDurable.
@@ -961,15 +967,19 @@ public:
 
 		Counters(StorageServer* self)
 		  : cc("StorageServer", self->thisServerID.toString()), allQueries("QueryQueue", cc),
-		    getKeyQueries("GetKeyQueries", cc), getValueQueries("GetValueQueries", cc),
-		    getRangeQueries("GetRangeQueries", cc), getMappedRangeQueries("GetMappedRangeQueries", cc),
+		    systemKeyQueries("SystemKeyQueries", cc), getKeyQueries("GetKeyQueries", cc),
+		    getValueQueries("GetValueQueries", cc), getRangeQueries("GetRangeQueries", cc),
+		    getRangeSystemKeyQueries("GetRangeSystemKeyQueries", cc),
 		    getRangeStreamQueries("GetRangeStreamQueries", cc), finishedQueries("FinishedQueries", cc),
 		    lowPriorityQueries("LowPriorityQueries", cc), rowsQueried("RowsQueried", cc),
 		    bytesQueried("BytesQueried", cc), watchQueries("WatchQueries", cc), emptyQueries("EmptyQueries", cc),
 		    feedRowsQueried("FeedRowsQueried", cc), feedBytesQueried("FeedBytesQueried", cc),
-		    feedStreamQueries("FeedStreamQueries", cc), feedVersionQueries("FeedVersionQueries", cc),
-		    bytesInput("BytesInput", cc), logicalBytesInput("LogicalBytesInput", cc),
-		    logicalBytesMoveInOverhead("LogicalBytesMoveInOverhead", cc),
+		    feedStreamQueries("FeedStreamQueries", cc), rejectedFeedStreamQueries("RejectedFeedStreamQueries", cc),
+		    feedVersionQueries("FeedVersionQueries", cc), getMappedRangeBytesQueried("GetMappedRangeBytesQueried", cc),
+		    finishedGetMappedRangeSecondaryQueries("FinishedGetMappedRangeSecondaryQueries", cc),
+		    getMappedRangeQueries("GetMappedRangeQueries", cc),
+		    finishedGetMappedRangeQueries("FinishedGetMappedRangeQueries", cc), bytesInput("BytesInput", cc),
+		    logicalBytesInput("LogicalBytesInput", cc), logicalBytesMoveInOverhead("LogicalBytesMoveInOverhead", cc),
 		    kvCommitLogicalBytes("KVCommitLogicalBytes", cc), kvClearRanges("KVClearRanges", cc),
 		    kvClearSingleKey("KVClearSingleKey", cc), kvSystemClearRanges("KVSystemClearRanges", cc),
 		    bytesDurable("BytesDurable", cc), bytesFetched("BytesFetched", cc), mutationBytes("MutationBytes", cc),
@@ -1097,6 +1107,9 @@ public:
 	    readRangeBytesLimitHistogram(Histogram::getHistogram(STORAGESERVER_HISTOGRAM_GROUP,
 	                                                         SS_READ_RANGE_BYTES_LIMIT_HISTOGRAM,
 	                                                         Histogram::Unit::bytes)),
+	    readRangeKVPairsReturnedHistogram(Histogram::getHistogram(STORAGESERVER_HISTOGRAM_GROUP,
+	                                                              SS_READ_RANGE_KV_PAIRS_RETURNED_HISTOGRAM,
+	                                                              Histogram::Unit::bytes)),
 	    tag(invalidTag), poppedAllAfter(std::numeric_limits<Version>::max()), cpuUsage(0.0), diskUsage(0.0),
 	    storage(this, storage), shardChangeCounter(0), lastTLogVersion(0), lastVersionWithData(0), restoredVersion(0),
 	    prevVersion(0), rebootAfterDurableVersion(std::numeric_limits<Version>::max()),
@@ -1617,6 +1630,9 @@ ACTOR Future<Void> getValueQ(StorageServer* data, GetValueRequest req) {
 		++data->counters.getValueQueries;
 		++data->counters.allQueries;
 		++data->readQueueSizeMetric;
+		if (req.key.startsWith(systemKeys.begin)) {
+			++data->counters.systemKeyQueries;
+		}
 		data->maxQueryQueue = std::max<int>(
 		    data->maxQueryQueue, data->counters.allQueries.getValue() - data->counters.finishedQueries.getValue());
 
@@ -2961,6 +2977,8 @@ ACTOR Future<GetKeyValuesReply> readRange(StorageServer* data,
 	state Key readBeginTemp;
 	state int vCount = 0;
 	state Span span("SS:readRange"_loc, parentSpan);
+	state int resultLogicalSize = 0;
+	state int logicalSize = 0;
 
 	// for caching the storage queue results during the first PTree traversal
 	state VectorRef<KeyValueRef> resultCache;
@@ -2998,7 +3016,6 @@ ACTOR Future<GetKeyValuesReply> readRange(StorageServer* data,
 			// Either way that's the correct result for lower_bound.
 			vCurrent = view.begin();
 		}
-
 		while (limit > 0 && *pLimitBytes > 0 && readBegin < range.end) {
 			ASSERT(!vCurrent || vCurrent.key() >= readBegin);
 			ASSERT(data->storageVersion() <= version);
@@ -3028,8 +3045,9 @@ ACTOR Future<GetKeyValuesReply> readRange(StorageServer* data,
 			readEnd = vCurrent ? std::min(vCurrent.key(), range.end) : range.end;
 			RangeResult atStorageVersion =
 			    wait(data->storage.readRange(KeyRangeRef(readBegin, readEnd), limit, *pLimitBytes, type));
-			data->counters.kvScanBytes += atStorageVersion.logicalSize();
-			data->readRangeBytesReturnedHistogram->sample(atStorageVersion.logicalSize());
+			logicalSize = atStorageVersion.logicalSize();
+			data->counters.kvScanBytes += logicalSize;
+			resultLogicalSize += logicalSize;
 			data->readRangeBytesLimitHistogram->sample(*pLimitBytes);
 
 			ASSERT(atStorageVersion.size() <= limit);
@@ -3129,8 +3147,9 @@ ACTOR Future<GetKeyValuesReply> readRange(StorageServer* data,
 			                     : range.begin;
 			RangeResult atStorageVersion =
 			    wait(data->storage.readRange(KeyRangeRef(readBegin, readEnd), limit, *pLimitBytes, type));
-			data->counters.kvScanBytes += atStorageVersion.logicalSize();
-			data->readRangeBytesReturnedHistogram->sample(atStorageVersion.logicalSize());
+			logicalSize = atStorageVersion.logicalSize();
+			data->counters.kvScanBytes += logicalSize;
+			resultLogicalSize += logicalSize;
 			data->readRangeBytesLimitHistogram->sample(*pLimitBytes);
 
 			ASSERT(atStorageVersion.size() <= -limit);
@@ -3181,6 +3200,8 @@ ACTOR Future<GetKeyValuesReply> readRange(StorageServer* data,
 			}
 		}
 	}
+	data->readRangeBytesReturnedHistogram->sample(resultLogicalSize);
+	data->readRangeKVPairsReturnedHistogram->sample(result.data.size());
 
 	// all but the last item are less than *pLimitBytes
 	ASSERT(result.data.size() == 0 || *pLimitBytes + result.data.end()[-1].expectedSize() + sizeof(KeyValueRef) > 0);
@@ -3338,6 +3359,10 @@ ACTOR Future<Void> getKeyValuesQ(StorageServer* data, GetKeyValuesRequest req)
 	++data->counters.getRangeQueries;
 	++data->counters.allQueries;
 	++data->readQueueSizeMetric;
+	if (req.begin.getKey().startsWith(systemKeys.begin)) {
+		++data->counters.systemKeyQueries;
+		++data->counters.getRangeSystemKeyQueries;
+	}
 	data->maxQueryQueue = std::max<int>(
 	    data->maxQueryQueue, data->counters.allQueries.getValue() - data->counters.finishedQueries.getValue());
 
@@ -3978,6 +4003,9 @@ ACTOR Future<Void> getMappedKeyValuesQ(StorageServer* data, GetMappedKeyValuesRe
 	++data->counters.getMappedRangeQueries;
 	++data->counters.allQueries;
 	++data->readQueueSizeMetric;
+	if (req.begin.getKey().startsWith(systemKeys.begin)) {
+		++data->counters.systemKeyQueries;
+	}
 	data->maxQueryQueue = std::max<int>(
 	    data->maxQueryQueue, data->counters.allQueries.getValue() - data->counters.finishedQueries.getValue());
 
@@ -4128,25 +4156,12 @@ ACTOR Future<Void> getMappedKeyValuesQ(StorageServer* data, GetMappedKeyValuesRe
 				//                ASSERT(r.data.size() <= std::abs(req.limit));
 			}
 
-			// For performance concerns, the cost of a range read is billed to the start key and end key of the range.
-			int64_t totalByteSize = 0;
-			for (int i = 0; i < r.data.size(); i++) {
-				totalByteSize += r.data[i].expectedSize();
-			}
-			if (totalByteSize > 0 && SERVER_KNOBS->READ_SAMPLING_ENABLED) {
-				int64_t bytesReadPerKSecond = std::max(totalByteSize, SERVER_KNOBS->EMPTY_READ_PENALTY) / 2;
-				data->metrics.notifyBytesReadPerKSecond(addPrefix(r.data[0].key, tenantPrefix, req.arena),
-				                                        bytesReadPerKSecond);
-				data->metrics.notifyBytesReadPerKSecond(
-				    addPrefix(r.data[r.data.size() - 1].key, tenantPrefix, req.arena), bytesReadPerKSecond);
-			}
-
 			r.penalty = data->getPenalty();
 			req.reply.send(r);
 
 			resultSize = req.limitBytes - remainingLimitBytes;
-			data->counters.bytesQueried += resultSize;
-			data->counters.rowsQueried += r.data.size();
+			data->counters.getMappedRangeBytesQueried += resultSize;
+			data->counters.finishedGetMappedRangeSecondaryQueries += r.data.size();
 			if (r.data.size() == 0) {
 				++data->counters.emptyQueries;
 			}
@@ -4159,6 +4174,7 @@ ACTOR Future<Void> getMappedKeyValuesQ(StorageServer* data, GetMappedKeyValuesRe
 
 	data->transactionTagCounter.addRequest(req.tags, resultSize);
 	++data->counters.finishedQueries;
+	++data->counters.finishedGetMappedRangeQueries;
 	--data->readQueueSizeMetric;
 
 	double duration = g_network->timer() - req.requestTime();
@@ -4195,6 +4211,9 @@ ACTOR Future<Void> getKeyValuesStreamQ(StorageServer* data, GetKeyValuesStreamRe
 	++data->counters.getRangeStreamQueries;
 	++data->counters.allQueries;
 	++data->readQueueSizeMetric;
+	if (req.begin.getKey().startsWith(systemKeys.begin)) {
+		++data->counters.systemKeyQueries;
+	}
 	data->maxQueryQueue = std::max<int>(
 	    data->maxQueryQueue, data->counters.allQueries.getValue() - data->counters.finishedQueries.getValue());
 
@@ -5768,6 +5787,21 @@ ACTOR Future<std::unordered_map<Key, Version>> dispatchChangeFeeds(StorageServer
 	}
 }
 
+bool fetchKeyCanRetry(const Error& e) {
+	switch (e.code()) {
+	case error_code_end_of_stream:
+	case error_code_connection_failed:
+	case error_code_transaction_too_old:
+	case error_code_future_version:
+	case error_code_process_behind:
+	case error_code_server_overloaded:
+	case error_code_proxy_memory_limit_exceeded:
+		return true;
+	default:
+		return false;
+	}
+}
+
 ACTOR Future<Void> fetchKeys(StorageServer* data, AddingShard* shard) {
 	state const UID fetchKeysID = deterministicRandom()->randomUniqueID();
 	state TraceInterval interval("FetchKeys");
@@ -5976,9 +6010,7 @@ ACTOR Future<Void> fetchKeys(StorageServer* data, AddingShard* shard) {
 					}
 				}
 			} catch (Error& e) {
-				if (e.code() != error_code_end_of_stream && e.code() != error_code_connection_failed &&
-				    e.code() != error_code_transaction_too_old && e.code() != error_code_future_version &&
-				    e.code() != error_code_process_behind && e.code() != error_code_server_overloaded) {
+				if (!fetchKeyCanRetry(e)) {
 					throw;
 				}
 				lastError = e;
@@ -7851,7 +7883,7 @@ void setAssignedStatus(StorageServer* self, KeyRangeRef keys, bool nowAssigned) 
 }
 
 void StorageServerDisk::clearRange(KeyRangeRef keys) {
-	storage->clear(keys, &data->metrics);
+	storage->clear(keys);
 	++(*kvClearRanges);
 	if (keys.singleKeyRange()) {
 		++(*kvClearSingleKey);
@@ -7868,7 +7900,7 @@ void StorageServerDisk::writeMutation(MutationRef mutation) {
 		storage->set(KeyValueRef(mutation.param1, mutation.param2));
 		*kvCommitLogicalBytes += mutation.expectedSize();
 	} else if (mutation.type == MutationRef::ClearRange) {
-		storage->clear(KeyRangeRef(mutation.param1, mutation.param2), &data->metrics);
+		storage->clear(KeyRangeRef(mutation.param1, mutation.param2));
 		++(*kvClearRanges);
 		if (KeyRangeRef(mutation.param1, mutation.param2).singleKeyRange()) {
 			++(*kvClearSingleKey);
@@ -7886,7 +7918,7 @@ void StorageServerDisk::writeMutations(const VectorRef<MutationRef>& mutations,
 			storage->set(KeyValueRef(m.param1, m.param2));
 			*kvCommitLogicalBytes += m.expectedSize();
 		} else if (m.type == MutationRef::ClearRange) {
-			storage->clear(KeyRangeRef(m.param1, m.param2), &data->metrics);
+			storage->clear(KeyRangeRef(m.param1, m.param2));
 			++(*kvClearRanges);
 			if (KeyRangeRef(m.param1, m.param2).singleKeyRange()) {
 				++(*kvClearSingleKey);
@@ -8299,7 +8331,7 @@ ACTOR Future<bool> restoreDurableState(StorageServer* data, IKeyValueStore* stor
 				++data->counters.kvSystemClearRanges;
 				// TODO(alexmiller): Figure out how to selectively enable spammy data distribution events.
 				// DEBUG_KEY_RANGE("clearInvalidVersion", invalidVersion, clearRange);
-				storage->clear(clearRange, &data->metrics);
+				storage->clear(clearRange);
 				++data->counters.kvSystemClearRanges;
 				data->byteSampleApplyClear(clearRange, invalidVersion);
 			}

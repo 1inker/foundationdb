@@ -199,6 +199,7 @@ ACTOR Future<Void> newCommitProxies(Reference<ClusterRecoveryData> self, Recruit
 	}
 
 	std::vector<CommitProxyInterface> newRecruits = wait(getAll(initializationReplies));
+	TraceEvent("CommitProxyInitializationComplete", self->dbgid).log();
 	// It is required for the correctness of COMMIT_ON_FIRST_PROXY that self->commitProxies[0] is the firstCommitProxy.
 	self->commitProxies = newRecruits;
 
@@ -220,6 +221,7 @@ ACTOR Future<Void> newGrvProxies(Reference<ClusterRecoveryData> self, RecruitFro
 	}
 
 	std::vector<GrvProxyInterface> newRecruits = wait(getAll(initializationReplies));
+	TraceEvent("GrvProxyInitializationComplete", self->dbgid).log();
 	self->grvProxies = newRecruits;
 	return Void();
 }
@@ -240,6 +242,7 @@ ACTOR Future<Void> newResolvers(Reference<ClusterRecoveryData> self, RecruitFrom
 	}
 
 	std::vector<ResolverInterface> newRecruits = wait(getAll(initializationReplies));
+	TraceEvent("ResolverInitializationComplete", self->dbgid).log();
 	self->resolvers = newRecruits;
 
 	return Void();
@@ -932,6 +935,7 @@ ACTOR Future<std::vector<Standalone<CommitTransactionRef>>> recruitEverything(
 	} else
 		TraceEvent(getRecoveryEventName(ClusterRecoveryEventType::CLUSTER_RECOVERY_STATE_EVENT_NAME).c_str(),
 		           self->dbgid)
+		    .setMaxFieldLength(-1)
 		    .detail("StatusCode", RecoveryStatus::recruiting_transaction_servers)
 		    .detail("Status", RecoveryStatus::names[RecoveryStatus::recruiting_transaction_servers])
 		    .detail("Conf", self->configuration.toString())
@@ -1089,10 +1093,14 @@ ACTOR Future<Void> readTransactionSystemState(Reference<ClusterRecoveryData> sel
 
 		if (self->recoveryTransactionVersion < minRequiredCommitVersion)
 			self->recoveryTransactionVersion = minRequiredCommitVersion;
-	}
 
-	if (BUGGIFY) {
-		self->recoveryTransactionVersion += deterministicRandom()->randomInt64(0, 10000000);
+		// Test randomly increasing the recovery version by a large number.
+		// When the version epoch is enabled, versions stay in sync with time.
+		// An offline cluster could see a large version jump when it comes back
+		// online, so test this behavior in simulation.
+		if (BUGGIFY) {
+			self->recoveryTransactionVersion += deterministicRandom()->randomInt64(0, 10000000);
+		}
 	}
 
 	TraceEvent(getRecoveryEventName(ClusterRecoveryEventType::CLUSTER_RECOVERY_RECOVERING_EVENT_NAME).c_str(),
@@ -1448,9 +1456,7 @@ ACTOR Future<Void> clusterRecoveryCore(Reference<ClusterRecoveryData> self) {
 			           (self->cstate.myDBState.oldTLogData.size() - CLIENT_KNOBS->RECOVERY_DELAY_START_GENERATION)));
 		}
 		if (g_network->isSimulated() && self->cstate.myDBState.oldTLogData.size() > CLIENT_KNOBS->MAX_GENERATIONS_SIM) {
-			g_simulator.connectionFailuresDisableDuration = 1e6;
-			g_simulator.speedUpSimulation = true;
-			TraceEvent(SevWarnAlways, "DisableConnectionFailures_TooManyGenerations").log();
+			disableConnectionFailures("TooManyGenerations");
 		}
 	}
 
