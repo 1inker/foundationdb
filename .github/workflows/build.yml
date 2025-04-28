@@ -181,6 +181,11 @@ jobs:
       JOSHUA_AGENT_TAG: "rhel8-20220816"
 
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          path: ${{github.workspace}}/src
+
       - name: Install dependencies
         shell: bash
         run: |

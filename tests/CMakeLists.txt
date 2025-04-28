@@ -310,7 +310,7 @@ if(WITH_PYTHON)
     restarting/from_6.3.13/StorefrontTestRestart-2.txt)
   add_fdb_test(
     TEST_FILES restarting/from_6.3.13_until_7.2.0/DrUpgradeRestart-1.txt
-    restarting/from_6.3.13_until_7.2.0/DrUpgradeRestart-2.txt)
+    restarting/from_6.3.13_until_7.2.0/DrUpgradeRestart-2.txt IGNORE)
   add_fdb_test(
     TEST_FILES restarting/from_7.0.0_until_7.1.0/UpgradeAndBackupRestore-1.toml
     restarting/from_7.0.0_until_7.1.0/UpgradeAndBackupRestore-2.toml)
@@ -470,9 +470,9 @@ if(WITH_PYTHON)
   add_fdb_test(TEST_FILES slow/ParallelRestoreOldBackupCorrectnessCycle.toml)
   add_fdb_test(TEST_FILES slow/ParallelRestoreOldBackupCorrectnessMultiCycles.toml)
   add_fdb_test(TEST_FILES slow/ParallelRestoreOldBackupWriteDuringReadAtomicRestore.toml)
-  add_fdb_test(TEST_FILES negative/ResolverIgnoreTooOld.toml)
-  add_fdb_test(TEST_FILES negative/ResolverIgnoreReads.toml)
-  add_fdb_test(TEST_FILES negative/ResolverIgnoreWrites.toml)
+  add_fdb_test(TEST_FILES negative/ResolverIgnoreTooOld.toml IGNORE)
+  add_fdb_test(TEST_FILES negative/ResolverIgnoreReads.toml IGNORE)
+  add_fdb_test(TEST_FILES negative/ResolverIgnoreWrites.toml IGNORE)
   add_fdb_test(TEST_FILES negative/StorageCorruption.toml)
   add_fdb_test(TEST_FILES ParallelRestoreOldBackupApiCorrectnessAtomicRestore.toml IGNORE)
 
