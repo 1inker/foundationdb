@@ -50,9 +50,8 @@ jobs:
             prepare: "debian-based"
             build_on: linux
             parallel: 5
-            image: foundationdb-build:7.3.0-1.ow.build
-            owner: owtech
-
+            image: foundationdb-build:7.3.63-1.ow.build
+            owner: ${GITHUB_REPOSITORY_OWNER@L}
     runs-on: ${{ matrix.run_on }}
     steps:
       - name: Checkout
