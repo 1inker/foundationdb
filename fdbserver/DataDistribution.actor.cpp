@@ -199,7 +199,8 @@ void StorageWiggler::updateMetadata(const UID& serverId, const StorageMetadataTy
 }
 
 bool StorageWiggler::necessary(const UID& serverId, const StorageMetadataType& metadata) const {
-	return metadata.wrongConfigured || (now() - metadata.createdTime > SERVER_KNOBS->DD_STORAGE_WIGGLE_MIN_SS_AGE_SEC);
+	return metadata.wrongConfiguredForWiggle ||
+	       (now() - metadata.createdTime > SERVER_KNOBS->DD_STORAGE_WIGGLE_MIN_SS_AGE_SEC);
 }
 
 Optional<UID> StorageWiggler::getNextServerId(bool necessaryOnly) {
@@ -983,7 +984,8 @@ ACTOR Future<Void> dataDistribution(Reference<DataDistributor> self,
 			                                       .anyZeroHealthyTeams = anyZeroHealthyTeams,
 			                                       .shards = &shards,
 			                                       .trackerCancelled = &trackerCancelled,
-			                                       .ddTenantCache = self->ddTenantCache });
+			                                       .ddTenantCache = self->ddTenantCache,
+			                                       .usableRegions = self->configuration.usableRegions });
 			actors.push_back(reportErrorsExcept(DataDistributionTracker::run(shardTracker,
 			                                                                 self->initData,
 			                                                                 getShardMetrics.getFuture(),

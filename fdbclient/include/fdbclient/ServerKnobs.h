@@ -193,6 +193,11 @@ public:
 	// it are default to be 'anonymous' for compatibility.
 	int PRIORITY_ENFORCE_MOVE_OUT_OF_PHYSICAL_SHARD;
 
+	// Probability that a team redundant data move set TrueBest when get destination team
+	double PROBABILITY_TEAM_REDUNDANT_DATAMOVE_CHOOSE_TRUE_BEST_DEST;
+	// Probability that a team unhealthy data move set TrueBest when get destination team
+	double PROBABILITY_TEAM_UNHEALTHY_DATAMOVE_CHOOSE_TRUE_BEST_DEST;
+
 	// Data distribution
 	// DD use AVAILABLE_SPACE_PIVOT_RATIO to calculate pivotAvailableSpaceRatio. Given a array that's descend
 	// sorted by available space ratio, the pivot position is AVAILABLE_SPACE_PIVOT_RATIO * team count.
@@ -241,6 +246,8 @@ public:
 	// shard metrics will update immediately
 	int64_t SHARD_READ_OPS_CHANGE_THRESHOLD;
 	bool ENABLE_WRITE_BASED_SHARD_SPLIT; // Experimental. Enable to enforce shard split when write traffic is high
+	int DD_SHARD_USABLE_REGION_CHECK_RATE; // Assuming all shards need to repair, the (rough) number of shards moving
+	                                       // for usable region per second. Set 0 to disable shard usable region check
 
 	double SHARD_MAX_READ_DENSITY_RATIO;
 	int64_t SHARD_READ_HOT_BANDWIDTH_MIN_PER_KSECONDS;
@@ -262,6 +269,10 @@ public:
 	                                                // balanced/filledup before starting the next wiggle.
 	double PERPETUAL_WIGGLE_DELAY; // The max interval between the last wiggle finish and the next wiggle start
 	bool PERPETUAL_WIGGLE_DISABLE_REMOVER; // Whether the start of perpetual wiggle replace team remover
+	bool PERPETUAL_WIGGLE_PAUSE_AFTER_TSS_TARGET_MET;
+	double PERPETUAL_WIGGLE_MIN_AVAILABLE_SPACE_RATIO; // Pause wiggle until all Storage servers have minimumn
+	                                                   // of PERPETUAL_WIGGLE_MIN_AVAILABLE_SPACE_RATIO disk
+	                                                   // space available.
 	double LOG_ON_COMPLETION_DELAY;
 	int BEST_TEAM_MAX_TEAM_TRIES;
 	int BEST_TEAM_OPTION_COUNT;
@@ -337,8 +348,15 @@ public:
 	bool DD_ENABLE_REBALANCE_STORAGE_QUEUE_WITH_LIGHT_WRITE_SHARD; // Enable to allow storage queue rebalancer to move
 	                                                               // light-traffic shards out of the overloading server
 	double DD_WAIT_TSS_DATA_MOVE_DELAY;
+	bool DD_VALIDATE_SERVER_TEAM_COUNT_AFTER_BUILD_TEAM; // Enable to validate server team count per server after build
+	                                                     // team
 
 	// TeamRemover to remove redundant teams
+	double TR_LOW_SPACE_PIVOT_DELAY_SEC; // teamRedundant data moves can make the min SS available % smaller in
+	                                     // particular when the majority of SSes have low available %. So, when the
+	                                     // pivot is below the target, teamRemover wait for the specified time to check
+	                                     // the pivot again. teamRemover triggers teamRedundant data moves only when the
+	                                     // pivot is above the target.
 	bool TR_FLAG_DISABLE_MACHINE_TEAM_REMOVER; // disable the machineTeamRemover actor
 	double TR_REMOVE_MACHINE_TEAM_DELAY; // wait for the specified time before try to remove next machine team
 	bool TR_FLAG_REMOVE_MT_WITH_MOST_TEAMS; // guard to select which machineTeamRemover logic to use
@@ -456,6 +474,7 @@ public:
 	// Set to 0 to disable histograms.
 	double ROCKSDB_HISTOGRAMS_SAMPLE_RATE;
 	double ROCKSDB_READ_RANGE_ITERATOR_REFRESH_TIME;
+	double ROCKSDB_PROBABILITY_REUSE_ITERATOR_SIM; // Probability that RocksDB reuses iterator in simulation
 	bool ROCKSDB_READ_RANGE_REUSE_ITERATORS;
 	bool SHARDED_ROCKSDB_REUSE_ITERATORS;
 	bool ROCKSDB_READ_RANGE_REUSE_BOUNDED_ITERATORS;
@@ -526,6 +545,7 @@ public:
 	double ROCKSDB_CF_METRICS_DELAY;
 	int ROCKSDB_MAX_LOG_FILE_SIZE;
 	int ROCKSDB_KEEP_LOG_FILE_NUM;
+	int ROCKSDB_MANUAL_FLUSH_TIME_INTERVAL;
 	bool ROCKSDB_SKIP_STATS_UPDATE_ON_OPEN;
 	bool ROCKSDB_SKIP_FILE_SIZE_CHECK_ON_OPEN;
 	bool ROCKSDB_FULLFILE_CHECKSUM; // For validate sst files when compaction and producing backup files. TODO: set
@@ -536,6 +556,7 @@ public:
 	int ROCKSDB_WRITEBATCH_PROTECTION_BYTES_PER_KEY;
 	int ROCKSDB_MEMTABLE_PROTECTION_BYTES_PER_KEY;
 	int ROCKSDB_BLOCK_PROTECTION_BYTES_PER_KEY;
+	bool SHARDED_ROCKSDB_ALLOW_WRITE_STALL_ON_FLUSH;
 	int SHARDED_ROCKSDB_MEMTABLE_MAX_RANGE_DELETIONS;
 	double SHARDED_ROCKSDB_VALIDATE_MAPPING_RATIO;
 	int SHARD_METADATA_SCAN_BYTES_LIMIT;
@@ -551,8 +572,11 @@ public:
 	int SHARDED_ROCKSDB_TARGET_FILE_SIZE_BASE;
 	int SHARDED_ROCKSDB_TARGET_FILE_SIZE_MULTIPLIER;
 	bool SHARDED_ROCKSDB_SUGGEST_COMPACT_CLEAR_RANGE;
+	int SHARDED_ROCKSDB_COMPACT_ON_RANGE_DELETION_THRESHOLD;
 	int SHARDED_ROCKSDB_MAX_BACKGROUND_JOBS;
 	int64_t SHARDED_ROCKSDB_BLOCK_CACHE_SIZE;
+	double SHARDED_ROCKSDB_CACHE_HIGH_PRI_POOL_RATIO;
+	bool SHARDED_ROCKSDB_CACHE_INDEX_AND_FILTER_BLOCKS;
 	int64_t SHARDED_ROCKSDB_WRITE_RATE_LIMITER_BYTES_PER_SEC;
 	int64_t SHARDED_ROCKSDB_RATE_LIMITER_MODE;
 	int SHARDED_ROCKSDB_BACKGROUND_PARALLELISM;
@@ -564,6 +588,10 @@ public:
 	int SHARDED_ROCKSDB_MAX_OPEN_FILES;
 	bool SHARDED_ROCKSDB_READ_ASYNC_IO;
 	int SHARDED_ROCKSDB_PREFIX_LEN;
+	int SHARDED_ROCKSDB_BLOOM_FILTER_BITS;
+	double SHARDED_ROCKSDB_MEMTABLE_BLOOM_FILTER_RATIO;
+	double SHARDED_ROCKSDB_HISTOGRAMS_SAMPLE_RATE;
+	bool SHARDED_ROCKSDB_USE_DIRECT_IO;
 
 	// Leader election
 	int MAX_NOTIFICATIONS;
@@ -709,7 +737,6 @@ public:
 	double REPLACE_INTERFACE_CHECK_DELAY;
 	double COORDINATOR_REGISTER_INTERVAL;
 	double CLIENT_REGISTER_INTERVAL;
-	bool CC_PAUSE_HEALTH_MONITOR;
 	bool CC_ENABLE_WORKER_HEALTH_MONITOR;
 	double CC_WORKER_HEALTH_CHECKING_INTERVAL; // The interval of refreshing the degraded server list.
 	double CC_DEGRADED_LINK_EXPIRATION_INTERVAL; // The time period from the last degradation report after which a
@@ -720,6 +747,8 @@ public:
 	int CC_DEGRADED_PEER_DEGREE_TO_EXCLUDE; // The maximum number of degraded peers when excluding a server. When the
 	                                        // number of degraded peers is more than this value, we will not exclude
 	                                        // this server since it may because of server overload.
+	int CC_DEGRADED_PEER_DEGREE_TO_EXCLUDE_MIN; // Similar to CC_DEGRADED_PEER_DEGREE_TO_EXCLUDE which is an upper
+	                                            // bound, this is a lower bound.
 	int CC_MAX_EXCLUSION_DUE_TO_HEALTH; // The max number of degraded servers to exclude by Cluster Controller due to
 	                                    // degraded health.
 	bool CC_HEALTH_TRIGGER_RECOVERY; // If true, cluster controller will kill the master to trigger recovery when
@@ -727,8 +756,9 @@ public:
 	double CC_TRACKING_HEALTH_RECOVERY_INTERVAL; // The number of recovery count should not exceed
 	                                             // CC_MAX_HEALTH_RECOVERY_COUNT within
 	                                             // CC_TRACKING_HEALTH_RECOVERY_INTERVAL.
-	int CC_MAX_HEALTH_RECOVERY_COUNT; // The max number of recoveries can be triggered due to worker health within
-	                                  // CC_TRACKING_HEALTH_RECOVERY_INTERVAL
+	int CC_MAX_HEALTH_RECOVERY_COUNT; // The max number recoveries that can be triggered due to worker
+	                                  // health within CC_TRACKING_HEALTH_RECOVERY_INTERVAL. This count accounts for any
+	                                  // recovery trigger including non-gray failure ones.
 	bool CC_HEALTH_TRIGGER_FAILOVER; // Whether to enable health triggered failover in CC.
 	int CC_FAILOVER_DUE_TO_HEALTH_MIN_DEGRADATION; // The minimum number of degraded servers that can trigger a
 	                                               // failover.
@@ -744,6 +774,8 @@ public:
 	                                             // determined as degraded satellite.
 	bool CC_ENABLE_REMOTE_LOG_ROUTER_MONITORING; // When enabled, gray failure tries to detect whether the remote log
 	                                             // router is degraded and may use trigger recovery to recover from it.
+	bool CC_INVALIDATE_EXCLUDED_PROCESSES; // When enabled, invalidate the complaints by processes that were excluded
+	                                       // in gray failure triggered recoveries.
 	double CC_THROTTLE_SINGLETON_RERECRUIT_INTERVAL; // The interval to prevent re-recruiting the same singleton if a
 	                                                 // recruiting fight between two cluster controllers occurs.
 
@@ -1030,6 +1062,7 @@ public:
 	std::string STORAGESERVER_READTYPE_PRIORITY_MAP;
 	int SPLIT_METRICS_MAX_ROWS;
 	double STORAGE_SHARD_CONSISTENCY_CHECK_INTERVAL;
+	bool CONSISTENCY_CHECK_BACKWARD_READ;
 	int PHYSICAL_SHARD_MOVE_LOG_SEVERITY;
 	int FETCH_SHARD_BUFFER_BYTE_LIMIT;
 	int FETCH_SHARD_UPDATES_BYTE_LIMIT;
@@ -1081,6 +1114,9 @@ public:
 
 	// Test harness
 	double WORKER_POLL_DELAY;
+	int PROBABILITY_FACTOR_MEMORY_ENGINE_SELECTED_SIM;
+	int PROBABILITY_FACTOR_ROCKSDB_ENGINE_SELECTED_SIM;
+	int PROBABILITY_FACTOR_SQLITE_ENGINE_SELECTED_SIM;
 
 	// Coordination
 	double COORDINATED_STATE_ONCONFLICT_POLL_INTERVAL;
@@ -1208,6 +1244,7 @@ public:
 	int SIM_KMS_MAX_KEYS;
 	int ENCRYPT_PROXY_MAX_DBG_TRACE_LENGTH;
 	double ENCRYPTION_LOGGING_INTERVAL;
+	double DISABLED_ENCRYPTION_PROBABILITY_SIM; // Probability that encryption is forced to be disabled in simulation
 
 	// Compression
 	bool ENABLE_BLOB_GRANULE_COMPRESSION;
