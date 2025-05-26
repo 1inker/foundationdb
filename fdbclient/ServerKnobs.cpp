@@ -461,9 +461,11 @@ void ServerKnobs::initialize(Randomize randomize, ClientKnobs* clientKnobs, IsSi
 	// Use a smaller memtable in simulation to avoid OOMs.
 	int64_t memtableBytes = isSimulated ? 1024 * 1024 : 512 * 1024 * 1024;
 	init( ROCKSDB_MEMTABLE_BYTES,                      memtableBytes );
-	init( ROCKSDB_LEVEL_STYLE_COMPACTION,                       true );
 	init( ROCKSDB_UNSAFE_AUTO_FSYNC,                           false );
-	init( ROCKSDB_PERIODIC_COMPACTION_SECONDS,                     0 );
+	init( ROCKSDB_PERIODIC_COMPACTION_SECONDS,                     0 ); if( isSimulated ) ROCKSDB_PERIODIC_COMPACTION_SECONDS = deterministicRandom()->randomInt(5*60, 24*60*60);
+	init( ROCKSDB_TTL_COMPACTION_SECONDS,                          0 ); if( isSimulated ) ROCKSDB_TTL_COMPACTION_SECONDS = deterministicRandom()->randomInt(5*60, 24*60*60);
+	int64_t maxCompactionBytes = 160LL * 64 * 1024 * 1024;
+	init( ROCKSDB_MAX_COMPACTION_BYTES,                            0 ); /* default = 25*64MB */ if( randomize && BUGGIFY ) ROCKSDB_MAX_COMPACTION_BYTES = deterministicRandom()->randomInt64(5*64*1024*1024, maxCompactionBytes);
 	init( ROCKSDB_PREFIX_LEN,                                     11 ); if( randomize && BUGGIFY )  ROCKSDB_PREFIX_LEN = deterministicRandom()->randomInt(1, 20);
 	init( ROCKSDB_MEMTABLE_PREFIX_BLOOM_SIZE_RATIO,              0.1 );
 	init( ROCKSDB_BLOOM_BITS_PER_KEY,                             10 );
@@ -524,6 +526,7 @@ void ServerKnobs::initialize(Randomize randomize, ClientKnobs* clientKnobs, IsSi
 	init( ROCKSDB_SINGLEKEY_DELETES_MAX,                         200 ); // Max rocksdb::delete calls in a transaction
 	init( ROCKSDB_ENABLE_CLEAR_RANGE_EAGER_READS,              false );
 	init( ROCKSDB_FORCE_DELETERANGE_FOR_CLEARRANGE,            false );
+	init( ROCKSDB_CLEARRANGES_LIMIT_PER_COMMIT,                    0 ); if( isSimulated ) ROCKSDB_CLEARRANGES_LIMIT_PER_COMMIT = deterministicRandom()->randomInt(1000, 10000); // Default: 0 (disabled).
 	// ROCKSDB_STATS_LEVEL=1 indicates rocksdb::StatsLevel::kExceptHistogramOrTimers
 	// Refer StatsLevel: https://github.com/facebook/rocksdb/blob/main/include/rocksdb/statistics.h#L594
 	init( ROCKSDB_STATS_LEVEL,                                     1 );
@@ -559,7 +562,7 @@ void ServerKnobs::initialize(Randomize randomize, ClientKnobs* clientKnobs, IsSi
  	init( ROCKSDB_VERIFY_CHECKSUM_BEFORE_RESTORE,               true );
  	init( ROCKSDB_ENABLE_CHECKPOINT_VALIDATION,                false ); if ( randomize && BUGGIFY ) ROCKSDB_ENABLE_CHECKPOINT_VALIDATION = deterministicRandom()->coinflip();
 	init( ROCKSDB_RETURN_OVERLOADED_ON_TIMEOUT,                 true );
-	init( ROCKSDB_COMPACTION_PRI,                                  3 ); // kMinOverlappingRatio, RocksDB default. 
+	init( ROCKSDB_COMPACTION_PRI,                                  3 ); /* kMinOverlappingRatio, RocksDB default. */  if ( randomize && BUGGIFY ) ROCKSDB_COMPACTION_PRI = deterministicRandom()->randomInt(0, 4);
 	init( ROCKSDB_WAL_RECOVERY_MODE,                               2 ); // kPointInTimeRecovery, RocksDB default.
 	init( ROCKSDB_TARGET_FILE_SIZE_BASE,                           0 ); // If 0, pick RocksDB default.
 	init( ROCKSDB_TARGET_FILE_SIZE_MULTIPLIER,                     1 ); // RocksDB default.
@@ -617,13 +620,15 @@ void ServerKnobs::initialize(Randomize randomize, ClientKnobs* clientKnobs, IsSi
 	init( SHARDED_ROCKSDB_LEVEL0_SLOWDOWN_WRITES_TRIGGER,         20 ); // RocksDB default.
 	init( SHARDED_ROCKSDB_LEVEL0_STOP_WRITES_TRIGGER,             36 ); // RocksDB default.
 	init( SHARDED_ROCKSDB_MAX_OPEN_FILES,                      50000 ); // Should be smaller than OS's fd limit.
+	init( SHARDED_ROCKSDB_COMPACTION_PRI,                          3 ); // kMinOverlappingRatio, RocksDB default.
 	init( SHARDED_ROCKSDB_DELAY_COMPACTION_FOR_DATA_MOVE,       false); if (isSimulated) SHARDED_ROCKSDB_DELAY_COMPACTION_FOR_DATA_MOVE = deterministicRandom()->coinflip();
 	init (SHARDED_ROCKSDB_READ_ASYNC_IO,                       false ); if (isSimulated) SHARDED_ROCKSDB_READ_ASYNC_IO = deterministicRandom()->coinflip();
 	init( SHARDED_ROCKSDB_PREFIX_LEN,                             11 ); if( randomize && BUGGIFY )  SHARDED_ROCKSDB_PREFIX_LEN = deterministicRandom()->randomInt(1, 20);
 	init( SHARDED_ROCKSDB_BLOOM_FILTER_BITS,                       3 ); if( randomize && BUGGIFY )  SHARDED_ROCKSDB_BLOOM_FILTER_BITS = deterministicRandom()->randomInt(3, 10);
 	init (SHARDED_ROCKSDB_MEMTABLE_BLOOM_FILTER_RATIO,           0.1 );
-	init( SHARDED_ROCKSDB_HISTOGRAMS_SAMPLE_RATE,              0.001 ); if( randomize && BUGGIFY ) SHARDED_ROCKSDB_HISTOGRAMS_SAMPLE_RATE = 0;
+	init( SHARDED_ROCKSDB_HISTOGRAMS_SAMPLE_RATE,              0.001 ); if( isSimulated ) SHARDED_ROCKSDB_HISTOGRAMS_SAMPLE_RATE = deterministicRandom()->random01();
 	init( SHARDED_ROCKSDB_USE_DIRECT_IO,                 false ); if (isSimulated) SHARDED_ROCKSDB_USE_DIRECT_IO = deterministicRandom()->coinflip();
+	init( SHARDED_ROCKSDB_FLUSH_PERIOD,                        0.0 ); if (isSimulated) SHARDED_ROCKSDB_FLUSH_PERIOD = deterministicRandom()->randomInt(100, 1000);
 
 
 	// Leader election
