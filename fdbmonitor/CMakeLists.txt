@@ -9,7 +9,7 @@ add_executable(fdbmonitor_tests ${FDBMONITOR_TEST_SRCS})
 get_target_property(fdbclient_target_includes fdbclient INCLUDE_DIRECTORIES)
 target_link_libraries(fdbmonitor_lib PUBLIC SimpleOpt)
 target_link_libraries(fdbmonitor PUBLIC fdbmonitor_lib)
-target_link_libraries(fdbmonitor_tests PUBLIC fdbmonitor_lib Threads::Threads)
+target_link_libraries(fdbmonitor_tests PUBLIC fdbmonitor_lib)
 target_include_directories(fdbmonitor_lib PUBLIC "${fdbclient_target_includes}")
 target_include_directories(fdbmonitor_tests PUBLIC "${fdbclient_target_includes}")
 strip_debug_symbols(fdbmonitor)
@@ -19,6 +19,7 @@ endif()
 # FIXME: This include directory is an ugly hack. We probably want to fix this.
 # as soon as we get rid of the old build system
 target_link_libraries(fdbmonitor PUBLIC Threads::Threads)
+target_link_libraries(fdbmonitor_tests PUBLIC Threads::Threads)
 
 # We don't compile fdbmonitor with thread sanitizer instrumentation, since this
 # appears to change its behavior (it no longer seems to restart killed

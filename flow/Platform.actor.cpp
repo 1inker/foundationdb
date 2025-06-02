@@ -2104,9 +2104,9 @@ static void enableLargePages() {
 	ModifyPrivilege(SE_LOCK_MEMORY_NAME, true);
 	largePagesPrivilegeEnabled = true;
 #else
-		// SOMEDAY: can/should we teach the client how to enable large pages
-		// on Linux? Or just rely on the system to have been configured as
-		// desired?
+	// SOMEDAY: can/should we teach the client how to enable large pages
+	// on Linux? Or just rely on the system to have been configured as
+	// desired?
 #endif
 }
 
@@ -2334,8 +2334,8 @@ void atomicReplace(std::string const& path, std::string const& content, bool tex
 		if (!f)
 			throw io_error();
 #ifdef _WIN32
-			// In Windows case, ReplaceFile API is used which preserves the ownership,
-			// ACLs and other attributes of the original file
+		// In Windows case, ReplaceFile API is used which preserves the ownership,
+		// ACLs and other attributes of the original file
 #elif defined(__unixish__)
 		// get the uid/gid/mode bits of old file and set it on new file, else fail
 		struct stat info;
@@ -3074,8 +3074,11 @@ std::string readFileBytes(std::string const& filename, size_t maxSize) {
 	return ret;
 }
 
-void writeFileBytes(std::string const& filename, const uint8_t* data, size_t count) {
-	std::ofstream ofs(filename, std::fstream::out | std::fstream::binary);
+void writeFileBytes(std::string const& filename, const uint8_t* data, size_t count, bool append) {
+	auto fflags = std::fstream::out | std::fstream::binary;
+	if (append)
+		fflags |= std::fstream::app;
+	std::ofstream ofs(filename, fflags);
 	if (!ofs.good()) {
 		TraceEvent("WriteFileBytes_FileOpenError").detail("Filename", filename).GetLastError();
 		throw io_error();
@@ -3369,7 +3372,11 @@ size_t TmpFile::read(uint8_t* buff, size_t len) {
 }
 
 void TmpFile::write(const uint8_t* buff, size_t len) {
-	writeFileBytes(filename, buff, len);
+	writeFileBytes(filename, buff, len, false);
+}
+
+void TmpFile::append(const uint8_t* buff, size_t len) {
+	writeFileBytes(filename, buff, len, true);
 }
 
 bool TmpFile::destroyFile() {

@@ -52,6 +52,11 @@ struct BackupAndRestoreCorrectnessWorkload : TestWorkload {
 	bool defaultBackup;
 	Optional<std::string> encryptionKeyFileName;
 
+	// This workload is not compatible with RandomRangeLock workload because they will race in locked range
+	void disableFailureInjectionWorkloads(std::set<std::string>& out) const override {
+		out.insert({ "RandomRangeLock" });
+	}
+
 	BackupAndRestoreCorrectnessWorkload(WorkloadContext const& wcx) : TestWorkload(wcx) {
 		locked.set(sharedRandomNumber % 2);
 		backupAfter = getOption(options, "backupAfter"_sr, 10.0);
@@ -682,8 +687,10 @@ struct BackupAndRestoreCorrectnessWorkload : TestWorkload {
 					} else if (deterministicRandom()->random01() < 0.1) {
 						targetVersion = desc.maxRestorableVersion.get();
 					} else if (deterministicRandom()->random01() < 0.5) {
-						targetVersion = deterministicRandom()->randomInt64(desc.minRestorableVersion.get(),
-						                                                   desc.contiguousLogEnd.get());
+						targetVersion = (desc.minRestorableVersion.get() != desc.maxRestorableVersion.get())
+						                    ? deterministicRandom()->randomInt64(desc.minRestorableVersion.get(),
+						                                                         desc.maxRestorableVersion.get())
+						                    : desc.maxRestorableVersion.get();
 					}
 				}
 

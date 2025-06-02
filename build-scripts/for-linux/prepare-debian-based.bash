@@ -6,7 +6,7 @@ BASE_DIR=`dirname $0`
 
 sudo apt update
 
-# wget is required to download cmake 3.24 if you are using Debian 12 to build.
+# wget is required to download cmake 3.24 and jemalloc if you are using Debian 12 to build.
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y wget
 
 $BASE_DIR/prepare-debian-based-cmake.bash 3.24
@@ -30,11 +30,12 @@ sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
   rpm
 
 $BASE_DIR/prepare-debian-based-swift.bash
+$BASE_DIR/prepare-debian-based-jemalloc.bash
 
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-  libjemalloc-dev \
   liblz4-dev \
-  libssl-dev
+  libssl-dev \
+  libz-dev
 
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
   libmono-system-data-datasetextensions4.0-cil \

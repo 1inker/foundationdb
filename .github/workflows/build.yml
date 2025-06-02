@@ -50,8 +50,8 @@ jobs:
             prepare: "debian-based"
             build_on: linux
             parallel: 5
-            image: foundationdb-build:7.4.0-1.ow.build
-            owner: owtech
+            image: foundationdb-build:7.4.1-0.ow.build
+            owner: ${GITHUB_REPOSITORY_OWNER@L}
     runs-on: ${{ matrix.run_on }}
     steps:
       - name: Checkout
@@ -180,12 +180,17 @@ jobs:
       JOSHUA_AGENT_TAG: "rhel8-20220816"
 
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          path: ${{github.workspace}}/src
+
       - name: Install dependencies
         shell: bash
         run: |
           sudo apt-get update
           sudo apt-get install -y sudo wget crudini git python3 python3-pip
-          sudo pip3 install wheel setuptools python-dateutil lxml boto3
+          sudo pip3 install wheel setuptools python-dateutil lxml boto3 pytest
 
       - name: Install FoundationDb
         shell: bash
@@ -227,12 +232,7 @@ jobs:
           podman pull ${{ env.JOSHUA_AGENT_URL }}/joshua-agent:${{ env.JOSHUA_AGENT_TAG }}
           podman create --name joshua-agent -v /etc/foundationdb:/etc/foundationdb -it joshua-agent:${{ env.JOSHUA_AGENT_TAG }}
           podman start joshua-agent
-
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          path: ${{github.workspace}}/src
-  
+ 
       - name: run tests
         shell: bash
         working-directory: ${{github.workspace}}/fdb-joshua

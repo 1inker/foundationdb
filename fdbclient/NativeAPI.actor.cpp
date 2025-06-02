@@ -126,7 +126,7 @@ template <class Interface, class Request, bool P>
 Future<REPLY_TYPE(Request)> loadBalance(
     DatabaseContext* ctx,
     const Reference<LocationInfo> alternatives,
-    RequestStream<Request, P> Interface::*channel,
+    RequestStream<Request, P> Interface::* channel,
     const Request& request = Request(),
     TaskPriority taskID = TaskPriority::DefaultPromiseEndpoint,
     AtMostOnce atMostOnce =
@@ -1559,6 +1559,7 @@ DatabaseContext::DatabaseContext(Reference<AsyncVar<Reference<IClusterConnection
     transactionsFutureVersions("FutureVersions", cc), transactionsNotCommitted("NotCommitted", cc),
     transactionsMaybeCommitted("MaybeCommitted", cc), transactionsResourceConstrained("ResourceConstrained", cc),
     transactionsProcessBehind("ProcessBehind", cc), transactionsThrottled("Throttled", cc),
+    transactionsLockRejected("LockRejected", cc),
     transactionsExpensiveClearCostEstCount("ExpensiveClearCostEstCount", cc),
     transactionGrvFullBatches("NumGrvFullBatches", cc), transactionGrvTimedOutBatches("NumGrvTimedOutBatches", cc),
     transactionCommitVersionNotFoundForSS("CommitVersionNotFoundForSS", cc), anyBGReads(false),
@@ -1872,6 +1873,7 @@ DatabaseContext::DatabaseContext(const Error& err)
     transactionsFutureVersions("FutureVersions", cc), transactionsNotCommitted("NotCommitted", cc),
     transactionsMaybeCommitted("MaybeCommitted", cc), transactionsResourceConstrained("ResourceConstrained", cc),
     transactionsProcessBehind("ProcessBehind", cc), transactionsThrottled("Throttled", cc),
+    transactionsLockRejected("LockRejected", cc),
     transactionsExpensiveClearCostEstCount("ExpensiveClearCostEstCount", cc),
     transactionGrvFullBatches("NumGrvFullBatches", cc), transactionGrvTimedOutBatches("NumGrvTimedOutBatches", cc),
     transactionCommitVersionNotFoundForSS("CommitVersionNotFoundForSS", cc), anyBGReads(false),
@@ -2450,7 +2452,7 @@ const UniqueOrderedOptionList<FDBTransactionOptions>& Database::getTransactionDe
 }
 
 void setNetworkOption(FDBNetworkOptions::Option option, Optional<StringRef> value) {
-	std::regex identifierRegex("^[a-zA-Z0-9_]*$");
+	std::regex identifierRegex("^[a-zA-Z0-9_-]*$");
 	switch (option) {
 	// SOMEDAY: If the network is already started, should these five throw an error?
 	case FDBNetworkOptions::TRACE_ENABLE:
@@ -3104,7 +3106,7 @@ template <class F>
 Future<KeyRangeLocationInfo> getKeyLocation(Database const& cx,
                                             TenantInfo const& tenant,
                                             Key const& key,
-                                            F StorageServerInterface::*member,
+                                            F StorageServerInterface::* member,
                                             SpanContext spanContext,
                                             Optional<UID> debugID,
                                             UseProvisionalProxies useProvisionalProxies,
@@ -3138,7 +3140,7 @@ Future<KeyRangeLocationInfo> getKeyLocation(Database const& cx,
 template <class F>
 Future<KeyRangeLocationInfo> getKeyLocation(Reference<TransactionState> trState,
                                             Key const& key,
-                                            F StorageServerInterface::*member,
+                                            F StorageServerInterface::* member,
                                             Reverse isBackward,
                                             UseTenant useTenant) {
 	CODE_PROBE(!useTenant, "Get key location ignoring tenant");
@@ -3254,7 +3256,7 @@ Future<std::vector<KeyRangeLocationInfo>> getKeyRangeLocations(Database const& c
                                                                KeyRange const& keys,
                                                                int limit,
                                                                Reverse reverse,
-                                                               F StorageServerInterface::*member,
+                                                               F StorageServerInterface::* member,
                                                                SpanContext const& spanContext,
                                                                Optional<UID> const& debugID,
                                                                UseProvisionalProxies useProvisionalProxies,
@@ -3297,7 +3299,7 @@ Future<std::vector<KeyRangeLocationInfo>> getKeyRangeLocations(Reference<Transac
                                                                KeyRange const& keys,
                                                                int limit,
                                                                Reverse reverse,
-                                                               F StorageServerInterface::*member,
+                                                               F StorageServerInterface::* member,
                                                                UseTenant useTenant) {
 	CODE_PROBE(!useTenant, "Get key range locations ignoring tenant");
 	return getKeyRangeLocations(trState->cx,
@@ -4280,7 +4282,7 @@ void transformRangeLimits(GetRangeLimits limits, Reverse reverse, GetKeyValuesFa
 }
 
 template <class GetKeyValuesFamilyRequest>
-PublicRequestStream<GetKeyValuesFamilyRequest> StorageServerInterface::*getRangeRequestStream() {
+PublicRequestStream<GetKeyValuesFamilyRequest> StorageServerInterface::* getRangeRequestStream() {
 	if constexpr (std::is_same<GetKeyValuesFamilyRequest, GetKeyValuesRequest>::value) {
 		return &StorageServerInterface::getKeyValues;
 	} else if (std::is_same<GetKeyValuesFamilyRequest, GetMappedKeyValuesRequest>::value) {
@@ -6176,7 +6178,8 @@ double Transaction::getBackoff(int errCode) {
 	// Set backoff for next time
 	if (errCode == error_code_commit_proxy_memory_limit_exceeded ||
 	    errCode == error_code_grv_proxy_memory_limit_exceeded ||
-	    errCode == error_code_transaction_throttled_hot_shard) {
+	    errCode == error_code_transaction_throttled_hot_shard ||
+	    errCode == error_code_transaction_rejected_range_locked) {
 
 		backoff = std::min(backoff * CLIENT_KNOBS->BACKOFF_GROWTH_RATE, CLIENT_KNOBS->RESOURCE_CONSTRAINED_MAX_BACKOFF);
 	} else {
@@ -6852,7 +6855,8 @@ ACTOR static Future<Void> tryCommit(Reference<TransactionState> trState, CommitT
 			    e.code() != error_code_process_behind && e.code() != error_code_future_version &&
 			    e.code() != error_code_tenant_not_found && e.code() != error_code_illegal_tenant_access &&
 			    e.code() != error_code_proxy_tag_throttled && e.code() != error_code_storage_quota_exceeded &&
-			    e.code() != error_code_tenant_locked && e.code() != error_code_transaction_throttled_hot_shard) {
+			    e.code() != error_code_tenant_locked && e.code() != error_code_transaction_throttled_hot_shard &&
+			    e.code() != error_code_transaction_rejected_range_locked) {
 				TraceEvent(SevError, "TryCommitError").error(e);
 			}
 			if (trState->trLogInfo)
@@ -6970,7 +6974,8 @@ Future<Void> Transaction::commitMutations() {
 		}
 		return commitResult;
 	} catch (Error& e) {
-		if (e.code() == error_code_transaction_throttled_hot_shard) {
+		if (e.code() == error_code_transaction_throttled_hot_shard ||
+		    e.code() == error_code_transaction_rejected_range_locked) {
 			TraceEvent("TransactionThrottledHotShard").error(e);
 			return onError(e);
 		}
@@ -7831,7 +7836,9 @@ Future<Void> Transaction::onError(Error const& e) {
 	    e.code() == error_code_grv_proxy_memory_limit_exceeded || e.code() == error_code_process_behind ||
 	    e.code() == error_code_batch_transaction_throttled || e.code() == error_code_tag_throttled ||
 	    e.code() == error_code_blob_granule_request_failed || e.code() == error_code_proxy_tag_throttled ||
-	    e.code() == error_code_transaction_throttled_hot_shard) {
+	    e.code() == error_code_transaction_throttled_hot_shard ||
+	    (e.code() == error_code_transaction_rejected_range_locked &&
+	     CLIENT_KNOBS->TRANSACTION_LOCK_REJECTION_RETRIABLE)) {
 		if (e.code() == error_code_not_committed)
 			++trState->cx->transactionsNotCommitted;
 		else if (e.code() == error_code_commit_unknown_result)
@@ -7847,11 +7854,16 @@ Future<Void> Transaction::onError(Error const& e) {
 		} else if (e.code() == error_code_proxy_tag_throttled) {
 			++trState->cx->transactionsThrottled;
 			trState->proxyTagThrottledDuration += CLIENT_KNOBS->PROXY_MAX_TAG_THROTTLE_DURATION;
+		} else if (e.code() == error_code_transaction_rejected_range_locked) {
+			++trState->cx->transactionsLockRejected;
 		}
 
 		double backoff = getBackoff(e.code());
 		reset();
 		return delay(backoff, trState->taskID);
+	} else if (e.code() == error_code_transaction_rejected_range_locked) {
+		ASSERT(!CLIENT_KNOBS->TRANSACTION_LOCK_REJECTION_RETRIABLE);
+		++trState->cx->transactionsLockRejected; // throw error
 	}
 	if (e.code() == error_code_transaction_too_old || e.code() == error_code_future_version) {
 		if (e.code() == error_code_transaction_too_old)
