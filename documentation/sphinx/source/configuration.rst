@@ -323,7 +323,7 @@ Backup agent sections
 .. code-block:: ini
 
     [backup_agent]
-    command = /usr/lib/foundationdb/backup_agent/backup_agent
+    command = /usr/bin/backup_agent
     
     [backup_agent.1]
 
