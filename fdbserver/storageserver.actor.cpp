@@ -1010,6 +1010,17 @@ struct TenantSSInfo {
 	}
 };
 
+struct SSBulkLoadMetrics {
+public:
+	SSBulkLoadMetrics() : ongoingTasks(0) {}
+	void addTask() { ongoingTasks++; }
+	void removeTask() { ongoingTasks--; }
+	int getOngoingTasks() { return ongoingTasks; }
+
+private:
+	int ongoingTasks = 0;
+};
+
 struct StorageServer : public IStorageMetricsService {
 	typedef VersionedMap<KeyRef, ValueOrClearToRef> VersionedData;
 
@@ -1535,20 +1546,20 @@ public:
 		// expensive.
 		Counter pTreeClearSplits;
 
-		LatencySample readLatencySample;
-		LatencySample readKeyLatencySample;
-		LatencySample readValueLatencySample;
-		LatencySample readRangeLatencySample;
-		LatencySample readVersionWaitSample;
-		LatencySample readQueueWaitSample;
-		LatencySample kvReadRangeLatencySample;
-		LatencySample updateLatencySample;
-		LatencySample updateEncryptionLatencySample;
-
+		std::unique_ptr<LatencySample> readLatencySample;
+		std::unique_ptr<LatencySample> readKeyLatencySample;
+		std::unique_ptr<LatencySample> readValueLatencySample;
+		std::unique_ptr<LatencySample> readRangeLatencySample;
+		std::unique_ptr<LatencySample> readVersionWaitSample;
+		std::unique_ptr<LatencySample> readQueueWaitSample;
+		std::unique_ptr<LatencySample> kvReadRangeLatencySample;
+		std::unique_ptr<LatencySample> updateLatencySample;
+		std::unique_ptr<LatencySample> updateEncryptionLatencySample;
 		LatencyBands readLatencyBands;
 		std::unique_ptr<LatencySample> mappedRangeSample; // Samples getMappedRange latency
 		std::unique_ptr<LatencySample> mappedRangeRemoteSample; // Samples getMappedRange remote subquery latency
 		std::unique_ptr<LatencySample> mappedRangeLocalSample; // Samples getMappedRange local subquery latency
+		std::unique_ptr<LatencySample> ingestDurationLatencySample;
 
 		explicit Counters(StorageServer* self)
 		  : CommonStorageCounters("StorageServer", self->thisServerID.toString(), &self->metrics),
@@ -1583,42 +1594,43 @@ public:
 		    changeServerKeysAssigned("ChangeServerKeysAssigned", cc),
 		    changeServerKeysUnassigned("ChangeServerKeysUnassigned", cc),
 		    kvClearRangesInFetchKeys("KvClearRangesInFetchKeys", cc),
-		    readLatencySample("ReadLatencyMetrics",
-		                      self->thisServerID,
-		                      SERVER_KNOBS->LATENCY_METRICS_LOGGING_INTERVAL,
-		                      SERVER_KNOBS->LATENCY_SKETCH_ACCURACY),
-		    readKeyLatencySample("GetKeyMetrics",
-		                         self->thisServerID,
-		                         SERVER_KNOBS->LATENCY_METRICS_LOGGING_INTERVAL,
-		                         SERVER_KNOBS->LATENCY_SKETCH_ACCURACY),
-		    readValueLatencySample("GetValueMetrics",
-		                           self->thisServerID,
-		                           SERVER_KNOBS->LATENCY_METRICS_LOGGING_INTERVAL,
-		                           SERVER_KNOBS->LATENCY_SKETCH_ACCURACY),
-		    readRangeLatencySample("GetRangeMetrics",
-		                           self->thisServerID,
-		                           SERVER_KNOBS->LATENCY_METRICS_LOGGING_INTERVAL,
-		                           SERVER_KNOBS->LATENCY_SKETCH_ACCURACY),
-		    readVersionWaitSample("ReadVersionWaitMetrics",
-		                          self->thisServerID,
-		                          SERVER_KNOBS->LATENCY_METRICS_LOGGING_INTERVAL,
-		                          SERVER_KNOBS->LATENCY_SKETCH_ACCURACY),
-		    readQueueWaitSample("ReadQueueWaitMetrics",
-		                        self->thisServerID,
-		                        SERVER_KNOBS->LATENCY_METRICS_LOGGING_INTERVAL,
-		                        SERVER_KNOBS->LATENCY_SKETCH_ACCURACY),
-		    kvReadRangeLatencySample("KVGetRangeMetrics",
-		                             self->thisServerID,
-		                             SERVER_KNOBS->LATENCY_METRICS_LOGGING_INTERVAL,
-		                             SERVER_KNOBS->LATENCY_SKETCH_ACCURACY),
-		    updateLatencySample("UpdateLatencyMetrics",
-		                        self->thisServerID,
-		                        SERVER_KNOBS->LATENCY_METRICS_LOGGING_INTERVAL,
-		                        SERVER_KNOBS->LATENCY_SKETCH_ACCURACY),
-		    updateEncryptionLatencySample("UpdateEncryptionLatencyMetrics",
-		                                  self->thisServerID,
-		                                  SERVER_KNOBS->LATENCY_METRICS_LOGGING_INTERVAL,
-		                                  SERVER_KNOBS->LATENCY_SKETCH_ACCURACY),
+		    readLatencySample(std::make_unique<LatencySample>("ReadLatencyMetrics",
+		                                                      self->thisServerID,
+		                                                      SERVER_KNOBS->LATENCY_METRICS_LOGGING_INTERVAL,
+		                                                      SERVER_KNOBS->LATENCY_SKETCH_ACCURACY)),
+		    readKeyLatencySample(std::make_unique<LatencySample>("GetKeyMetrics",
+		                                                         self->thisServerID,
+		                                                         SERVER_KNOBS->LATENCY_METRICS_LOGGING_INTERVAL,
+		                                                         SERVER_KNOBS->LATENCY_SKETCH_ACCURACY)),
+		    readValueLatencySample(std::make_unique<LatencySample>("GetValueMetrics",
+		                                                           self->thisServerID,
+		                                                           SERVER_KNOBS->LATENCY_METRICS_LOGGING_INTERVAL,
+		                                                           SERVER_KNOBS->LATENCY_SKETCH_ACCURACY)),
+		    readRangeLatencySample(std::make_unique<LatencySample>("GetRangeMetrics",
+		                                                           self->thisServerID,
+		                                                           SERVER_KNOBS->LATENCY_METRICS_LOGGING_INTERVAL,
+		                                                           SERVER_KNOBS->LATENCY_SKETCH_ACCURACY)),
+		    readVersionWaitSample(std::make_unique<LatencySample>("ReadVersionWaitMetrics",
+		                                                          self->thisServerID,
+		                                                          SERVER_KNOBS->LATENCY_METRICS_LOGGING_INTERVAL,
+		                                                          SERVER_KNOBS->LATENCY_SKETCH_ACCURACY)),
+		    readQueueWaitSample(std::make_unique<LatencySample>("ReadQueueWaitMetrics",
+		                                                        self->thisServerID,
+		                                                        SERVER_KNOBS->LATENCY_METRICS_LOGGING_INTERVAL,
+		                                                        SERVER_KNOBS->LATENCY_SKETCH_ACCURACY)),
+		    kvReadRangeLatencySample(std::make_unique<LatencySample>("KVGetRangeMetrics",
+		                                                             self->thisServerID,
+		                                                             SERVER_KNOBS->LATENCY_METRICS_LOGGING_INTERVAL,
+		                                                             SERVER_KNOBS->LATENCY_SKETCH_ACCURACY)),
+		    updateLatencySample(std::make_unique<LatencySample>("UpdateLatencyMetrics",
+		                                                        self->thisServerID,
+		                                                        SERVER_KNOBS->LATENCY_METRICS_LOGGING_INTERVAL,
+		                                                        SERVER_KNOBS->LATENCY_SKETCH_ACCURACY)),
+		    updateEncryptionLatencySample(
+		        std::make_unique<LatencySample>("UpdateEncryptionLatencyMetrics",
+		                                        self->thisServerID,
+		                                        SERVER_KNOBS->LATENCY_METRICS_LOGGING_INTERVAL,
+		                                        SERVER_KNOBS->LATENCY_SKETCH_ACCURACY)),
 		    readLatencyBands("ReadLatencyBands", self->thisServerID, SERVER_KNOBS->STORAGE_LOGGING_DELAY),
 		    mappedRangeSample(std::make_unique<LatencySample>("GetMappedRangeMetrics",
 		                                                      self->thisServerID,
@@ -1631,7 +1643,11 @@ public:
 		    mappedRangeLocalSample(std::make_unique<LatencySample>("GetMappedRangeLocalMetrics",
 		                                                           self->thisServerID,
 		                                                           SERVER_KNOBS->LATENCY_METRICS_LOGGING_INTERVAL,
-		                                                           SERVER_KNOBS->LATENCY_SKETCH_ACCURACY)) {
+		                                                           SERVER_KNOBS->LATENCY_SKETCH_ACCURACY)),
+		    ingestDurationLatencySample(std::make_unique<LatencySample>("IngestDurationMetrics",
+		                                                                self->thisServerID,
+		                                                                SERVER_KNOBS->LATENCY_METRICS_LOGGING_INTERVAL,
+		                                                                SERVER_KNOBS->LATENCY_SKETCH_ACCURACY)) {
 			specialCounter(cc, "LastTLogVersion", [self]() { return self->lastTLogVersion; });
 			specialCounter(cc, "Version", [self]() { return self->version.get(); });
 			specialCounter(cc, "StorageVersion", [self]() { return self->storageVersion(); });
@@ -1686,6 +1702,8 @@ public:
 	BGTenantMap tenantData;
 
 	std::shared_ptr<AccumulativeChecksumValidator> acsValidator = nullptr;
+
+	std::shared_ptr<SSBulkLoadMetrics> bulkLoadMetrics = nullptr;
 
 	StorageServer(IKeyValueStore* storage,
 	              Reference<AsyncVar<ServerDBInfo> const> const& db,
@@ -1754,7 +1772,8 @@ public:
 	    acsValidator(CLIENT_KNOBS->ENABLE_MUTATION_CHECKSUM && CLIENT_KNOBS->ENABLE_ACCUMULATIVE_CHECKSUM &&
 	                         !SERVER_KNOBS->ENABLE_VERSION_VECTOR && !SERVER_KNOBS->ENABLE_VERSION_VECTOR_TLOG_UNICAST
 	                     ? std::make_shared<AccumulativeChecksumValidator>()
-	                     : nullptr) {
+	                     : nullptr),
+	    bulkLoadMetrics(std::make_shared<SSBulkLoadMetrics>()) {
 		readPriorityRanks = parseStringToVector<int>(SERVER_KNOBS->STORAGESERVER_READTYPE_PRIORITY_MAP, ',');
 		ASSERT(readPriorityRanks.size() > (int)ReadType::MAX);
 		version.initMetric("StorageServer.Version"_sr, counters.cc.getId());
@@ -2027,7 +2046,8 @@ public:
 		                          versionLag,
 		                          lastUpdate,
 		                          counters.bytesDurable.getValue(),
-		                          counters.bytesInput.getValue());
+		                          counters.bytesInput.getValue(),
+		                          bulkLoadMetrics->getOngoingTasks());
 	}
 
 	void getSplitMetrics(const SplitMetricsRequest& req) override { this->metrics.splitMetrics(req); }
@@ -2521,7 +2541,7 @@ ACTOR Future<Void> getValueQ(StorageServer* data, GetValueRequest req) {
 
 		// Track time from requestTime through now as read queueing wait time
 		state double queueWaitEnd = g_network->timer();
-		data->counters.readQueueWaitSample.addMeasurement(queueWaitEnd - req.requestTime());
+		data->counters.readQueueWaitSample->addMeasurement(queueWaitEnd - req.requestTime());
 
 		if (req.options.present() && req.options.get().debugID.present())
 			g_traceBatch.addEvent("GetValueDebug",
@@ -2531,7 +2551,7 @@ ACTOR Future<Void> getValueQ(StorageServer* data, GetValueRequest req) {
 		state Optional<Value> v;
 		Version commitVersion = getLatestCommitVersion(req.ssLatestCommitVersions, data->tag);
 		state Version version = wait(waitForVersion(data, commitVersion, req.version, req.spanContext));
-		data->counters.readVersionWaitSample.addMeasurement(g_network->timer() - queueWaitEnd);
+		data->counters.readVersionWaitSample->addMeasurement(g_network->timer() - queueWaitEnd);
 
 		if (req.options.present() && req.options.get().debugID.present())
 			g_traceBatch.addEvent("GetValueDebug",
@@ -2629,8 +2649,8 @@ ACTOR Future<Void> getValueQ(StorageServer* data, GetValueRequest req) {
 	++data->counters.finishedQueries;
 
 	double duration = g_network->timer() - req.requestTime();
-	data->counters.readLatencySample.addMeasurement(duration);
-	data->counters.readValueLatencySample.addMeasurement(duration);
+	data->counters.readLatencySample->addMeasurement(duration);
+	data->counters.readValueLatencySample->addMeasurement(duration);
 	if (data->latencyBandConfig.present()) {
 		int maxReadBytes =
 		    data->latencyBandConfig.get().readConfig.maxReadBytes.orDefault(std::numeric_limits<int>::max());
@@ -4727,7 +4747,7 @@ ACTOR Future<Void> getKeyValuesQ(StorageServer* data, GetKeyValuesRequest req)
 
 	// Track time from requestTime through now as read queueing wait time
 	state double queueWaitEnd = g_network->timer();
-	data->counters.readQueueWaitSample.addMeasurement(queueWaitEnd - req.requestTime());
+	data->counters.readQueueWaitSample->addMeasurement(queueWaitEnd - req.requestTime());
 
 	try {
 		if (req.options.present() && req.options.get().debugID.present())
@@ -4744,7 +4764,7 @@ ACTOR Future<Void> getKeyValuesQ(StorageServer* data, GetKeyValuesRequest req)
 		    .detail("DebugID",
 		            req.options.present() && req.options.get().debugID.present() ? req.options.get().debugID.get()
 		                                                                         : UID());
-		data->counters.readVersionWaitSample.addMeasurement(g_network->timer() - queueWaitEnd);
+		data->counters.readVersionWaitSample->addMeasurement(g_network->timer() - queueWaitEnd);
 
 		data->checkTenantEntry(version, req.tenantInfo, req.options.present() ? req.options.get().lockAware : false);
 		if (req.tenantInfo.hasTenant()) {
@@ -4851,7 +4871,7 @@ ACTOR Future<Void> getKeyValuesQ(StorageServer* data, GetKeyValuesRequest req)
 			                                      req.options,
 			                                      req.tenantInfo.prefix));
 			const double duration = g_network->timer() - kvReadRange;
-			data->counters.kvReadRangeLatencySample.addMeasurement(duration);
+			data->counters.kvReadRangeLatencySample->addMeasurement(duration);
 			GetKeyValuesReply r = _r;
 
 			if (req.options.present() && req.options.get().debugID.present())
@@ -4880,6 +4900,7 @@ ACTOR Future<Void> getKeyValuesQ(StorageServer* data, GetKeyValuesRequest req)
 			for (int i = 0; i < r.data.size(); i++) {
 				totalByteSize += r.data[i].expectedSize();
 			}
+
 			if (totalByteSize > 0 && SERVER_KNOBS->READ_SAMPLING_ENABLED) {
 				int64_t bytesReadPerKSecond = std::max(totalByteSize, SERVER_KNOBS->EMPTY_READ_PENALTY) / 2;
 				data->metrics.notifyBytesReadPerKSecond(addPrefix(r.data[0].key, req.tenantInfo.prefix, req.arena),
@@ -4911,8 +4932,8 @@ ACTOR Future<Void> getKeyValuesQ(StorageServer* data, GetKeyValuesRequest req)
 	++data->counters.finishedQueries;
 
 	double duration = g_network->timer() - req.requestTime();
-	data->counters.readLatencySample.addMeasurement(duration);
-	data->counters.readRangeLatencySample.addMeasurement(duration);
+	data->counters.readLatencySample->addMeasurement(duration);
+	data->counters.readRangeLatencySample->addMeasurement(duration);
 	if (data->latencyBandConfig.present()) {
 		int maxReadBytes =
 		    data->latencyBandConfig.get().readConfig.maxReadBytes.orDefault(std::numeric_limits<int>::max());
@@ -6689,7 +6710,7 @@ ACTOR Future<Void> getMappedKeyValuesQ(StorageServer* data, GetMappedKeyValuesRe
 
 	// Track time from requestTime through now as read queueing wait time
 	state double queueWaitEnd = g_network->timer();
-	data->counters.readQueueWaitSample.addMeasurement(queueWaitEnd - req.requestTime());
+	data->counters.readQueueWaitSample->addMeasurement(queueWaitEnd - req.requestTime());
 
 	try {
 		if (req.options.present() && req.options.get().debugID.present())
@@ -6698,7 +6719,7 @@ ACTOR Future<Void> getMappedKeyValuesQ(StorageServer* data, GetMappedKeyValuesRe
 		// VERSION_VECTOR change
 		Version commitVersion = getLatestCommitVersion(req.ssLatestCommitVersions, data->tag);
 		state Version version = wait(waitForVersion(data, commitVersion, req.version, span.context));
-		data->counters.readVersionWaitSample.addMeasurement(g_network->timer() - queueWaitEnd);
+		data->counters.readVersionWaitSample->addMeasurement(g_network->timer() - queueWaitEnd);
 
 		data->checkTenantEntry(version, req.tenantInfo, req.options.present() ? req.options.get().lockAware : false);
 		if (req.tenantInfo.hasTenant()) {
@@ -6857,7 +6878,7 @@ ACTOR Future<Void> getMappedKeyValuesQ(StorageServer* data, GetMappedKeyValuesRe
 	++data->counters.finishedGetMappedRangeQueries;
 
 	double duration = g_network->timer() - req.requestTime();
-	data->counters.readLatencySample.addMeasurement(duration);
+	data->counters.readLatencySample->addMeasurement(duration);
 	data->counters.mappedRangeSample->addMeasurement(duration);
 	if (data->latencyBandConfig.present()) {
 		int maxReadBytes =
@@ -7104,12 +7125,12 @@ ACTOR Future<Void> getKeyQ(StorageServer* data, GetKeyRequest req) {
 
 	// Track time from requestTime through now as read queueing wait time
 	state double queueWaitEnd = g_network->timer();
-	data->counters.readQueueWaitSample.addMeasurement(queueWaitEnd - req.requestTime());
+	data->counters.readQueueWaitSample->addMeasurement(queueWaitEnd - req.requestTime());
 
 	try {
 		Version commitVersion = getLatestCommitVersion(req.ssLatestCommitVersions, data->tag);
 		state Version version = wait(waitForVersion(data, commitVersion, req.version, req.spanContext));
-		data->counters.readVersionWaitSample.addMeasurement(g_network->timer() - queueWaitEnd);
+		data->counters.readVersionWaitSample->addMeasurement(g_network->timer() - queueWaitEnd);
 
 		data->checkTenantEntry(version, req.tenantInfo, req.options.map(&ReadOptions::lockAware).orDefault(false));
 		if (req.tenantInfo.hasTenant()) {
@@ -7172,8 +7193,8 @@ ACTOR Future<Void> getKeyQ(StorageServer* data, GetKeyRequest req) {
 	++data->counters.finishedQueries;
 
 	double duration = g_network->timer() - req.requestTime();
-	data->counters.readLatencySample.addMeasurement(duration);
-	data->counters.readKeyLatencySample.addMeasurement(duration);
+	data->counters.readLatencySample->addMeasurement(duration);
+	data->counters.readKeyLatencySample->addMeasurement(duration);
 
 	if (data->latencyBandConfig.present()) {
 		int maxReadBytes =
@@ -8884,12 +8905,87 @@ ACTOR Future<Void> tryGetRangeForBulkLoad(PromiseStream<RangeResult> results,
 		if (e.code() == error_code_actor_cancelled) {
 			throw;
 		}
-		if (e.code() == error_code_inverted_range) {
-			TraceEvent(SevError, "Zhe1").detail("Keys", keys);
-		}
 		results.sendError(bulkload_task_failed());
 		throw;
 	}
+}
+
+// Utility function to process sample files during bulk load
+ACTOR static Future<Void> processSampleFiles(StorageServer* data,
+                                             std::string bulkLoadLocalDir,
+                                             std::shared_ptr<BulkLoadFileSetKeyMap> localFileSets) {
+	state BulkLoadFileSetKeyMap::const_iterator iter = localFileSets->begin();
+	state BulkLoadFileSetKeyMap::const_iterator end = localFileSets->end();
+	state std::vector<KeyValue> rawSamples;
+	state std::unique_ptr<IRocksDBSstFileReader> reader;
+
+	while (iter != end) {
+		const auto& [range, fileSet] = *iter;
+		if (fileSet.hasByteSampleFile()) {
+			state std::string sampleFilePath = fileSet.getBytesSampleFileFullPath();
+			state int retryCount = 0;
+			state int maxRetries = 10; // Consider making this a KNOB
+			state Error lastError;
+
+			// This outer loop retries reading the entire file if errors occur during opening/reading
+			while (retryCount < maxRetries) {
+				try {
+					// Read all samples from the SST file into memory first
+					// Store as KeyValueRef to keep the original encoded size value
+					rawSamples.clear();
+					reader = newRocksDBSstFileReader();
+					reader->open(abspath(sampleFilePath));
+
+					TraceEvent(SevInfo, "StorageServerProcessingSampleFile", data->thisServerID)
+					    .detail("File", sampleFilePath);
+
+					// Read all samples
+					while (reader->hasNext()) {
+						// Copy the next kv to rawSamples.
+						rawSamples.push_back(reader->next());
+					}
+
+					// Now apply all read samples to the in-memory set and update metrics
+					for (const auto& kv : rawSamples) {
+						const KeyRef& key = kv.key;
+						int64_t size = BinaryReader::fromStringRef<int64_t>(kv.value, Unversioned());
+						data->metrics.byteSample.sample.insert(key, size);
+						data->metrics.notifyBytes(key, size);
+						data->addMutationToMutationLogOrStorage(
+						    invalidVersion,
+						    MutationRef(MutationRef::SetValue, key.withPrefix(persistByteSampleKeys.begin), kv.value));
+					}
+
+					// If we get here, processing was successful for this file
+					break; // Exit the retry loop
+
+				} catch (Error& e) {
+					lastError = e;
+					retryCount++;
+					TraceEvent(retryCount < maxRetries ? SevWarn : SevError,
+					           "StorageServerSampleFileProcessingError",
+					           data->thisServerID)
+					    .error(e) // Log the actual error 'e'
+					    .detail("File", sampleFilePath)
+					    // REMOVED: .detail("Key", kv.key).detail("Value", kv.value) as 'kv' is out of scope
+					    .detail("RetryCount", retryCount)
+					    .detail("MaxRetries", maxRetries);
+
+					// No need to check/close reader here, unique_ptr handles it.
+
+					if (retryCount < maxRetries) {
+						// Wait before retrying, with exponential backoff
+						wait(delay(0.1 * pow(2, retryCount))); // Consider adding jitter
+						continue; // Retry reading the file
+					}
+					// On final retry failure, throw the last error encountered
+					throw lastError;
+				}
+			} // end retry loop
+		}
+		++iter;
+	} // end file iteration loop
+	return Void();
 }
 
 ACTOR Future<Void> fetchKeys(StorageServer* data, AddingShard* shard) {
@@ -8923,10 +9019,12 @@ ACTOR Future<Void> fetchKeys(StorageServer* data, AddingShard* shard) {
 	    {}, SERVER_KNOBS->FETCH_KEYS_LOWER_PRIORITY ? ReadType::FETCH : ReadType::NORMAL, CacheResult::False);
 
 	if (conductBulkLoad) {
-		TraceEvent(bulkLoadVerboseEventSev(), "SSBulkLoadTaskFetchKey", data->thisServerID)
+		TraceEvent(bulkLoadPerfEventSev(), "SSBulkLoadTaskFetchKey", data->thisServerID)
 		    .detail("DataMoveId", dataMoveId.toString())
 		    .detail("Range", keys)
-		    .detail("Phase", "Begin");
+		    .detail("Phase", "Begin")
+		    .detail("ConcurrentTasks", data->bulkLoadMetrics->getOngoingTasks());
+		data->bulkLoadMetrics->addTask();
 	}
 
 	// need to set this at the very start of the fetch, to handle any private change feed destroy mutations we get
@@ -9034,7 +9132,7 @@ ACTOR Future<Void> fetchKeys(StorageServer* data, AddingShard* shard) {
 			tr.setOption(FDBTransactionOptions::LOCK_AWARE);
 			if (!isFullRestore && SERVER_KNOBS->ENABLE_REPLICA_CONSISTENCY_CHECK_ON_DATA_MOVEMENT) {
 				tr.setOption(FDBTransactionOptions::ENABLE_REPLICA_CONSISTENCY_CHECK);
-				int64_t requiredReplicas = SERVER_KNOBS->CONSISTENCY_CHECK_REQUIRED_REPLICAS;
+				int64_t requiredReplicas = SERVER_KNOBS->DATAMOVE_CONSISTENCY_CHECK_REQUIRED_REPLICAS;
 				tr.setOption(FDBTransactionOptions::CONSISTENCY_CHECK_REQUIRED_REPLICAS,
 				             StringRef((uint8_t*)&requiredReplicas, sizeof(int64_t)));
 			}
@@ -9135,9 +9233,50 @@ ACTOR Future<Void> fetchKeys(StorageServer* data, AddingShard* shard) {
 				TraceEvent(bulkLoadVerboseEventSev(), "SSBulkLoadTaskFetchKey", data->thisServerID)
 				    .detail("DataMoveId", dataMoveId.toString())
 				    .detail("Range", keys)
+				    .detail("Knobs", SERVER_KNOBS->BULK_LOAD_USE_SST_INGEST)
+				    .detail("SupportsSstIngestion", data->storage.getKeyValueStore()->supportsSstIngestion())
 				    .detail("Phase", "File download");
-				hold = tryGetRangeForBulkLoad(results, keys, localBulkLoadFileSets);
-				rangeEnd = keys.end;
+				// Attempt SST ingestion...
+				if (SERVER_KNOBS->BULK_LOAD_USE_SST_INGEST &&
+				    data->storage.getKeyValueStore()->supportsSstIngestion()) {
+					TraceEvent(bulkLoadVerboseEventSev(), "SSBulkLoadTaskFetchKey", data->thisServerID)
+					    .detail("DataMoveId", dataMoveId.toString())
+					    .detail("Range", keys)
+					    .detail("Phase", "SST ingestion");
+					// Verify ranges...
+					for (const auto& [range, fileSet] : *localBulkLoadFileSets) {
+						ASSERT(keys.contains(range));
+					}
+					// Clear the key range before ingestion. This mirrors the replaceRange done in the case were
+					// we do not ingest SST files.
+					data->storage.getKeyValueStore()->clear(keys);
+
+					// Now wait on the durableVersion to be updated so clear has been committed.
+					wait(data->durableVersion.whenAtLeast(data->storageVersion() + 1));
+
+					// Compact the range before ingestion to optimize storage
+					wait(data->storage.getKeyValueStore()->compactRange(keys));
+
+					// Ingest the SST files.
+					// Measure duration at this level so we capture the inter-thread handoff time.
+					state double ingestStartTime = g_network->timer(); // Record start time
+					wait(data->storage.getKeyValueStore()->ingestSSTFiles(localBulkLoadFileSets));
+					const double ingestDuration = g_network->timer() - ingestStartTime;
+					data->counters.ingestDurationLatencySample->addMeasurement(ingestDuration);
+
+					// Compact the range after ingestion to avoid accumulating compaction overtime
+					wait(data->storage.getKeyValueStore()->compactRange(keys));
+
+					// Process sample files after SST ingestion
+					wait(processSampleFiles(data, bulkLoadLocalDir, localBulkLoadFileSets));
+
+					// NOTICE: We break the 'fetchKeys' loop here if we successfully ingest the SST files.
+					// EARLY EXIT FROM 'fetchKeys' LOOP!!!
+					break;
+				} else {
+					hold = tryGetRangeForBulkLoad(results, keys, localBulkLoadFileSets);
+					rangeEnd = keys.end;
+				}
 			} else {
 				hold = tryGetRange(results, &tr, keys);
 				rangeEnd = keys.end;
@@ -9182,7 +9321,9 @@ ACTOR Future<Void> fetchKeys(StorageServer* data, AddingShard* shard) {
 							               data->thisServerID);
 						}
 					}
-					metricReporter.addFetchedBytes(expectedBlockSize, this_block.size());
+					if (!conductBulkLoad) {
+						metricReporter.addFetchedBytes(expectedBlockSize, this_block.size());
+					}
 					totalBytes += expectedBlockSize;
 
 					if (shard->reason != DataMovementReason::INVALID &&
@@ -9219,6 +9360,7 @@ ACTOR Future<Void> fetchKeys(StorageServer* data, AddingShard* shard) {
 					for (; kvItr != this_block.end(); ++kvItr) {
 						data->byteSampleApplySet(*kvItr, invalidVersion);
 					}
+
 					if (this_block.more) {
 						blockBegin = this_block.getReadThrough();
 					} else {
@@ -9235,6 +9377,9 @@ ACTOR Future<Void> fetchKeys(StorageServer* data, AddingShard* shard) {
 			} catch (Error& e) {
 				if (!fetchKeyCanRetry(e)) {
 					throw e;
+				}
+				if (!conductBulkLoad) {
+					data->counters.fetchKeyErrors += 1;
 				}
 				lastError = e;
 				if (lastError.code() == error_code_storage_replica_comparison_error) {
@@ -9307,6 +9452,16 @@ ACTOR Future<Void> fetchKeys(StorageServer* data, AddingShard* shard) {
 				}
 				break;
 			}
+		} // fetchKeys loop.
+
+		if (conductBulkLoad && !SERVER_KNOBS->BULK_LOAD_USE_SST_INGEST &&
+		    data->storage.getKeyValueStore()->supportsSstIngestion()) {
+			// This block is for the fetchKey without SST ingestion case.
+			// For the SST ingestion case, we have already compacted the range right after ingestion.
+			// Wait until the load data has been committed.
+			wait(data->durableVersion.whenAtLeast(data->storageVersion() + 1));
+			// Compact the range after ingestion to avoid accumulating compaction overtime.
+			wait(data->storage.getKeyValueStore()->compactRange(keys));
 		}
 
 		// We have completed the fetch and write of the data, now we wait for MVCC window to pass.
@@ -9507,6 +9662,7 @@ ACTOR Future<Void> fetchKeys(StorageServer* data, AddingShard* shard) {
 
 		TraceEvent(SevDebug, interval.end(), data->thisServerID);
 		if (conductBulkLoad) {
+			data->bulkLoadMetrics->removeTask();
 			// Do best effort cleanup
 			clearFileFolder(bulkLoadLocalDir, data->thisServerID, /*ignoreError=*/true);
 		}
@@ -9543,6 +9699,7 @@ ACTOR Future<Void> fetchKeys(StorageServer* data, AddingShard* shard) {
 		if (e.code() != error_code_actor_cancelled)
 			data->otherError.sendError(e); // Kill the storage server.  Are there any recoverable errors?
 		if (conductBulkLoad) {
+			data->bulkLoadMetrics->removeTask();
 			// Do best effort cleanup
 			clearFileFolder(bulkLoadLocalDir, data->thisServerID, /*ignoreError=*/true);
 		}
@@ -12465,8 +12622,8 @@ ACTOR Future<Void> update(StorageServer* data, bool* pReceivedUpdate) {
 			data->behind = false;
 		}
 		const double duration = g_network->timer() - updateStart;
-		data->counters.updateEncryptionLatencySample.addMeasurement(decryptionTime);
-		data->counters.updateLatencySample.addMeasurement(duration);
+		data->counters.updateEncryptionLatencySample->addMeasurement(decryptionTime);
+		data->counters.updateLatencySample->addMeasurement(duration);
 
 		return Void(); // update will get called again ASAP
 	} catch (Error& err) {
@@ -15153,6 +15310,7 @@ ACTOR Future<Void> storageServer(IKeyValueStore* persistentData,
 	static_assert(sizeof(self) < 16384, "FastAlloc doesn't allow allocations larger than 16KB");
 	TraceEvent("StorageServerInitProgress", ssi.id())
 	    .detail("EngineType", self.storage.getKeyValueStoreType().toString())
+	    .detail("Size", sizeof(self))
 	    .detail("Step", "4.StartInit");
 
 	self.sk = serverKeysPrefixFor(self.tssPairID.present() ? self.tssPairID.get() : self.thisServerID)

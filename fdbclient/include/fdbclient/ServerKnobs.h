@@ -199,8 +199,11 @@ public:
 	// STORAGE_FETCH_KEYS_RATE_LIMIT.
 	int FETCH_KEYS_THROTTLE_PRIORITY_THRESHOLD;
 
-	bool ENABLE_REPLICA_CONSISTENCY_CHECK_ON_DATA_MOVEMENT;
-	int CONSISTENCY_CHECK_REQUIRED_REPLICAS;
+	bool ENABLE_REPLICA_CONSISTENCY_CHECK_ON_DATA_MOVEMENT; // Enable to check replica consistency on data movement
+	int DATAMOVE_CONSISTENCY_CHECK_REQUIRED_REPLICAS; // The number of extra replicas to check for replica consistency
+	                                                  // on data movement read range requests by fetchKeys
+	bool ENABLE_CONSERVATIVE_RELOCATION_WHEN_REPLICA_CONSISTENCY_CHECK; // Enable to slow down relocation when replica
+	                                                                    // consistency check on data movement is enabled
 
 	// Probability that a team redundant data move set TrueBest when get destination team
 	double PROBABILITY_TEAM_REDUNDANT_DATAMOVE_CHOOSE_TRUE_BEST_DEST;
@@ -414,6 +417,12 @@ public:
 	int SS_BULKDUMP_BATCH_COUNT_MAX_PER_REQUEST; // the max number of batch count per bulkdump request to a SS
 	int BULKLOAD_ASYNC_READ_WRITE_BLOCK_SIZE; // the block size when performing async read/write for bulkload
 	int MANIFEST_COUNT_MAX_PER_BULKLOAD_TASK; // the max number of manifest that a bulkload task can process
+	bool BULKLOAD_SIM_FAILURE_INJECTION; // Set to true to inject failure in bulkload simulation
+	double DD_BULKLOAD_POWER_OF_D_RATIO; // When selecting the dest team, DD randomly chooses 1/D portion of all valid
+	                                     // teams as the candidates and the DD selects the team with the minimal number
+	                                     // of ongoing tasks from the candidates as the dest team.
+	double DD_BULKLOAD_TASK_SUBMISSION_INTERVAL_SEC; // the seconds that the bulkload task submitter has to wait
+	                                                 // between two tasks
 	bool CC_ENFORCE_USE_UNFIT_DD_IN_SIM; // Set for CC to enforce to use an unfit DD in the simulation. This knob takes
 	                                     // effect only in the simulation.
 	bool DISABLE_AUDIT_STORAGE_FINAL_REPLICA_CHECK_IN_SIM; // Set to disable audit storage replica check in the
@@ -742,7 +751,7 @@ public:
 	double BACKUP_TIMEOUT; // master's reaction time for backup failure
 	double BACKUP_NOOP_POP_DELAY;
 	int BACKUP_FILE_BLOCK_BYTES;
-	int64_t BACKUP_LOCK_BYTES;
+	int64_t BACKUP_WORKER_LOCK_BYTES;
 	double BACKUP_UPLOAD_DELAY;
 
 	// Cluster Controller
@@ -782,7 +791,6 @@ public:
 	double REPLACE_INTERFACE_CHECK_DELAY;
 	double COORDINATOR_REGISTER_INTERVAL;
 	double CLIENT_REGISTER_INTERVAL;
-	bool CC_PAUSE_HEALTH_MONITOR;
 	bool CC_ENABLE_WORKER_HEALTH_MONITOR;
 	double CC_WORKER_HEALTH_CHECKING_INTERVAL; // The interval of refreshing the degraded server list.
 	double CC_DEGRADED_LINK_EXPIRATION_INTERVAL; // The time period from the last degradation report after which a
@@ -1458,6 +1466,8 @@ public:
 
 	// Swift: Enable the Swift runtime hooks and use Swift implementations where possible
 	bool FLOW_WITH_SWIFT;
+
+	bool BULK_LOAD_USE_SST_INGEST; // Enable direct SST file ingestion for RocksDB storage engines
 
 	ServerKnobs(Randomize, ClientKnobs*, IsSimulated);
 	void initialize(Randomize, ClientKnobs*, IsSimulated);

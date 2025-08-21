@@ -121,7 +121,7 @@ test_deploy_pkgs() {
 }
 
 RPM_INSTALL_CMD="dnf install -y"
-DEB_INSTALL_CMD="apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y"
+DEB_INSTALL_CMD="echo 'deb http://archive.debian.org/debian/ buster main' > /etc/apt/sources.list && apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y"
 
 echo "Testing DEBs deploy..."
 test_deploy_pkgs \

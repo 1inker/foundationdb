@@ -199,8 +199,8 @@ void ClientKnobs::initialize(Randomize randomize) {
 	init( RESTORE_RANGES_READ_BATCH,             10000 );
 	init( BLOB_GRANULE_RESTORE_CHECK_INTERVAL,      10 );
 	init( BACKUP_CONTAINER_LOCAL_ALLOW_RELATIVE_PATH, false );
-	init( ENABLE_REPLICA_CONSISTENCY_CHECK_ON_BACKUP_READS, true );
-	init( CONSISTENCY_CHECK_REQUIRED_REPLICAS,      -2 ); // Do consistency check based on all available storage replicas
+	init( ENABLE_REPLICA_CONSISTENCY_CHECK_ON_BACKUP_READS, false ); if( randomize && BUGGIFY ) { ENABLE_REPLICA_CONSISTENCY_CHECK_ON_BACKUP_READS = true; }
+	init( BACKUP_CONSISTENCY_CHECK_REQUIRED_REPLICAS, -2 ); // Do consistency check based on all available storage replicas
 	init( BULKLOAD_JOB_HISTORY_COUNT_MAX,           10 ); if (randomize && BUGGIFY) BULKLOAD_JOB_HISTORY_COUNT_MAX = deterministicRandom()->randomInt(1, 10);
 	init( BULKLOAD_VERBOSE_LEVEL,                   10 );
 	init( S3CLIENT_VERBOSE_LEVEL,                   10 );
@@ -239,6 +239,7 @@ void ClientKnobs::initialize(Randomize randomize) {
 	init( BLOBSTORE_READ_CACHE_BLOCKS_PER_FILE,      2 );
 	init( BLOBSTORE_MULTIPART_MAX_PART_SIZE,  20000000 );
 	init( BLOBSTORE_MULTIPART_MIN_PART_SIZE,   5242880 );
+	init( BLOBSTORE_MULTIPART_RETRY_DELAY_MS,     1000 );
 	init( BLOBSTORE_GLOBAL_CONNECTION_POOL,      false );
 	init( BLOBSTORE_ENABLE_LOGGING,               true );
 	init( BLOBSTORE_STATS_LOGGING_INTERVAL,       10.0 );

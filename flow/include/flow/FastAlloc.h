@@ -25,6 +25,8 @@
 #include "flow/Platform.h"
 #include "flow/config.h"
 
+#include "flow/Error.h"
+
 // ALLOC_INSTRUMENTATION_STDOUT enables non-sampled logging of all allocations and deallocations to stdout to be
 // processed by tools/alloc_instrumentation.py
 // #define ALLOC_INSTRUMENTATION_STDOUT ENABLED(NOT_IN_CLEAN)
@@ -234,7 +236,7 @@ force_inline void freeOrMaybeKeepalive(void* ptr) {
 }
 
 inline constexpr int nextFastAllocatedSize(int x) {
-	assert(x > 0 && x <= 16384);
+	ASSERT(x > 0 && x <= 16384);
 	if (x <= 16)
 		return 16;
 	else if (x <= 32)
