@@ -3,7 +3,7 @@
 #
 # This source file is part of the FoundationDB open source project
 #
-# Copyright 2013-2018 Apple Inc. and the FoundationDB project authors
+# Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -20,28 +20,25 @@
 
 # FoundationDB Python API
 
+import atexit
 import ctypes
 import ctypes.util
-import datetime
 import functools
 import inspect
 import multiprocessing
 import os
 import platform
+import struct
 import sys
 import threading
 import traceback
-
 import weakref
+
 import fdb
-from fdb import six
-from fdb.tuple import pack, unpack
+from fdb.tuple import pack, int2byte
 
 from fdb import fdboptions as _opts
-import types
-import struct
 
-import atexit
 
 _network_thread = None
 _network_thread_reentrant_lock = threading.RLock()
@@ -139,7 +136,6 @@ def fill_options(scope, predicates=False):
             elif paramType == type(""):
                 f = option_wrap_string(code)
             elif paramType == type(b""):
-                # This won't happen in Python 2 because type("") == type(b""), but it will happen in Python 3
                 f = option_wrap_bytes(code)
             elif paramType == type(0):
                 f = option_wrap_int(code)
@@ -195,6 +191,15 @@ def _error_predicate(predicate, error_code):
     return bool(_capi.fdb_error_predicate(predicate, error_code))
 
 
+# define generated types for linters
+class StreamingMode:
+    pass
+
+
+class ConflictRangeType:
+    pass
+
+
 def make_enum(scope):
     _dict = getattr(_opts, scope)
 
@@ -214,7 +219,7 @@ make_enum("ConflictRangeType")
 
 
 def transactional(*tr_args, **tr_kwargs):
-    """Decorate a funcation as transactional.
+    """Decorate a function as transactional.
 
     The decorator looks for a named argument (default "tr") and takes
     one of two actions, depending on the type of the parameter passed
@@ -1345,6 +1350,13 @@ class Tenant(_TransactionCreator):
     def get_id(self):
         return FutureInt64(self.capi.fdb_tenant_get_id(self.tpointer))
 
+    def list_blobbified_ranges(self, begin, end, limit):
+        return FutureKeyValueArray(
+            self.capi.fdb_tenant_list_blobbified_ranges(
+                self.tpointer, begin, len(begin), end, len(end), limit
+            )
+        )
+
 
 fill_operations()
 
@@ -1721,6 +1733,16 @@ def init_c_api():
 
     _capi.fdb_tenant_get_id.argtypes = [ctypes.c_void_p]
     _capi.fdb_tenant_get_id.restype = ctypes.c_void_p
+
+    _capi.fdb_tenant_list_blobbified_ranges.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_int,
+    ]
+    _capi.fdb_tenant_list_blobbified_ranges.restype = ctypes.c_void_p
 
     _capi.fdb_tenant_create_transaction.argtypes = [
         ctypes.c_void_p,
@@ -2145,4 +2167,4 @@ def strinc(key):
     if len(key) == 0:
         raise ValueError("Key must contain at least one byte not equal to 0xFF.")
 
-    return key[:-1] + six.int2byte(ord(key[-1:]) + 1)
+    return key[:-1] + int2byte(ord(key[-1:]) + 1)

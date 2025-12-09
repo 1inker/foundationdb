@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2023 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,11 +22,17 @@
 #define FLOW_OPTIONAL_H
 
 #include <optional>
+#include <fmt/format.h>
 
+#include "flow/Traceable.h"
 #include "flow/FileIdentifier.h"
-#include "flow/Error.h"
+#include "flow/swift_support.h"
+#ifdef WITH_SWIFT
+#include <swift/bridging>
+#endif
 
 class Arena;
+class Void;
 
 // Optional is a wrapper for std::optional. There
 // are two primary reasons to use this wrapper instead
@@ -41,9 +47,14 @@ class Arena;
 //    assertion failures are preferable. This is the main reason we
 //    don't intend to use std::optional directly.
 template <class T>
-class Optional : public ComposedIdentifier<T, 4> {
+class
+#ifdef WITH_SWIFT
+    SWIFT_CONFORMS_TO_PROTOCOL(flow_swift.FlowOptionalProtocol)
+#endif
+        Optional : public ComposedIdentifier<T, 4> {
 public:
 	using ValueType = T;
+	using Wrapped = T;
 
 	Optional() = default;
 
@@ -251,6 +262,12 @@ public:
 	// Ordering: If T is ordered, then Optional() < Optional(t) and (Optional(u)<Optional(v))==(u<v)
 	bool operator<(Optional const& o) const { return impl < o.impl; }
 
+	const T* operator->() const { return &get(); }
+	T* operator->() { return &get(); }
+	const T& operator*() const& { return get(); }
+	T& operator*() & { return get(); }
+	T&& operator*() && { return get(); }
+
 	void reset() { impl.reset(); }
 	size_t hash() const { return hashFunc(impl); }
 
@@ -258,5 +275,15 @@ private:
 	static inline std::hash<std::optional<T>> hashFunc{};
 	std::optional<T> impl;
 };
+
+template <class T>
+struct Traceable<Optional<T>> : std::conditional<Traceable<T>::value, std::true_type, std::false_type>::type {
+	static std::string toString(const Optional<T>& value) {
+		return value.present() ? Traceable<T>::toString(value.get()) : "[not set]";
+	}
+};
+
+template <typename T>
+struct fmt::formatter<Optional<T>> : FormatUsingTraceable<Optional<T>> {};
 
 #endif // FLOW_OPTIONAL_H

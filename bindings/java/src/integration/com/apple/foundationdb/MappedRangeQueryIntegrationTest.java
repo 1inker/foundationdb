@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2018 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -53,7 +53,7 @@ class MappedRangeQueryIntegrationTest {
 		 */
 		try (Database db = openFDB()) {
 			db.run(tr -> {
-				tr.clear(Range.startsWith(new byte[] { (byte)0x00 }));
+				tr.clear(new byte[0], new byte[] { (byte) 0xff });
 				return null;
 			});
 		}
@@ -192,12 +192,12 @@ class MappedRangeQueryIntegrationTest {
 
 	RangeQueryWithIndex mappedRangeQuery = (int begin, int end, Database db) -> db.run(tr -> {
 		try {
-			List<MappedKeyValue> kvs = tr.getMappedRange(KeySelector.firstGreaterOrEqual(indexEntryKey(begin)),
-			                                             KeySelector.firstGreaterOrEqual(indexEntryKey(end)), MAPPER,
-			                                             ReadTransaction.ROW_LIMIT_UNLIMITED,
-			                                             FDBTransaction.MATCH_INDEX_ALL, false, StreamingMode.WANT_ALL)
-			                               .asList()
-			                               .get();
+			List<MappedKeyValue> kvs =
+			    tr.getMappedRange(KeySelector.firstGreaterOrEqual(indexEntryKey(begin)),
+			                      KeySelector.firstGreaterOrEqual(indexEntryKey(end)), MAPPER,
+			                      ReadTransaction.ROW_LIMIT_UNLIMITED, false, StreamingMode.WANT_ALL)
+			        .asList()
+			        .get();
 			Assertions.assertEquals(end - begin, kvs.size());
 
 			if (validate) {

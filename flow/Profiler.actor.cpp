@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -33,7 +33,7 @@
 #include "flow/Platform.h"
 #include "flow/actorcompiler.h" // This must be the last include.
 
-extern volatile thread_local int profilingEnabled;
+extern volatile thread_local int flowProfilingEnabled;
 
 static uint64_t sys_gettid() {
 	return syscall(__NR_gettid);
@@ -146,7 +146,7 @@ struct Profiler {
 		if (inSigHandler.exchange(true)) {
 			return;
 		}
-		if (profilingEnabled) {
+		if (flowProfilingEnabled) {
 			double t = timer();
 			output_buffer->push(*(void**)&t);
 			size_t n = platform::raw_backtrace(addresses, 256);

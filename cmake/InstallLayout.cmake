@@ -181,6 +181,7 @@ install(DIRECTORY "${script_dir}/clients/usr/lib/cmake"
 ################################################################################
 
 file(COPY "${PROJECT_SOURCE_DIR}/packaging/docker" DESTINATION "${PROJECT_BINARY_DIR}/packages/")
+file(COPY "${PROJECT_SOURCE_DIR}/fdbkubernetesmonitor" DESTINATION "${PROJECT_BINARY_DIR}/packages/docker/")
 
 ################################################################################
 # General CPack configuration
@@ -293,6 +294,7 @@ set(CPACK_RPM_EXCLUDE_FROM_AUTO_FILELIST_ADDITION
   "/usr/lib/cmake"
   "/usr/lib/foundationdb-${FDB_VERSION}${FDB_BUILDTIME_STRING}/etc/foundationdb"
   )
+set(CPACK_RPM_BUILD_SOURCE_DIRS_PREFIX "/usr/src")
 set(CPACK_RPM_DEBUGINFO_PACKAGE ${GENERATE_DEBUG_PACKAGES})
 #set(CPACK_RPM_BUILD_SOURCE_FDB_INSTALL_DIRS_PREFIX /usr/src)
 set(CPACK_RPM_COMPONENT_INSTALL ON)

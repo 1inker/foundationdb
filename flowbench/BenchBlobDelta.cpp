@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -47,7 +47,7 @@ public:
 		maxValueSize = randGen->randomExp(7, 9);
 		// Generate start version
 		version = randGen->randomUInt32();
-		// Generate probabilty of update existing keys
+		// Generate probability of update existing keys
 		updateExistingKeysProb = randGen->random01();
 		// Generate deltas
 		for (auto i : PRE_GEN_TARGET_BYTES) {
@@ -141,13 +141,18 @@ static DeltaGenerator deltaGen; // Pre-generate deltas
 static void bench_serialize_deltas(benchmark::State& state) {
 	int targetBytes = state.range(0);
 	int chunkSize = state.range(1);
+	bool enableEncryption = state.range(2);
 
 	Standalone<GranuleDeltas> delta = deltaGen.getDelta(targetBytes);
 	KeyRange range = deltaGen.getRange();
 
 	Standalone<StringRef> fileName = "testdelta"_sr; // unused
 	Optional<CompressionFilter> compressFilter; // unused. no compression
+	Arena arena;
 	Optional<BlobGranuleCipherKeysCtx> cipherKeysCtx; // unused. no encryption
+	if (enableEncryption) {
+		cipherKeysCtx = getCipherKeysCtx(arena);
+	}
 
 	uint32_t serializedBytes = 0;
 	for (auto _ : state) {
@@ -172,9 +177,12 @@ static void bench_sort_deltas(benchmark::State& state) {
 
 // Benchmark serialization for granule deltas 128KB, 512KB and 1024KB. Chunk size 32KB
 BENCHMARK(bench_serialize_deltas)
-    ->Args({ 128 * 1024, 32 * 1024 })
-    ->Args({ 512 * 1024, 32 * 1024 })
-    ->Args({ 1024 * 1024, 32 * 1024 });
+    ->Args({ 128 * 1024, 32 * 1024, false })
+    ->Args({ 512 * 1024, 32 * 1024, false })
+    ->Args({ 1024 * 1024, 32 * 1024, false })
+    ->Args({ 128 * 1024, 32 * 1024, true })
+    ->Args({ 512 * 1024, 32 * 1024, true })
+    ->Args({ 1024 * 1024, 32 * 1024, true });
 
 // Benchmark sorting for granule deltas 128KB, 512KB and 1024KB. Chunk size 32KB
 BENCHMARK(bench_sort_deltas)->Args({ 128 * 1024 })->Args({ 512 * 1024 })->Args({ 1024 * 1024 });

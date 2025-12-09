@@ -4,7 +4,7 @@
 #
 # This source file is part of the FoundationDB open source project
 #
-# Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+# Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -24,9 +24,15 @@ import ddsketch_calc as dd
 
 
 parser = argparse.ArgumentParser(description="Converts values to DDSketch buckets")
-parser.add_argument('-e', '--error_guarantee', help='Error guarantee (default is 0.005)', required=False, type=float)
-parser.add_argument('-v', '--value', help="Value", required=False, type=int)
-parser.add_argument('-b', '--bucket', help='Bucket index', required=False, type=int)
+parser.add_argument(
+    "-e",
+    "--error_guarantee",
+    help="Error guarantee (default is 0.005)",
+    required=False,
+    type=float,
+)
+parser.add_argument("-v", "--value", help="Value", required=False, type=int)
+parser.add_argument("-b", "--bucket", help="Bucket index", required=False, type=int)
 args = parser.parse_args()
 
 error = 0.005

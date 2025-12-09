@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -33,8 +33,6 @@ bool g_crashOnError = false;
 std::set<int> debugErrorSet = std::set<int>{ error_code_platform_error };
 #define SHOULD_LOG_ERROR(x) (debugErrorSet.count(x) > 0)
 #endif
-
-#include <iostream>
 
 Error Error::fromUnvalidatedCode(int code) {
 	if (code < 0 || code > 30000) {
@@ -103,10 +101,12 @@ Error internal_error_impl(const char* a_nm,
 	return Error(error_code_internal_error);
 }
 
+Error::Error() : error_code(invalid_error_code), flags(0) {}
+
 Error::Error(int error_code) : error_code(error_code), flags(0) {
 	if (TRACE_SAMPLE())
 		TraceEvent(SevSample, "ErrorCreated").detail("ErrorCode", error_code);
-	// std::cout << "Error: " << error_code << std::endl;
+
 	if (error_code >= 3000 && error_code < 6000) {
 		{
 			TraceEvent te(SevError, "SystemError");
@@ -178,6 +178,13 @@ Error Error::asInjectedFault() const {
 	Error e = *this;
 	e.flags |= FLAG_INJECTED_FAULT;
 	return e;
+}
+
+AttributeNotFoundError::AttributeNotFoundError(const std::string& missingAttribute_)
+  : Error(error_code_attribute_not_found), missingAttribute(missingAttribute_) {}
+
+const std::string& AttributeNotFoundError::getMissingAttribute() const {
+	return missingAttribute;
 }
 
 ErrorCodeTable::ErrorCodeTable() {

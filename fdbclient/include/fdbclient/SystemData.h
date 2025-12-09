@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -24,9 +24,11 @@
 
 // Functions and constants documenting the organization of the reserved keyspace in the database beginning with "\xFF"
 
+#include "fdbclient/AccumulativeChecksum.h"
+#include "fdbclient/BulkLoading.h"
+#include "fdbclient/BlobWorkerInterface.h" // TODO move the functions that depend on this out of here and into BlobWorkerInterface.h to remove this dependency
 #include "fdbclient/FDBTypes.h"
-#include "fdbclient/BlobGranuleCommon.h"
-#include "fdbclient/BlobWorkerInterface.h" // TODO move the functions that depend on this out of here and into BlobWorkerInterface.h to remove this depdendency
+#include "fdbclient/RangeLock.h"
 #include "fdbclient/StorageServerInterface.h"
 #include "fdbclient/Tenant.h"
 
@@ -34,8 +36,51 @@
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wunused-variable"
 
-FDB_DECLARE_BOOLEAN_PARAM(AssignEmptyRange);
-FDB_DECLARE_BOOLEAN_PARAM(UnassignShard);
+FDB_BOOLEAN_PARAM(AssignEmptyRange);
+FDB_BOOLEAN_PARAM(UnassignShard);
+FDB_BOOLEAN_PARAM(EnablePhysicalShardMove);
+
+enum class DataMoveType : uint8_t {
+	LOGICAL = 0,
+	PHYSICAL = 1,
+	PHYSICAL_EXP = 2,
+	LOGICAL_BULKLOAD = 3,
+	PHYSICAL_BULKLOAD = 4,
+	NUMBER_OF_TYPES = 5,
+};
+
+// One-to-one relationship to the priority knobs
+enum class DataMovementReason : uint8_t {
+	INVALID = 0,
+	RECOVER_MOVE = 1,
+	REBALANCE_UNDERUTILIZED_TEAM = 2,
+	REBALANCE_OVERUTILIZED_TEAM = 3,
+	REBALANCE_READ_OVERUTIL_TEAM = 4,
+	REBALANCE_READ_UNDERUTIL_TEAM = 5,
+	PERPETUAL_STORAGE_WIGGLE = 6,
+	TEAM_HEALTHY = 7,
+	TEAM_CONTAINS_UNDESIRED_SERVER = 8,
+	TEAM_REDUNDANT = 9,
+	MERGE_SHARD = 10,
+	POPULATE_REGION = 11,
+	TEAM_UNHEALTHY = 12,
+	TEAM_2_LEFT = 13,
+	TEAM_1_LEFT = 14,
+	TEAM_FAILED = 15,
+	TEAM_0_LEFT = 16,
+	SPLIT_SHARD = 17,
+	ENFORCE_MOVE_OUT_OF_PHYSICAL_SHARD = 18,
+	REBALANCE_STORAGE_QUEUE = 19,
+	ASSIGN_EMPTY_RANGE = 20, // dummy reason, no corresponding data move priority
+	SEED_SHARD_SERVER = 21, // dummy reason, no corresponding data move priority
+	NUMBER_OF_REASONS = 22, // dummy reason, no corresponding data move priority
+};
+
+// SystemKey is just a Key but with a special type so that instances of it can be found easily throughput the code base
+// and in simulation constructions will verify that no SystemKey is a direct prefix of any other.
+struct SystemKey : Key {
+	SystemKey(Key const& k);
+};
 
 struct RestoreLoaderInterface;
 struct RestoreApplierInterface;
@@ -93,15 +138,29 @@ void decodeKeyServersValue(RangeResult result,
                            bool missingIsError = true);
 bool isSystemKey(KeyRef key);
 
+extern const KeyRef accumulativeChecksumKey;
+const Value accumulativeChecksumValue(const AccumulativeChecksumState& acsState);
+AccumulativeChecksumState decodeAccumulativeChecksum(const ValueRef& value);
+
 extern const KeyRangeRef auditKeys;
 extern const KeyRef auditPrefix;
 extern const KeyRangeRef auditRanges;
 extern const KeyRef auditRangePrefix;
 
+// Key for a particular audit
 const Key auditKey(const AuditType type, const UID& auditId);
+// KeyRange for whole audit
 const KeyRange auditKeyRange(const AuditType type);
-const Key auditRangeKey(const UID& auditId, const KeyRef& key);
-const Key auditRangePrefixFor(const UID& auditId);
+// Prefix for audit work progress by range
+const Key auditRangeBasedProgressPrefixFor(const AuditType type, const UID& auditId);
+// Range for audit work progress by range
+const KeyRange auditRangeBasedProgressRangeFor(const AuditType type, const UID& auditId);
+const KeyRange auditRangeBasedProgressRangeFor(const AuditType type);
+// Prefix for audit work progress by server
+const Key auditServerBasedProgressPrefixFor(const AuditType type, const UID& auditId, const UID& serverId);
+// Range for audit work progress by server
+const KeyRange auditServerBasedProgressRangeFor(const AuditType type, const UID& auditId);
+const KeyRange auditServerBasedProgressRangeFor(const AuditType type);
 
 const Value auditStorageStateValue(const AuditStorageState& auditStorageState);
 AuditStorageState decodeAuditStorageState(const ValueRef& value);
@@ -145,16 +204,28 @@ void decodeStorageCacheValue(const ValueRef& value, std::vector<uint16_t>& serve
 extern const KeyRangeRef serverKeysRange;
 extern const KeyRef serverKeysPrefix;
 extern const ValueRef serverKeysTrue, serverKeysTrueEmptyRange, serverKeysFalse;
-const UID newShardId(const uint64_t physicalShardId,
-                     AssignEmptyRange assignEmptyRange,
-                     UnassignShard unassignShard = UnassignShard::False);
+const UID newDataMoveId(const uint64_t physicalShardId,
+                        AssignEmptyRange assignEmptyRange,
+                        const DataMoveType type,
+                        const DataMovementReason reason,
+                        UnassignShard unassignShard = UnassignShard::False);
 const Key serverKeysKey(UID serverID, const KeyRef& keys);
 const Key serverKeysPrefixFor(UID serverID);
 UID serverKeysDecodeServer(const KeyRef& key);
 std::pair<UID, Key> serverKeysDecodeServerBegin(const KeyRef& key);
 bool serverHasKey(ValueRef storedValue);
 const Value serverKeysValue(const UID& id);
-void decodeServerKeysValue(const ValueRef& value, bool& assigned, bool& emptyRange, UID& id);
+void decodeDataMoveId(const UID& id,
+                      bool& assigned,
+                      bool& emptyRange,
+                      DataMoveType& dataMoveType,
+                      DataMovementReason& dataMoveReason);
+void decodeServerKeysValue(const ValueRef& value,
+                           bool& assigned,
+                           bool& emptyRange,
+                           DataMoveType& dataMoveType,
+                           UID& id,
+                           DataMovementReason& dataMoveReason);
 
 extern const KeyRangeRef conflictingKeysRange;
 extern const ValueRef conflictingKeysTrue, conflictingKeysFalse;
@@ -175,9 +246,6 @@ extern const KeyRef cacheChangePrefix;
 const Key cacheChangeKeyFor(uint16_t idx);
 uint16_t cacheChangeKeyDecodeIndex(const KeyRef& key);
 
-// For persisting the consistency scan configuration and metrics
-extern const KeyRef consistencyScanInfoKey;
-
 // "\xff/tss/[[serverId]]" := "[[tssId]]"
 extern const KeyRangeRef tssMappingKeys;
 
@@ -195,6 +263,12 @@ extern const KeyRangeRef tssMismatchKeys;
 // \xff/serverMetadata/[[storageInterfaceUID]] = [[StorageMetadataType]]
 // Note: storageInterfaceUID is the one stated in the file name
 extern const KeyRangeRef serverMetadataKeys;
+
+// Any update to serverMetadataKeys will update this key to a random UID.
+extern const KeyRef serverMetadataChangeKey;
+
+UID decodeServerMetadataKey(const KeyRef&);
+StorageMetadataType decodeServerMetadataValue(const KeyRef&);
 
 // "\xff/serverTag/[[serverID]]" = "[[Tag]]"
 //	Provides the Tag for the given serverID. Used to access a
@@ -441,11 +515,31 @@ extern const KeyRef primaryLocalityKey;
 extern const KeyRef primaryLocalityPrivateKey;
 extern const KeyRef fastLoggingEnabled;
 extern const KeyRef fastLoggingEnabledPrivateKey;
+extern const KeyRef constructDataKey;
 
 extern const KeyRef moveKeysLockOwnerKey, moveKeysLockWriteKey;
 
 extern const KeyRef dataDistributionModeKey;
 extern const UID dataDistributionModeLock;
+
+extern const KeyRef bulkLoadModeKey;
+extern const KeyRangeRef bulkLoadKeys;
+extern const KeyRef bulkLoadPrefix;
+const Value bulkLoadStateValue(const BulkLoadState& bulkLoadState);
+BulkLoadState decodeBulkLoadState(const ValueRef& value);
+
+extern const std::string rangeLockNameForBulkLoad;
+extern const KeyRangeRef rangeLockKeys;
+extern const KeyRef rangeLockPrefix;
+const Value rangeLockStateSetValue(const RangeLockStateSet& rangeLockStateSet);
+RangeLockStateSet decodeRangeLockStateSet(const ValueRef& value);
+
+extern const KeyRangeRef rangeLockOwnerKeys;
+extern const KeyRef rangeLockOwnerPrefix;
+const Key rangeLockOwnerKeyFor(const RangeLockOwnerName& ownerUniqueID);
+const RangeLockOwnerName decodeRangeLockOwnerKey(const KeyRef& key);
+const Value rangeLockOwnerValue(const RangeLockOwner& rangeLockOwner);
+RangeLockOwner decodeRangeLockOwner(const ValueRef& value);
 
 // Keys to view and control tag throttling
 extern const KeyRangeRef tagThrottleKeys;
@@ -479,6 +573,9 @@ Key logRangesEncodeValue(KeyRef keyEnd, KeyRef destPath);
 // Returns a key prefixed with the specified key with
 // the given uid encoded at the end
 Key uidPrefixKey(KeyRef keyPrefix, UID logUid);
+
+extern std::tuple<Standalone<StringRef>, uint64_t, uint64_t, uint64_t> decodeConstructKeys(ValueRef value);
+extern Value encodeConstructValue(StringRef keyStart, uint64_t valSize, uint64_t keyCount, uint64_t seed);
 
 /// Apply mutations constant variables
 
@@ -543,6 +640,9 @@ extern const KeyRangeRef backupLogKeys;
 extern const KeyRangeRef applyLogKeys;
 // Returns true if m is a blog (backup log) or alog (apply log) mutation
 bool isBackupLogMutation(const MutationRef& m);
+
+// Returns true if m is an acs mutation: a mutation carrying accumulative checksum value
+bool isAccumulativeChecksumMutation(const MutationRef& m);
 
 extern const KeyRef backupVersionKey;
 extern const ValueRef backupVersionValue;
@@ -614,6 +714,22 @@ std::pair<Key, Version> decodeChangeFeedDurableKey(ValueRef const& key);
 const Value changeFeedDurableValue(Standalone<VectorRef<MutationRef>> const& mutations, Version knownCommittedVersion);
 std::pair<Standalone<VectorRef<MutationRef>>, Version> decodeChangeFeedDurableValue(ValueRef const& value);
 
+extern const KeyRangeRef changeFeedCacheKeys;
+extern const KeyRef changeFeedCachePrefix;
+
+const Value changeFeedCacheKey(Key const& prefix, Key const& feed, KeyRange const& range, Version version);
+std::tuple<Key, KeyRange, Version> decodeChangeFeedCacheKey(Key const& prefix, ValueRef const& key);
+const Value changeFeedCacheValue(Standalone<VectorRef<MutationsAndVersionRef>> const& mutations);
+Standalone<VectorRef<MutationsAndVersionRef>> decodeChangeFeedCacheValue(ValueRef const& value);
+
+extern const KeyRangeRef changeFeedCacheFeedKeys;
+extern const KeyRef changeFeedCacheFeedPrefix;
+
+const Value changeFeedCacheFeedKey(Key const& prefix, Key const& feed, KeyRange const& range);
+std::tuple<Key, Key, KeyRange> decodeChangeFeedCacheFeedKey(ValueRef const& key);
+const Value changeFeedCacheFeedValue(Version const& version, Version const& popped);
+std::pair<Version, Version> decodeChangeFeedCacheFeedValue(ValueRef const& value);
+
 // Configuration database special keys
 extern const KeyRef configTransactionDescriptionKey;
 extern const KeyRange globalConfigKnobKeys;
@@ -623,6 +739,7 @@ extern const KeyRangeRef configClassKeys;
 // blob range special keys
 extern const KeyRef blobRangeChangeKey;
 extern const KeyRangeRef blobRangeKeys;
+extern const KeyRangeRef blobRangeChangeLogKeys;
 extern const KeyRef blobManagerEpochKey;
 
 const Value blobManagerEpochValueFor(int64_t epoch);
@@ -631,6 +748,12 @@ int64_t decodeBlobManagerEpochValue(ValueRef const& value);
 // blob granule keys
 extern const StringRef blobRangeActive;
 extern const StringRef blobRangeInactive;
+
+bool isBlobRangeActive(const ValueRef& blobRangeValue);
+
+const Key blobRangeChangeLogReadKeyFor(Version version);
+const Value blobRangeChangeLogValueFor(const Standalone<BlobRangeChangeLogRef>& value);
+Standalone<BlobRangeChangeLogRef> decodeBlobRangeChangeLogValue(ValueRef const& value);
 
 extern const uint8_t BG_FILE_TYPE_DELTA;
 extern const uint8_t BG_FILE_TYPE_SNAPSHOT;
@@ -671,8 +794,9 @@ const Value blobGranuleFileValueFor(
     int64_t offset,
     int64_t length,
     int64_t fullFileLength,
+    int64_t logicalSize,
     Optional<BlobGranuleCipherKeysMeta> cipherKeysMeta = Optional<BlobGranuleCipherKeysMeta>());
-std::tuple<Standalone<StringRef>, int64_t, int64_t, int64_t, Optional<BlobGranuleCipherKeysMeta>>
+std::tuple<Standalone<StringRef>, int64_t, int64_t, int64_t, int64_t, Optional<BlobGranuleCipherKeysMeta>>
 decodeBlobGranuleFileValue(ValueRef const& value);
 
 const Value blobGranulePurgeValueFor(Version version, KeyRange range, bool force);
@@ -733,19 +857,7 @@ UID decodeBlobWorkerAffinityKey(KeyRef const& key);
 const Value blobWorkerAffinityValue(UID const& id);
 UID decodeBlobWorkerAffinityValue(ValueRef const& value);
 
-// Blob restore command
-extern const KeyRangeRef blobRestoreCommandKeys;
-const Value blobRestoreCommandKeyFor(const KeyRangeRef range);
-const KeyRange decodeBlobRestoreCommandKeyFor(const KeyRef key);
-const Value blobRestoreCommandValueFor(BlobRestoreState restoreState);
-Standalone<BlobRestoreState> decodeBlobRestoreState(ValueRef const& value);
-extern const KeyRangeRef blobRestoreArgKeys;
-const Value blobRestoreArgKeyFor(const KeyRangeRef range);
-const KeyRange decodeBlobRestoreArgKeyFor(const KeyRef key);
-const Value blobRestoreArgValueFor(BlobRestoreArg args);
-Standalone<BlobRestoreArg> decodeBlobRestoreArg(ValueRef const& value);
 extern const Key blobManifestVersionKey;
-extern const Key blobGranulesLastFlushKey;
 
 extern const KeyRangeRef idempotencyIdKeys;
 extern const KeyRef idempotencyIdsExpiredVersion;

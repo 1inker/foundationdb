@@ -3,7 +3,7 @@
 #
 # This source file is part of the FoundationDB open source project
 #
-# Copyright 2013-2018 Apple Inc. and the FoundationDB project authors
+# Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -150,11 +150,11 @@ class RandomGenerator(object):
 
     def random_range_params(self):
         if random.random() < 0.75:
-            limit = random.randint(1, 1e3)
+            limit = random.randint(1, int(1e3))
         elif random.random() < 0.75:
             limit = 0
         else:
-            limit = random.randint(1e8, (1 << 31) - 1)
+            limit = random.randint(int(1e8), (1 << 31) - 1)
 
         return (limit, random.randint(0, 1), random.randint(-2, 4))
 

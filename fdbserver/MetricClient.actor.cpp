@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -107,7 +107,7 @@ void UDPMetricClient::send(MetricCollection* metrics) {
 			metrics->sumMap.clear();
 		}
 
-		// Each histogram should be in a seperate because of their large sizes
+		// Each histogram should be in a separate because of their large sizes
 		// Expected DDSketch size is ~4200 entries * 9 bytes = 37800
 		for (const auto& [_, h] : metrics->histMap) {
 			const std::vector<OTEL::OTELHistogram> singleHist{ std::move(h) };

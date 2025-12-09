@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -218,47 +218,6 @@ struct BlobGranuleVerifierWorkload : TestWorkload {
 		OldRead(KeyRange range, Version v, RangeResult oldResult) : range(range), v(v), oldResult(oldResult) {}
 	};
 
-	ACTOR Future<Void> killBlobWorkers(Database cx, BlobGranuleVerifierWorkload* self) {
-		state Transaction tr(cx);
-		state std::set<UID> knownWorkers;
-		state bool first = true;
-		loop {
-			try {
-				RangeResult r = wait(tr.getRange(blobWorkerListKeys, CLIENT_KNOBS->TOO_MANY));
-
-				state std::vector<UID> haltIds;
-				state std::vector<Future<ErrorOr<Void>>> haltRequests;
-				for (auto& it : r) {
-					BlobWorkerInterface interf = decodeBlobWorkerListValue(it.value);
-					if (first) {
-						knownWorkers.insert(interf.id());
-					}
-					if (knownWorkers.count(interf.id())) {
-						haltIds.push_back(interf.id());
-						haltRequests.push_back(interf.haltBlobWorker.tryGetReply(HaltBlobWorkerRequest(1e6, UID())));
-					}
-				}
-				first = false;
-				wait(waitForAll(haltRequests));
-				bool allPresent = true;
-				for (int i = 0; i < haltRequests.size(); i++) {
-					if (haltRequests[i].get().present()) {
-						knownWorkers.erase(haltIds[i]);
-					} else {
-						allPresent = false;
-					}
-				}
-				if (allPresent) {
-					return Void();
-				} else {
-					wait(delay(1.0));
-				}
-			} catch (Error& e) {
-				wait(tr.onError(e));
-			}
-		}
-	}
-
 	// TODO refactor more generally
 	ACTOR Future<Void> loadGranuleMetadataBeforeForcePurge(Database cx, BlobGranuleVerifierWorkload* self) {
 		// load all granule history entries that intersect purged range
@@ -307,7 +266,6 @@ struct BlobGranuleVerifierWorkload : TestWorkload {
 		state std::map<double, OldRead> timeTravelChecks;
 		state int64_t timeTravelChecksMemory = 0;
 		state Version prevPurgeVersion = -1;
-		state UID dbgId = debugRandom()->randomUniqueID();
 		state Version newPurgeVersion = 0;
 		// usually we want randomness to verify maximum data, but sometimes hotspotting a subset is good too
 		state bool pickGranuleUniform = deterministicRandom()->random01() < 0.1;
@@ -343,13 +301,13 @@ struct BlobGranuleVerifierWorkload : TestWorkload {
 					    allowPurging && !self->purgeAtLatest && deterministicRandom()->random01() < 0.5;
 					state bool forcePurge = doPurging && self->doForcePurge && deterministicRandom()->random01() < 0.25;
 					if (doPurging) {
-						CODE_PROBE(true, "BGV considering purge");
+						CODE_PROBE(true, "BGV considering purge", probe::decoration::rare);
 						Version maxPurgeVersion = oldRead.v;
 						for (auto& it : timeTravelChecks) {
 							maxPurgeVersion = std::min(it.second.v, maxPurgeVersion);
 						}
 						if (prevPurgeVersion < maxPurgeVersion) {
-							CODE_PROBE(true, "BGV doing purge");
+							CODE_PROBE(true, "BGV doing purge", probe::decoration::rare);
 							newPurgeVersion = deterministicRandom()->randomInt64(prevPurgeVersion, maxPurgeVersion);
 							prevPurgeVersion = std::max(prevPurgeVersion, newPurgeVersion);
 							if (BGV_DEBUG) {
@@ -383,7 +341,7 @@ struct BlobGranuleVerifierWorkload : TestWorkload {
 								}
 								ASSERT(false);
 							}
-							CODE_PROBE(true, "BGV purge complete");
+							CODE_PROBE(true, "BGV purge complete", probe::decoration::rare);
 							if (BGV_DEBUG) {
 								fmt::print("BGV Purge complete @ {0}\n", newPurgeVersion);
 							}
@@ -402,6 +360,9 @@ struct BlobGranuleVerifierWorkload : TestWorkload {
 						}
 						self->timeTravelReads++;
 					} catch (Error& e) {
+						if (e.code() == error_code_actor_cancelled) {
+							throw;
+						}
 						fmt::print("Error TT: {0}\n", e.name());
 						if (e.code() == error_code_blob_granule_transaction_too_old) {
 							self->timeTravelTooOld++;
@@ -417,7 +378,7 @@ struct BlobGranuleVerifierWorkload : TestWorkload {
 					// reading older than the purge version
 					if (doPurging) {
 						if (self->strictPurgeChecking) {
-							wait(self->killBlobWorkers(cx, self));
+							wait(killBlobWorkers(cx));
 							if (BGV_DEBUG) {
 								fmt::print("BGV Reading post-purge [{0} - {1}) @ {2}\n",
 								           oldRead.range.begin.printable(),
@@ -890,7 +851,7 @@ struct BlobGranuleVerifierWorkload : TestWorkload {
 
 		// ask all workers for all of their open granules and make sure none are in the force purge range
 
-		// Because there could be ranges assigned that havne't yet finished opening to check for purge, some BWs might
+		// Because there could be ranges assigned that haven't yet finished opening to check for purge, some BWs might
 		// still temporarily have ranges assigned. To address this, we just retry the check after a bit
 		loop {
 			state bool anyRangesLeft = false;
@@ -1225,7 +1186,7 @@ struct BlobGranuleVerifierWorkload : TestWorkload {
 		}
 
 		if (self->clientId == 0 && SERVER_KNOBS->BG_ENABLE_MERGING && self->clearAndMergeCheck) {
-			CODE_PROBE(true, "BGV clearing database and awaiting merge");
+			CODE_PROBE(true, "BGV clearing database and awaiting merge", probe::decoration::rare);
 			wait(clearAndAwaitMerge(cx, normalKeys));
 
 			if (self->enablePurging && self->purgeAtLatest && deterministicRandom()->coinflip()) {

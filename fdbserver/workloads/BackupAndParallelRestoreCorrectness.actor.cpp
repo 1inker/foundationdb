@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -49,6 +49,11 @@ struct BackupAndParallelRestoreCorrectnessWorkload : TestWorkload {
 	// CAVEAT: When removePrefix is used, we must ensure every key in backup have the removePrefix
 
 	std::map<Standalone<KeyRef>, Standalone<ValueRef>> dbKVs;
+
+	// This workload is not compatible with RandomRangeLock workload because they will race in locked range
+	void disableFailureInjectionWorkloads(std::set<std::string>& out) const override {
+		out.insert({ "RandomRangeLock" });
+	}
 
 	BackupAndParallelRestoreCorrectnessWorkload(WorkloadContext const& wcx) : TestWorkload(wcx) {
 		locked.set(sharedRandomNumber % 2);
@@ -189,7 +194,7 @@ struct BackupAndParallelRestoreCorrectnessWorkload : TestWorkload {
 	                                   Key tag,
 	                                   Standalone<VectorRef<KeyRangeRef>> backupRanges,
 	                                   double stopDifferentialDelay,
-	                                   Promise<Void> submittted) {
+	                                   Promise<Void> submitted) {
 		state UID randomID = nondeterministicRandom()->randomUniqueID();
 		state Future<Void> stopDifferentialFuture = delay(stopDifferentialDelay);
 
@@ -232,7 +237,7 @@ struct BackupAndParallelRestoreCorrectnessWorkload : TestWorkload {
 				throw;
 		}
 
-		submittted.send(Void());
+		submitted.send(Void());
 
 		// Stop the differential backup, if enabled
 		if (stopDifferentialDelay) {
@@ -399,7 +404,6 @@ struct BackupAndParallelRestoreCorrectnessWorkload : TestWorkload {
 	ACTOR static Future<Void> _start(Database cx, BackupAndParallelRestoreCorrectnessWorkload* self) {
 		state FileBackupAgent backupAgent;
 		state Future<Void> extraBackup;
-		state bool extraTasks = false;
 		state UID randomID = nondeterministicRandom()->randomUniqueID();
 		state int restoreIndex = 0;
 		state ReadYourWritesTransaction tr2(cx);
@@ -623,7 +627,6 @@ struct BackupAndParallelRestoreCorrectnessWorkload : TestWorkload {
 			// Q: What is the extra backup and why do we need to care about it?
 			if (extraBackup.isValid()) { // SOMEDAY: Handle this case
 				TraceEvent("BARW_WaitExtraBackup", randomID).detail("BackupTag", printable(self->backupTag));
-				extraTasks = true;
 				try {
 					wait(extraBackup);
 				} catch (Error& e) {
@@ -769,7 +772,7 @@ struct BackupAndParallelRestoreCorrectnessWorkload : TestWorkload {
 
 			TraceEvent("BARW_Complete", randomID).detail("BackupTag", printable(self->backupTag));
 
-			// Decrement the backup agent requets
+			// Decrement the backup agent requests
 			if (self->agentRequest) {
 				BackupAndParallelRestoreCorrectnessWorkload::backupAgentRequests--;
 			}

@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -82,6 +82,8 @@ struct WorkloadRequest {
 
 	VectorRef<VectorRef<KeyValueRef>> options;
 
+	std::vector<KeyRange> rangesToCheck; // For consistency checker urgent
+
 	int clientId; // the "id" of the client receiving the request (0 indexed)
 	int clientCount; // the total number of test clients participating in the workload
 	ReplyPromise<struct WorkloadInterface> reply;
@@ -102,6 +104,7 @@ struct WorkloadRequest {
 		           defaultTenant,
 		           runFailureWorkloads,
 		           disabledFailureInjectionWorkloads,
+		           rangesToCheck,
 		           arena);
 	}
 };
@@ -121,10 +124,16 @@ struct TesterInterface {
 ACTOR Future<Void> testerServerCore(TesterInterface interf,
                                     Reference<IClusterConnectionRecord> ccr,
                                     Reference<AsyncVar<struct ServerDBInfo> const> serverDBInfo,
-                                    LocalityData locality);
+                                    LocalityData locality,
+                                    Optional<std::string> expectedWorkLoad = Optional<std::string>());
 
 enum test_location_t { TEST_HERE, TEST_ON_SERVERS, TEST_ON_TESTERS };
-enum test_type_t { TEST_TYPE_FROM_FILE, TEST_TYPE_CONSISTENCY_CHECK, TEST_TYPE_UNIT_TESTS };
+enum test_type_t {
+	TEST_TYPE_FROM_FILE,
+	TEST_TYPE_CONSISTENCY_CHECK,
+	TEST_TYPE_UNIT_TESTS,
+	TEST_TYPE_CONSISTENCY_CHECK_URGENT
+};
 
 ACTOR Future<Void> runTests(
     Reference<IClusterConnectionRecord> connRecord,

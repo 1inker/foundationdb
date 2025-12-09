@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -329,7 +329,6 @@ struct FdbCApi : public ThreadSafeReferenceCounted<FdbCApi> {
 	                                        int targetBytes,
 	                                        FDBStreamingMode mode,
 	                                        int iteration,
-	                                        int matchIndex,
 	                                        fdb_bool_t snapshot,
 	                                        fdb_bool_t reverse);
 	FDBFuture* (*transactionGetVersionstamp)(FDBTransaction* tr);
@@ -492,7 +491,6 @@ public:
 	                                               const KeySelectorRef& end,
 	                                               const StringRef& mapper,
 	                                               GetRangeLimits limits,
-	                                               int matchIndex,
 	                                               bool snapshot,
 	                                               bool reverse) override;
 	ThreadFuture<Standalone<VectorRef<const char*>>> getAddressesForKey(const KeyRef& key) override;
@@ -731,7 +729,6 @@ public:
 	                                               const KeySelectorRef& end,
 	                                               const StringRef& mapper,
 	                                               GetRangeLimits limits,
-	                                               int matchIndex,
 	                                               bool snapshot,
 	                                               bool reverse) override;
 	ThreadFuture<Standalone<VectorRef<const char*>>> getAddressesForKey(const KeyRef& key) override;
@@ -1084,10 +1081,10 @@ public:
 		// Must be called from the main thread
 		void startLegacyVersionMonitors();
 
-		// Set a new database connnection
+		// Set a new database connection
 		void setDatabase(Reference<IDatabase> db);
 
-		// Get database intialization error if initialization failed
+		// Get database initialization error if initialization failed
 		ErrorOr<Void> getInitializationError();
 
 		// Return a JSON string containing database client-side status information

@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -161,6 +161,8 @@ Future<Void> SimpleFailureMonitor::onDisconnectOrFailure(Endpoint const& endpoin
 		if (endpoint.token.first() == 0xffffffffffffffff) {
 			// well known endpoint
 			event.suppressFor(5.0);
+		} else {
+			event.suppressFor(0.1);
 		}
 		event.detail("Addr", endpoint.getPrimaryAddress())
 		    .detail("Reason", i == addressStatus.end() || i->second.isFailed() ? "Disconnected" : "EndpointFailed")
@@ -200,8 +202,6 @@ FailureStatus SimpleFailureMonitor::getState(Endpoint const& endpoint) const {
 			return FailureStatus();
 		else
 			return a->second;
-		// printf("%s.getState(%s) = %s %p\n", g_network->getLocalAddress().toString(), endpoint.address.toString(),
-		//        a.failed ? "FAILED" : "OK", this);
 	}
 }
 

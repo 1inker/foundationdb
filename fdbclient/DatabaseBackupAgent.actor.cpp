@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -26,12 +26,14 @@
 #include "fdbclient/NativeAPI.actor.h"
 #include <ctime>
 #include <climits>
+#include "fdbrpc/simulator.h"
 #include "flow/IAsyncFile.h"
+#include "flow/flow.h"
 #include "flow/genericactors.actor.h"
 #include "flow/Hash3.h"
 #include <numeric>
 #include "fdbclient/ManagementAPI.actor.h"
-#include "fdbclient/KeyBackedTypes.h"
+#include "fdbclient/KeyBackedTypes.actor.h"
 #include <inttypes.h>
 #include <map>
 
@@ -361,8 +363,9 @@ struct BackupRangeTaskFunc : TaskFuncBase {
 
 					if ((!prevAdjacent || !nextAdjacent) &&
 					    rangeCount > ((prevAdjacent || nextAdjacent) ? CLIENT_KNOBS->BACKUP_MAP_KEY_UPPER_LIMIT
-					                                                 : CLIENT_KNOBS->BACKUP_MAP_KEY_LOWER_LIMIT)) {
-						CODE_PROBE(true, "range insert delayed because too versionMap is too large");
+					                                                 : CLIENT_KNOBS->BACKUP_MAP_KEY_LOWER_LIMIT) &&
+					    (!g_network->isSimulated() || (isGeneralBuggifyEnabled() && !g_simulator->speedUpSimulation))) {
+						CODE_PROBE(true, "range insert delayed because versionMap is too large");
 
 						if (rangeCount > CLIENT_KNOBS->BACKUP_MAP_KEY_UPPER_LIMIT)
 							TraceEvent(SevWarnAlways, "DBA_KeyRangeMapTooLarge").log();
@@ -737,7 +740,7 @@ struct CopyLogRangeTaskFunc : TaskFuncBase {
 		                          .get(BackupAgentBase::keyConfig)
 		                          .get(task->params[BackupAgentBase::keyConfigLogUid]);
 		state std::vector<RangeResult> nextMutations;
-		state bool isTimeoutOccured = false;
+		state bool isTimeoutOccurred = false;
 		state Optional<KeyRef> lastKey;
 		state Version lastVersion;
 		state int64_t nextMutationSize = 0;
@@ -795,7 +798,7 @@ struct CopyLogRangeTaskFunc : TaskFuncBase {
 						bool first = true;
 						for (auto m : mutations) {
 							for (auto kv : m) {
-								if (isTimeoutOccured) {
+								if (isTimeoutOccurred) {
 									Version newVersion = getLogKeyVersion(kv.key);
 
 									if (newVersion > lastVersion) {
@@ -828,13 +831,13 @@ struct CopyLogRangeTaskFunc : TaskFuncBase {
 				if (nextVersionAfterBreak.present()) {
 					return nextVersionAfterBreak;
 				}
-				if (!isTimeoutOccured && timer_monotonic() >= breakTime && lastKey.present()) {
-					// timeout occured
+				if (!isTimeoutOccurred && timer_monotonic() >= breakTime && lastKey.present()) {
+					// timeout occurred
 					// continue to copy mutations with the
 					// same version before break because
 					// the next run should start from the beginning of a version > lastVersion.
 					lastVersion = getLogKeyVersion(lastKey.get());
-					isTimeoutOccured = true;
+					isTimeoutOccurred = true;
 				}
 			} catch (Error& e) {
 				if (e.code() == error_code_actor_cancelled || e.code() == error_code_backup_error)
@@ -2965,8 +2968,6 @@ public:
 			state Future<Void> partialTimeout = partial ? delay(30.0) : Never();
 			state Reference<ReadYourWritesTransaction> srcTr(
 			    new ReadYourWritesTransaction(backupAgent->taskBucket->src));
-			state Version beginVersion;
-			state Version endVersion;
 
 			loop {
 				try {
@@ -3003,9 +3004,7 @@ public:
 						return Void();
 					}
 
-					if (bVersionF.get().present()) {
-						beginVersion = BinaryReader::fromStringRef<Version>(bVersionF.get().get(), Unversioned());
-					} else {
+					if (!bVersionF.get().present()) {
 						break;
 					}
 
@@ -3023,8 +3022,6 @@ public:
 					if (partialTimeout.isReady()) {
 						return Void();
 					}
-
-					endVersion = srcTr->getCommittedVersion() + 1;
 
 					break;
 				} catch (Error& e) {

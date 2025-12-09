@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -30,15 +30,15 @@
 #include "fdbclient/NativeAPI.actor.h"
 #include "fdbclient/RunRYWTransaction.actor.h"
 #include "fdbclient/Subspace.h"
-#include "fdbclient/KeyBackedTypes.h"
+#include "fdbclient/KeyBackedTypes.actor.h"
 
 class FutureBucket;
 class TaskFuture;
 
-FDB_DECLARE_BOOLEAN_PARAM(AccessSystemKeys);
-FDB_DECLARE_BOOLEAN_PARAM(PriorityBatch);
-FDB_DECLARE_BOOLEAN_PARAM(VerifyTask);
-FDB_DECLARE_BOOLEAN_PARAM(UpdateParams);
+FDB_BOOLEAN_PARAM(AccessSystemKeys);
+FDB_BOOLEAN_PARAM(PriorityBatch);
+FDB_BOOLEAN_PARAM(VerifyTask);
+FDB_BOOLEAN_PARAM(UpdateParams);
 
 // A Task is a set of key=value parameters that constitute a unit of work for a TaskFunc to perform.
 // The parameter keys are specific to the TaskFunc that the Task is for, except for a set of reserved

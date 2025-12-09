@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -24,6 +24,7 @@
 
 #include <atomic>
 #include <array>
+#include <latch>
 
 #include "flow/Error.h"
 #include "flow/Trace.h"
@@ -134,16 +135,7 @@ public:
 	void block();
 
 private:
-#ifdef _WIN32
-	void* ev;
-#elif defined(__linux__) || defined(__FreeBSD__)
-	sem_t sem;
-#elif defined(__APPLE__)
-	mach_port_t self;
-	semaphore_t sem;
-#else
-#error Port me!
-#endif
+	std::latch latch{ 1 };
 };
 
 class Mutex {

@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -35,8 +35,6 @@
 #include <cinttypes>
 
 #include "flow/actorcompiler.h" // This must be the last #include.
-
-FDB_DEFINE_BOOLEAN_PARAM(IncludeKeyRangeMap);
 
 class BackupContainerFileSystemImpl {
 public:
@@ -244,7 +242,7 @@ public:
 	}
 
 	// For a list of log files specified by their indices (of the same tag),
-	// returns if they are continous in the range [begin, end]. If "tags" is not
+	// returns if they are continuous in the range [begin, end]. If "tags" is not
 	// nullptr, then it will be populated with [begin, end] -> tags, where next
 	// pair's begin <= previous pair's end + 1. On return, the last pair's end
 	// version (inclusive) gives the continuous range from begin.
@@ -326,10 +324,10 @@ public:
 		end = std::min(end, tags.rbegin()->first.second);
 		TraceEvent("ContinuousLogEnd").detail("Partition", 0).detail("EndVersion", end).detail("Begin", begin);
 
-		// for each range in tags, check all partitions from 1 are continouous
+		// for each range in tags, check all partitions from 1 are continuous
 		Version lastEnd = begin;
 		for (const auto& [beginEnd, count] : tags) {
-			Version tagEnd = beginEnd.second; // This range's minimum continous partition version
+			Version tagEnd = beginEnd.second; // This range's minimum continuous partition version
 			for (int i = 1; i < count; i++) {
 				std::map<std::pair<Version, Version>, int> rangeTags;
 				isContinuous(logs, tagIndices[i], beginEnd.first, beginEnd.second, &rangeTags);
@@ -396,11 +394,13 @@ public:
 	                                     Version* end,
 	                                     Version targetVersion) {
 		auto i = logs.begin();
-		if (outLogs != nullptr)
+		if (outLogs != nullptr) {
 			outLogs->push_back(*i);
+			++i; // skip the first file
+		}
 
 		// Add logs to restorable logs set until continuity is broken OR we reach targetVersion
-		while (++i != logs.end()) {
+		while (i != logs.end()) {
 			if (i->beginVersion > *end || i->beginVersion > targetVersion)
 				break;
 
@@ -410,6 +410,7 @@ public:
 					outLogs->push_back(*i);
 				*end = i->endVersion;
 			}
+			++i;
 		}
 	}
 
@@ -510,7 +511,7 @@ public:
 		state Version scanEnd = std::numeric_limits<Version>::max();
 
 		// Use the known log range if present
-		// Logs are assumed to be contiguious between metaLogBegin and metaLogEnd, so initalize desc accordingly
+		// Logs are assumed to be contiguous between metaLogBegin and metaLogEnd, so initialize desc accordingly
 		if (metaLogBegin.present() && metaLogEnd.present()) {
 			// minLogBegin is the greater of the log begin metadata OR the unreliable end version since we can't count
 			// on log file presence before that version.
@@ -1505,7 +1506,8 @@ Future<Void> BackupContainerFileSystem::createTestEncryptionKeyFile(std::string 
 Reference<BackupContainerFileSystem> BackupContainerFileSystem::openContainerFS(
     const std::string& url,
     const Optional<std::string>& proxy,
-    const Optional<std::string>& encryptionKeyFileName) {
+    const Optional<std::string>& encryptionKeyFileName,
+    bool isBackup) {
 	static std::map<std::string, Reference<BackupContainerFileSystem>> m_cache;
 
 	Reference<BackupContainerFileSystem>& r = m_cache[url];
@@ -1518,18 +1520,28 @@ Reference<BackupContainerFileSystem> BackupContainerFileSystem::openContainerFS(
 			r = makeReference<BackupContainerLocalDirectory>(url, encryptionKeyFileName);
 		} else if (u.startsWith("blobstore://"_sr)) {
 			std::string resource;
+			Optional<std::string> blobstoreProxy;
+
+			// If no proxy is passed down to the openContainer method, try to fallback to the
+			// fileBackupAgentProxy which is a global variable and will be set for the backup_agent.
+			if (proxy.present()) {
+				blobstoreProxy = proxy.get();
+			} else if (fileBackupAgentProxy.present()) {
+				blobstoreProxy = fileBackupAgentProxy.get();
+			}
 
 			// The URL parameters contain blobstore endpoint tunables as well as possible backup-specific options.
 			S3BlobStoreEndpoint::ParametersT backupParams;
 			Reference<S3BlobStoreEndpoint> bstore =
-			    S3BlobStoreEndpoint::fromString(url, proxy, &resource, &lastOpenError, &backupParams);
+			    S3BlobStoreEndpoint::fromString(url, blobstoreProxy, &resource, &lastOpenError, &backupParams);
 
 			if (resource.empty())
 				throw backup_invalid_url();
 			for (auto c : resource)
 				if (!isalnum(c) && c != '_' && c != '-' && c != '.' && c != '/')
 					throw backup_invalid_url();
-			r = makeReference<BackupContainerS3BlobStore>(bstore, resource, backupParams, encryptionKeyFileName);
+			r = makeReference<BackupContainerS3BlobStore>(
+			    bstore, resource, backupParams, encryptionKeyFileName, isBackup);
 		}
 #ifdef BUILD_AZURE_BACKUP
 		else if (u.startsWith("azure://"_sr)) {

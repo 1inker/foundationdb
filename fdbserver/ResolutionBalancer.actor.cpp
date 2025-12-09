@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -34,7 +34,7 @@ void ResolutionBalancer::setResolvers(const std::vector<ResolverInterface>& v) {
 }
 
 void ResolutionBalancer::setChangesInReply(UID requestingProxy, GetCommitVersionReply& rep) {
-	if (resolverNeedingChanges.count(requestingProxy)) {
+	if (resolverNeedingChanges.contains(requestingProxy)) {
 		rep.resolverChanges = resolverChanges.get();
 		rep.resolverChangesVersion = resolverChangesVersion;
 		resolverNeedingChanges.erase(requestingProxy);
@@ -84,14 +84,14 @@ static std::pair<KeyRangeRef, bool> findRange(CoalescedKeyRangeMap<int>& key_res
 	prev = ranges.begin();
 	it = ranges.begin();
 	++it;
-	// If possible create a new boundry which doesn't exist yet
+	// If possible create a new boundary which doesn't exist yet
 	for (; it != ranges.end(); ++it) {
-		if (it->value() == src && !borders.count(prev->value()) &&
+		if (it->value() == src && !borders.contains(prev->value()) &&
 		    std::find(movedRanges.begin(), movedRanges.end(), ResolverMoveRef(it->range(), dest)) ==
 		        movedRanges.end()) {
 			return std::make_pair(it->range(), true);
 		}
-		if (prev->value() == src && !borders.count(it->value()) &&
+		if (prev->value() == src && !borders.contains(it->value()) &&
 		    std::find(movedRanges.begin(), movedRanges.end(), ResolverMoveRef(prev->range(), dest)) ==
 		        movedRanges.end()) {
 			return std::make_pair(prev->range(), false);

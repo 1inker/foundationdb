@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -147,7 +147,7 @@ struct DatabaseConfiguration {
 		return result;
 	}
 
-	// Counts the number of DCs required including remote and satellites for current database configuraiton.
+	// Counts the number of DCs required including remote and satellites for current database configuration.
 	int32_t minDatacentersRequired() const {
 		int minRequired = 0;
 		for (auto& r : regions) {
@@ -165,9 +165,9 @@ struct DatabaseConfiguration {
 		return minRequired;
 	}
 
-	// Retuns the maximum number of discrete failures a cluster can tolerate.
+	// Returns the maximum number of discrete failures a cluster can tolerate.
 	// In HA mode, `fullyReplicatedRegions` is set to "1" initially when data is being
-	// replicated to remote, and will be incremented later. `forAvailablity` is set to true
+	// replicated to remote, and will be incremented later. `forAvailability` is set to true
 	// if we want to account the number for machines that can recruit new tLogs/SS after failures.
 	// Killing an entire datacenter counts as killing one zone in modes that support it.
 	int32_t maxZoneFailuresTolerated(int fullyReplicatedRegions, bool forAvailability) const {
@@ -252,6 +252,7 @@ struct DatabaseConfiguration {
 	// Perpetual Storage Setting
 	int32_t perpetualStorageWiggleSpeed;
 	std::string perpetualStorageWiggleLocality;
+	KeyValueStoreType perpetualStoreType;
 
 	// Storage Migration Type
 	StorageMigrationType storageMigrationType;
@@ -263,9 +264,8 @@ struct DatabaseConfiguration {
 	EncryptionAtRestMode encryptionAtRestMode;
 
 	// Excluded servers (no state should be here)
-	bool isExcludedServer(NetworkAddressList) const;
+	bool isExcludedServer(NetworkAddressList, const LocalityData& locality) const;
 	bool isExcludedLocality(const LocalityData& locality) const;
-	bool isMachineExcluded(const LocalityData& locality) const;
 	std::set<AddressExclusion> getExcludedServers() const;
 	std::set<std::string> getExcludedLocalities() const;
 

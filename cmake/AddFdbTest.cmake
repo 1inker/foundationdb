@@ -7,7 +7,7 @@
 #   an error if there are any .txt files in the test directory that do not
 #   correspond to a test or are not ignore by a pattern
 # - IGNORE_PATTERNS regular expressions. All files that match any of those
-#   experessions don't need to be associated with a test
+#   expressions don't need to be associated with a test
 function(configure_testing)
   set(options ERROR_ON_ADDITIONAL_FILES)
   set(oneValueArgs TEST_DIRECTORY)
@@ -230,8 +230,8 @@ function(stage_correctness_package)
                             ${STAGE_OUT_DIR}/bin/coverage.fdbclient.xml
                             ${STAGE_OUT_DIR}/bin/coverage.fdbrpc.xml
                             ${STAGE_OUT_DIR}/bin/coverage.flow.xml
-                            ${STAGE_OUT_DIR}/bin/TestHarness.exe
-                            ${STAGE_OUT_DIR}/bin/TraceLogHelper.dll
+                            # ${STAGE_OUT_DIR}/bin/TestHarness.exe
+                            # ${STAGE_OUT_DIR}/bin/TraceLogHelper.dll
                             ${STAGE_OUT_DIR}/CMakeCache.txt
     )
 
@@ -243,16 +243,16 @@ function(stage_correctness_package)
             ${CMAKE_BINARY_DIR}/lib/coverage.fdbclient.xml
             ${CMAKE_BINARY_DIR}/lib/coverage.fdbrpc.xml
             ${CMAKE_BINARY_DIR}/lib/coverage.flow.xml
-            ${CMAKE_BINARY_DIR}/packages/bin/TestHarness.exe
-            ${CMAKE_BINARY_DIR}/packages/bin/TraceLogHelper.dll
+            # ${CMAKE_BINARY_DIR}/packages/bin/TestHarness.exe
+            # ${CMAKE_BINARY_DIR}/packages/bin/TraceLogHelper.dll
     COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_BINARY_DIR}/CMakeCache.txt ${STAGE_OUT_DIR}
     COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_BINARY_DIR}/packages/bin/fdbserver
                                      ${CMAKE_BINARY_DIR}/bin/coverage.fdbserver.xml
                                      ${CMAKE_BINARY_DIR}/lib/coverage.fdbclient.xml
                                      ${CMAKE_BINARY_DIR}/lib/coverage.fdbrpc.xml
                                      ${CMAKE_BINARY_DIR}/lib/coverage.flow.xml
-                                     ${CMAKE_BINARY_DIR}/packages/bin/TestHarness.exe
-                                     ${CMAKE_BINARY_DIR}/packages/bin/TraceLogHelper.dll
+                                     # ${CMAKE_BINARY_DIR}/packages/bin/TestHarness.exe
+                                     # ${CMAKE_BINARY_DIR}/packages/bin/TraceLogHelper.dll
                                      ${STAGE_OUT_DIR}/bin
     COMMENT "Copying files for ${STAGE_CONTEXT} package"
     )
@@ -418,8 +418,8 @@ function(prepare_binding_test_files build_directory target_name target_dependenc
       COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_BINARY_DIR}/bindings/go/bin/_stacktester ${build_directory}/tests/go/build/bin/_stacktester
       COMMAND ${CMAKE_COMMAND} -E make_directory ${build_directory}/tests/go/src/fdb/
       COMMAND ${CMAKE_COMMAND} -E copy
-        ${CMAKE_BINARY_DIR}/bindings/go/src/github.com/apple/foundationdb/bindings/go/src/fdb/generated.go # SRC
-        ${build_directory}/tests/go/src/fdb/ # DEST
+      ${CMAKE_BINARY_DIR}/bindings/go/src/github.com/apple/foundationdb/bindings/go/src/fdb/generated.go # SRC
+      ${build_directory}/tests/go/src/fdb/ # DEST
       COMMENT "Copy generated.go for bindingtester")
   endif()
 
@@ -551,6 +551,29 @@ function(package_bindingtester)
   add_custom_target(bindingtester ALL DEPENDS ${tar_file} copy_bindingtester_binaries)
 endfunction()
 
+function(add_fdb_unit_test TEST_NAME PATTERN)
+  add_test(NAME ${TEST_NAME}
+           WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+           COMMAND ${CMAKE_BINARY_DIR}/bin/fdbserver -r unittests -f "${PATTERN}")
+  set_tests_properties(${TEST_NAME} PROPERTIES
+    FAIL_REGULAR_EXPRESSION "0 tests passed; 1 tests failed."
+  )
+endfunction()
+
+function(collect_unit_tests SOURCE_DIR)
+  message("Collecting unit_tests in ${SOURCE_DIR}")
+  execute_process(
+    COMMAND grep --include \*.h --include \*.cpp --include \*.hpp -rhoP "TEST_CASE\\(\\\"\\K[^\\\"]+(?=\\\"\\))" "${SOURCE_DIR}"
+    OUTPUT_VARIABLE TEST_NAMES
+  )
+  string(REGEX REPLACE "\n" ";" TEST_NAMES "${TEST_NAMES}")
+
+  foreach(TEST_NAME ${TEST_NAMES})
+    message("ADDING DISCOVERED UNIT TEST: ${TEST_NAME}")
+    add_fdb_unit_test(UnitTest_${TEST_NAME} ${TEST_NAME})
+  endforeach()
+endfunction()
+
 # Test for setting up Python venv for client tests.
 # Adding this test as a fixture to another test allows the use of non-native Python packages within client test scripts
 # by installing dependencies from requirements.txt
@@ -569,7 +592,8 @@ string(APPEND test_venv_cmd "${Python3_EXECUTABLE} -m venv ${test_venv_dir} ")
 string(APPEND test_venv_cmd "&& ${test_venv_activate} ")
 string(APPEND test_venv_cmd "&& pip install --upgrade pip ")
 string(APPEND test_venv_cmd "&& pip install -r ${CMAKE_SOURCE_DIR}/tests/TestRunner/requirements.txt")
-string(APPEND test_venv_cmd "&& (cd ${CMAKE_BINARY_DIR}/bindings/python && python3 setup.py install) ")
+# NOTE: At this stage we are in the virtual environment and Python3_EXECUTABLE is not available anymore
+string(APPEND test_venv_cmd "&& (cd ${CMAKE_BINARY_DIR}/bindings/python && python3 -m pip install .) ")
 add_test(
   NAME test_venv_setup
   COMMAND bash -c ${test_venv_cmd}

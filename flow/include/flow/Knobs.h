@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -133,6 +133,9 @@ public:
 	bool FAST_ALLOC_ALLOW_GUARD_PAGES;
 	double HUGE_ARENA_LOGGING_BYTES;
 	double HUGE_ARENA_LOGGING_INTERVAL;
+	// This setting allows to let the fdbserver abort instead of exit to generate coredumps
+	// in case of a failure.
+	bool ABORT_ON_FAILURE;
 
 	double MEMORY_USAGE_CHECK_INTERVAL;
 
@@ -184,6 +187,9 @@ public:
 	double INCOMPATIBLE_PEER_DELAY_BEFORE_LOGGING;
 	double PING_LOGGING_INTERVAL;
 	double PING_SKETCH_ACCURACY;
+	bool LOG_CONNECTION_ATTEMPTS_ENABLED;
+	int LOG_CONNECTION_INTERVAL_SECS;
+	std::string CONNECTION_LOG_DIRECTORY;
 
 	int TLS_CERT_REFRESH_DELAY_SECONDS;
 	double TLS_SERVER_CONNECTION_THROTTLE_TIMEOUT;
@@ -209,6 +215,7 @@ public:
 	int PUBLIC_KEY_FILE_REFRESH_INTERVAL_SECONDS;
 	double AUDIT_TIME_WINDOW;
 	int TOKEN_CACHE_SIZE;
+	bool WIPE_SENSITIVE_DATA_FROM_PACKET_BUFFER;
 
 	// AsyncFileCached
 	int64_t PAGE_CACHE_4K;
@@ -217,6 +224,7 @@ public:
 	int64_t SIM_PAGE_CACHE_64K;
 	int64_t BUGGIFY_SIM_PAGE_CACHE_4K;
 	int64_t BUGGIFY_SIM_PAGE_CACHE_64K;
+	int64_t BLOB_WORKER_PAGE_CACHE;
 	std::string CACHE_EVICTION_POLICY; // for now, "random", "lru", are supported
 	int MAX_EVICT_ATTEMPTS;
 	double PAGE_CACHE_TRUNCATE_LOOKUP_FRACTION;
@@ -246,6 +254,10 @@ public:
 	// AsyncFileNonDurable
 	double NON_DURABLE_MAX_WRITE_DELAY;
 	double MAX_PRIOR_MODIFICATION_DELAY;
+
+	// AsyncFileWriteChecker
+	double ASYNC_FILE_WRITE_CHEKCER_LOGGING_INTERVAL;
+	double ASYNC_FILE_WRITE_CHEKCER_CHECKING_DELAY;
 
 	// GenericActors
 	double BUGGIFY_FLOW_LOCK_RELEASE_DELAY;
@@ -284,6 +296,7 @@ public:
 	int MIN_PACKET_BUFFER_FREE_BYTES;
 	int FLOW_TCP_NODELAY;
 	int FLOW_TCP_QUICKACK;
+	bool RESOLVE_PREFER_IPV4_ADDR;
 
 	// Sim2
 	// FIMXE: more parameters could be factored out
@@ -361,6 +374,9 @@ public:
 	bool LOAD_BALANCE_TSS_MISMATCH_VERIFY_SS;
 	bool LOAD_BALANCE_TSS_MISMATCH_TRACE_FULL;
 	int TSS_LARGE_TRACE_SIZE;
+	double LOAD_BALANCE_FETCH_REPLICA_TIMEOUT;
+	bool ENABLE_REPLICA_CONSISTENCY_CHECK_ON_READS;
+	int CONSISTENCY_CHECK_REQUIRED_REPLICAS;
 
 	// Health Monitor
 	int FAILURE_DETECTION_DELAY;
@@ -371,18 +387,19 @@ public:
 	// Encryption
 	int64_t ENCRYPT_CIPHER_KEY_CACHE_TTL;
 	int64_t ENCRYPT_KEY_REFRESH_INTERVAL;
+	int64_t ENCRYPT_KEY_HEALTH_CHECK_INTERVAL;
+	double EKP_HEALTH_CHECK_REQUEST_TIMEOUT;
+	bool ENCRYPT_KEY_CACHE_ENABLE_DETAIL_LOGGING;
 	double ENCRYPT_KEY_CACHE_LOGGING_INTERVAL;
 	double ENCRYPT_KEY_CACHE_LOGGING_SKETCH_ACCURACY;
 	bool ENCRYPT_HEADER_AUTH_TOKEN_ENABLED;
 	int ENCRYPT_HEADER_AUTH_TOKEN_ALGO;
-	double EKP_KMS_CONNECTION_BACKOFF;
-	int EKP_KMS_CONNECTION_RETRIES;
 
 	// RESTClient
 	int RESTCLIENT_MAX_CONNECTIONPOOL_SIZE;
 	int RESTCLIENT_CONNECT_TRIES;
 	int RESTCLIENT_CONNECT_TIMEOUT;
-	int RESTCLIENT_MAX_CONNECTION_LIFE;
+	int RESTCLIENT_MAX_CONNECTION_LIFE; // Not implemented yet.
 	int RESTCLIENT_REQUEST_TRIES;
 	int RESTCLIENT_REQUEST_TIMEOUT_SEC;
 	int REST_LOG_LEVEL;

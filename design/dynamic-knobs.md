@@ -107,25 +107,25 @@ Below is a sample Python script to write to the configuration database.
 ```python
 import fdb
 
-fdb.api_version(720)
+fdb.api_version(730)
 
 @fdb.transactional
 def set_knob(tr, knob_name, knob_value, config_class, description):
-        tr['\xff\xff/description'] = description
+        tr[b'\xff\xff/description'] = description
         tr[fdb.tuple.pack((config_class, knob_name,))] = knob_value
 
 # This function performs two knob changes transactionally.
 @fdb.transactional
 def set_multiple_knobs(tr):
-        tr['\xff\xff/description'] = 'description'
-        tr[fdb.tuple.pack((None, 'min_trace_severity',))] = '10'
-        tr[fdb.tuple.pack(('az-1', 'min_trace_severity',))] = '20'
+        tr[b'\xff\xff/description'] = b'description'
+        tr[fdb.tuple.pack((None, b'min_trace_severity',))] = b'10'
+        tr[fdb.tuple.pack((b'az-1', b'min_trace_severity',))] = b'20'
 
 db = fdb.open()
 db.options.set_use_config_database()
 
-set_knob(db, 'min_trace_severity', '10', None, 'description')
-set_knob(db, 'min_trace_severity', '20', 'az-1', 'description')
+set_knob(db, b'min_trace_severity', b'10', None, b'description')
+set_knob(db, b'min_trace_severity', b'20', 'az-1', b'description')
 ```
 
 ### CLI Usage
@@ -134,6 +134,7 @@ Users may also utilize `fdbcli` to set and update knobs dynamically. Usage is as
 ```
 setknob <knob_name> <knob_value> [config_class]
 getknob <knob_name> [config_class]
+clearknob <knob_name> [config_class]
 ```
 Where `knob_name` is an existing knob, `knob_value` is the desired value to set the knob and `config_class` is the optional configuration class. Furthermore, `setknob` may be combined within a `begin\commit` to update multiple knobs atomically. If using this option, a description must follow `commit` otherwise a prompt will be shown asking for a description. The description must be non-empty. An example follows.
 ```
@@ -151,7 +152,7 @@ commit "change"
 ```
 Specifically, `set, clear, get, getrange, clearrange` cannot be combined in any transaction with a `setknob` or `getknob`.
 
-If using an individual `setknob` without being inside a `begin\commit` block, then `fdbcli` will prompt for a description as well.
+If using an individual `setknob` or `clearknob` without being inside a `begin\commit` block, then `fdbcli` will prompt for a description as well.
 
 #### Type checking
 Knobs have implicit types attached to them when defined. For example, the knob `tracing_udp_listener_addr` is set to `"127.0.0.1"` as so the type is string. If a user invokes `setknob` on this knob with an incorrect value that is not a string, the transaction will fail. 
@@ -174,10 +175,15 @@ for *every* ``fdbserver`` process.
 The only client change from the configuration database is as part of the change
 coordinators command. The change coordinators command is not considered
 successful until the configuration database is readable on the new
-coordinators. This will cause the change coordinators command to hang if run
-against a database with dynamic knobs disabled. To disable the client side
-configuration database liveness check, specify the ``--no-config-db`` flag when
-changing coordinators. For example:
+coordinators. If the configuration database has been disabled server-side via
+the ``--no-config-db`` command line option, the coordinators will continue to
+serve the configuration interface, but will reply to each request with an empty
+response. Client-side changes are no longer necessary when disabling the
+configuration database.
+
+Optionally, the client liveness check of the configuration database can be
+prevented by specifying the ``--no-config-db`` flag when changing the
+coordinators. For example:
 
 ```
 fdbcli> coordinators auto --no-config-db

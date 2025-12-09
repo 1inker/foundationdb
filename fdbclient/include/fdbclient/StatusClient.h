@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -28,7 +28,15 @@
 class StatusClient {
 public:
 	enum StatusLevel { MINIMAL = 0, NORMAL = 1, DETAILED = 2, JSON = 3 };
-	static Future<StatusObject> statusFetcher(Database db);
+	// Fetches status json from FoundationDB.
+	// @in statusField if not specified (or an empty string is specified) the actor will
+	// fetch the entire status json object. If set to "fault_tolerance" the actor will
+	// fetch fault tolerance related status json fields ("fault_tolerance", "data", "logs",
+	// "maintenance_zone", "maintenance_seconds_remaining",	"qos", "recovery_state", "messages")
+	// only.
+	// @out status json
+	// @note we don't have support to fetch arbitrary status json fields at this point.
+	static Future<StatusObject> statusFetcher(Database db, std::string statusField = "");
 };
 
 #endif

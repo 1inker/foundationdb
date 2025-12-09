@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2018 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -184,7 +184,7 @@ public class DirectorySubspace extends Subspace implements Directory {
 
 	/**
 	 * Called by all functions that could operate on this subspace directly (moveTo, remove, removeIfExists, exists).
-	 * Subclasses can chooose to return a different directory layer to use for the operation if path is in fact empty.
+	 * Subclasses can choose to return a different directory layer to use for the operation if path is in fact empty.
 	 */
 	DirectoryLayer getLayerForPath(List<String> path) {
 		return directoryLayer;

@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -26,6 +26,7 @@
 #include <vector>
 
 #include "fdbclient/CommitTransaction.h"
+#include "fdbserver/ResolverBug.h"
 
 struct ConflictSet;
 ConflictSet* newConflictSet();
@@ -43,6 +44,7 @@ struct ConflictBatch {
 		TransactionTooOld,
 		TransactionTenantFailure,
 		TransactionCommitted,
+		TransactionLockReject,
 	};
 
 	void addTransaction(const CommitTransactionRef& transaction, Version newOldestVersion);
@@ -63,6 +65,12 @@ private:
 	// Stores the map: a transaction -> conflicted transactions' indices
 	std::map<int, VectorRef<int>>* conflictingKeyRangeMap;
 	Arena* resolveBatchReplyArena;
+	std::shared_ptr<ResolverBug> bugs = SimBugInjector().get<ResolverBug>(ResolverBugID());
+
+	// bug injection
+	bool ignoreTooOld() const;
+	bool ignoreWriteSet() const;
+	bool ignoreReadSet() const;
 
 	void checkIntraBatchConflicts();
 	void combineWriteConflictRanges();

@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -25,6 +25,7 @@
 void forceLinkIndexedSetTests();
 void forceLinkDequeTests();
 void forceLinkFlowTests();
+void forceLinkCoroTests();
 void forceLinkVersionedMapTests();
 void forceLinkMemcpyTests();
 void forceLinkMemcpyPerfTests();
@@ -49,6 +50,11 @@ void forceLinkArenaStringTests();
 void forceLinkActorCollectionTests();
 void forceLinkDDSketchTests();
 void forceLinkCommitProxyTests();
+void forceLinkWipedStringTests();
+void forceLinkRandomKeyValueUtilsTests();
+void forceLinkSimKmsVaultTests();
+void forceLinkRESTSimKmsVaultTest();
+void forceLinkActorFuzzUnitTests();
 
 struct UnitTestWorkload : TestWorkload {
 	static constexpr auto NAME = "UnitTests";
@@ -90,6 +96,7 @@ struct UnitTestWorkload : TestWorkload {
 		forceLinkIndexedSetTests();
 		forceLinkDequeTests();
 		forceLinkFlowTests();
+		forceLinkCoroTests();
 		forceLinkVersionedMapTests();
 		forceLinkMemcpyTests();
 		forceLinkMemcpyPerfTests();
@@ -113,6 +120,11 @@ struct UnitTestWorkload : TestWorkload {
 		forceLinkArenaStringTests();
 		forceLinkActorCollectionTests();
 		forceLinkDDSketchTests();
+		forceLinkWipedStringTests();
+		forceLinkRandomKeyValueUtilsTests();
+		forceLinkSimKmsVaultTests();
+		forceLinkRESTSimKmsVaultTest();
+		forceLinkActorFuzzUnitTests();
 	}
 
 	Future<Void> setup(Database const& cx) override {

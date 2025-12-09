@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -26,8 +26,11 @@
 #define FDBSERVER_PROXYCOMMITDATA_ACTOR_H
 
 #include "fdbclient/FDBTypes.h"
+#include "fdbclient/GetEncryptCipherKeys.h"
+#include "fdbclient/RangeLock.h"
 #include "fdbclient/Tenant.h"
 #include "fdbrpc/Stats.h"
+#include "fdbserver/AccumulativeChecksumUtil.h"
 #include "fdbserver/Knobs.h"
 #include "fdbserver/LogSystem.h"
 #include "fdbserver/LogSystemDiskQueueAdapter.h"
@@ -70,6 +73,7 @@ struct ProxyStats {
 	Version lastCommitVersionAssigned;
 
 	LatencySample commitLatencySample;
+	LatencySample encryptionLatencySample;
 	LatencyBands commitLatencyBands;
 
 	// Ratio of tlogs receiving empty commit messages.
@@ -139,6 +143,10 @@ struct ProxyStats {
 	                        id,
 	                        SERVER_KNOBS->LATENCY_METRICS_LOGGING_INTERVAL,
 	                        SERVER_KNOBS->LATENCY_SKETCH_ACCURACY),
+	    encryptionLatencySample("CommitEncryptionLatencyMetrics",
+	                            id,
+	                            SERVER_KNOBS->LATENCY_METRICS_LOGGING_INTERVAL,
+	                            SERVER_KNOBS->LATENCY_SKETCH_ACCURACY),
 	    commitLatencyBands("CommitLatencyBands", id, SERVER_KNOBS->STORAGE_LOGGING_DELAY),
 	    commitBatchingEmptyMessageRatio("CommitBatchingEmptyMessageRatio",
 	                                    id,
@@ -187,6 +195,7 @@ struct ExpectedIdempotencyIdCountForKey {
 	  : commitVersion(commitVersion), idempotencyIdCount(idempotencyIdCount), batchIndexHighByte(batchIndexHighByte) {}
 };
 
+struct RangeLock;
 struct ProxyCommitData {
 	UID dbgid;
 	int64_t commitBatchesMemBytesCount;
@@ -242,6 +251,7 @@ struct ProxyCommitData {
 	Version lastTxsPop;
 	bool popRemoteTxs;
 	std::vector<Standalone<StringRef>> whitelistedBinPathVec;
+	std::vector<std::pair<KeyRange, double>> hotShards;
 
 	Optional<LatencyBandConfig> latencyBandConfig;
 	double lastStartCommit;
@@ -256,11 +266,18 @@ struct ProxyCommitData {
 	int localTLogCount = -1;
 
 	EncryptionAtRestMode encryptMode;
+	Reference<GetEncryptCipherKeysMonitor> encryptionMonitor;
 
 	PromiseStream<ExpectedIdempotencyIdCountForKey> expectedIdempotencyIdCountForKey;
 	Standalone<VectorRef<MutationRef>> idempotencyClears;
 
 	AsyncVar<bool> triggerCommit;
+
+	uint16_t commitProxyIndex; // decided when the cluster controller recruits commit proxies
+	std::shared_ptr<AccumulativeChecksumBuilder> acsBuilder = nullptr;
+	LogEpoch epoch;
+
+	std::shared_ptr<RangeLock> rangeLock = nullptr;
 
 	// The tag related to a storage server rarely change, so we keep a vector of tags for each key range to be slightly
 	// more CPU efficient. When a tag related to a storage server does change, we empty out all of these vectors to
@@ -285,7 +302,11 @@ struct ProxyCommitData {
 		return false;
 	}
 
-	TenantMode getTenantMode() const { return db->get().client.tenantMode; }
+	TenantMode getTenantMode() const {
+		CODE_PROBE(db->get().client.grvProxies.empty() || db->get().client.grvProxies[0].provisional,
+		           "Accessing tenant mode in provisional ClientDBInfo");
+		return db->get().client.tenantMode;
+	}
 
 	void updateLatencyBandConfig(Optional<LatencyBandConfig> newLatencyBandConfig) {
 		if (newLatencyBandConfig.present() != latencyBandConfig.present() ||
@@ -303,7 +324,7 @@ struct ProxyCommitData {
 		latencyBandConfig = newLatencyBandConfig;
 	}
 
-	void updateSSTagCost(const UID& id, const TagSet& tagSet, MutationRef m, int cost) {
+	void updateSSTagCost(const UID& id, const TagSet& tagSet, MutationRef m, uint64_t cost) {
 		auto [it, _] = ssTrTagCommitCost.try_emplace(id, TransactionTagMap<TransactionCommitCostEstimation>());
 
 		for (auto& tag : tagSet) {
@@ -315,6 +336,17 @@ struct ProxyCommitData {
 		}
 	}
 
+	// RangeLock feature currently does not support version vector
+	// So, if the version vector is enabled, the RangeLock is automatically disabled
+	// RangeLock feature currently rely on processing private mutations in commit proxy
+	// So, if PROXY_USE_RESOLVER_PRIVATE_MUTATIONS is on, the RangeLock is automatically disabled
+	// RangeLock feature currently is not compatible with encryption and tenant
+	bool rangeLockEnabled() {
+		return SERVER_KNOBS->ENABLE_READ_LOCK_ON_RANGE && !SERVER_KNOBS->ENABLE_VERSION_VECTOR &&
+		       !SERVER_KNOBS->ENABLE_VERSION_VECTOR_TLOG_UNICAST && !encryptMode.isEncryptionEnabled() &&
+		       getTenantMode() == TenantMode::DISABLED;
+	}
+
 	ProxyCommitData(UID dbgid,
 	                MasterInterface master,
 	                PublicRequestStream<GetReadVersionRequest> getConsistentReadVersion,
@@ -323,20 +355,99 @@ struct ProxyCommitData {
 	                Reference<AsyncVar<ServerDBInfo> const> db,
 	                bool firstProxy,
 	                EncryptionAtRestMode encryptMode,
-	                bool provisional)
+	                bool provisional,
+	                uint16_t commitProxyIndex,
+	                LogEpoch epoch)
 	  : dbgid(dbgid), commitBatchesMemBytesCount(0),
 	    stats(dbgid, &version, &committedVersion, &commitBatchesMemBytesCount, &tenantMap), master(master),
 	    logAdapter(nullptr), txnStateStore(nullptr), committedVersion(recoveryTransactionVersion),
 	    minKnownCommittedVersion(0), version(0), lastVersionTime(0), commitVersionRequestNumber(1),
-	    mostRecentProcessedRequestNumber(0), firstProxy(firstProxy), encryptMode(encryptMode), provisional(provisional),
-	    lastCoalesceTime(0), locked(false), commitBatchInterval(SERVER_KNOBS->COMMIT_TRANSACTION_BATCH_INTERVAL_MIN),
+	    mostRecentProcessedRequestNumber(0), firstProxy(firstProxy), encryptMode(encryptMode),
+	    encryptionMonitor(makeReference<GetEncryptCipherKeysMonitor>()), provisional(provisional), lastCoalesceTime(0),
+	    locked(false), commitBatchInterval(SERVER_KNOBS->COMMIT_TRANSACTION_BATCH_INTERVAL_MIN),
 	    localCommitBatchesStarted(0), getConsistentReadVersion(getConsistentReadVersion), commit(commit),
 	    cx(openDBOnServer(db, TaskPriority::DefaultEndpoint, LockAware::True)), db(db),
 	    singleKeyMutationEvent("SingleKeyMutation"_sr), lastTxsPop(0), popRemoteTxs(false), lastStartCommit(0),
 	    lastCommitLatency(SERVER_KNOBS->REQUIRED_MIN_RECOVERY_DURATION), lastCommitTime(0), lastMasterReset(now()),
-	    lastResolverReset(now()) {
+	    lastResolverReset(now()), commitProxyIndex(commitProxyIndex),
+	    acsBuilder(CLIENT_KNOBS->ENABLE_MUTATION_CHECKSUM && CLIENT_KNOBS->ENABLE_ACCUMULATIVE_CHECKSUM &&
+	                       !encryptMode.isEncryptionEnabled() && !SERVER_KNOBS->ENABLE_VERSION_VECTOR &&
+	                       !SERVER_KNOBS->ENABLE_VERSION_VECTOR_TLOG_UNICAST
+	                   ? std::make_shared<AccumulativeChecksumBuilder>(
+	                         getCommitProxyAccumulativeChecksumIndex(commitProxyIndex))
+	                   : nullptr),
+	    epoch(epoch) {
 		commitComputePerOperation.resize(SERVER_KNOBS->PROXY_COMPUTE_BUCKETS, 0.0);
 	}
+};
+struct RangeLock {
+public:
+	RangeLock(ProxyCommitData* const pProxyCommitData) : pProxyCommitData(pProxyCommitData) {
+		coreMap.insert(allKeys, RangeLockStateSet());
+	}
+
+	bool pendingRequest() const { return currentRangeLockStartKey.present(); }
+
+	void initKeyPoint(const Key& key, const Value& value) {
+		ASSERT(pProxyCommitData != nullptr && pProxyCommitData->rangeLockEnabled());
+		// TraceEvent(SevDebug, "RangeLockRangeOps").detail("Ops", "Init").detail("Key", key);
+		if (!value.empty()) {
+			coreMap.rawInsert(key, decodeRangeLockStateSet(value));
+		} else {
+			coreMap.rawInsert(key, RangeLockStateSet());
+		}
+		return;
+	}
+
+	void setPendingRequest(const Key& startKey, const RangeLockStateSet& lockSetState) {
+		ASSERT(pProxyCommitData != nullptr && pProxyCommitData->rangeLockEnabled());
+		ASSERT(!pendingRequest());
+		currentRangeLockStartKey = std::make_pair(startKey, lockSetState);
+		return;
+	}
+
+	void consumePendingRequest(const Key& endKey) {
+		ASSERT(pProxyCommitData != nullptr && pProxyCommitData->rangeLockEnabled());
+		ASSERT(pendingRequest());
+		ASSERT(endKey <= normalKeys.end);
+		ASSERT(currentRangeLockStartKey.get().first < endKey);
+		KeyRange lockRange = Standalone(KeyRangeRef(currentRangeLockStartKey.get().first, endKey));
+		RangeLockStateSet lockSetState = currentRangeLockStartKey.get().second;
+		/* TraceEvent(SevDebug, "RangeLockRangeOps")
+		    .detail("Ops", "Update")
+		    .detail("Range", lockRange)
+		    .detail("Status", lockSetState.toString()); */
+		coreMap.insert(lockRange, lockSetState);
+		coreMap.coalesce(allKeys);
+		currentRangeLockStartKey.reset();
+		return;
+	}
+
+	bool isLocked(const KeyRange& range) const {
+		ASSERT(pProxyCommitData != nullptr && pProxyCommitData->rangeLockEnabled());
+		if (range.end >= normalKeys.end) {
+			return false;
+		}
+		for (auto lockRange : coreMap.intersectingRanges(range)) {
+			if (lockRange.value().isValid() && lockRange.value().isLockedFor(RangeLockType::ReadLockOnRange)) {
+				/*TraceEvent(SevDebug, "RangeLockRangeOps")
+				    .detail("Ops", "Check")
+				    .detail("Range", range)
+				    .detail("Status", "Reject");*/
+				return true;
+			}
+		}
+		/*TraceEvent(SevDebug, "RangeLockRangeOps")
+		    .detail("Ops", "Check")
+		    .detail("Range", range)
+		    .detail("Status", "Accept");*/
+		return false;
+	}
+
+private:
+	Optional<std::pair<Key, RangeLockStateSet>> currentRangeLockStartKey;
+	KeyRangeMap<RangeLockStateSet> coreMap;
+	ProxyCommitData* const pProxyCommitData;
 };
 
 #include "flow/unactorcompiler.h"

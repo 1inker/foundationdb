@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -64,6 +64,8 @@ public:
 
 	virtual void addref() = 0;
 	virtual void delref() = 0;
+
+	virtual StringRef getClassName() { return "IAsyncFile"_sr; }
 
 	// For read() and write(), the data buffer must remain valid until the future is ready
 	virtual Future<int> read(void* data,

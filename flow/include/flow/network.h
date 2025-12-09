@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -21,6 +21,9 @@
 #ifndef FLOW_OPENNETWORK_H
 #define FLOW_OPENNETWORK_H
 #pragma once
+
+#include "flow/ProtocolVersion.h"
+#include "flow/swift.h"
 
 #include "flow/NetworkAddress.h"
 #include "flow/IPAddress.h"
@@ -79,7 +82,7 @@ struct NetworkMetrics {
 	NetworkMetrics()
 	  : lastRunLoopBusyness(0), networkBusyness(0),
 	    starvationTrackerNetworkBusyness(PriorityStats(static_cast<TaskPriority>(starvationBins.at(0)))) {
-		for (int priority : starvationBins) { // initalize starvation trackers with given priorities
+		for (int priority : starvationBins) { // initialize starvation trackers with given priorities
 			starvationTrackers.emplace_back(static_cast<TaskPriority>(priority));
 		}
 	}
@@ -112,6 +115,7 @@ struct NetworkInfo {
 	FlowLock* handshakeLock;
 
 	NetworkInfo();
+	~NetworkInfo();
 };
 
 class IEventFD : public ReferenceCounted<IEventFD> {
@@ -126,11 +130,16 @@ typedef NetworkAddress (*NetworkAddressFuncPtr)();
 typedef NetworkAddressList (*NetworkAddressesFuncPtr)();
 
 class TLSConfig;
-class INetwork;
+
+class SWIFT_CXX_IMMORTAL_SINGLETON_TYPE INetwork;
+
 extern INetwork* g_network;
 extern INetwork* newNet2(const TLSConfig& tlsConfig, bool useThreadPool = false, bool useMetrics = false);
+inline INetwork* _swift_newNet2(const TLSConfig* tlsConfig, bool useThreadPool = false, bool useMetrics = false) {
+	return newNet2(*tlsConfig, useThreadPool, useMetrics);
+}
 
-class INetwork {
+class SWIFT_CXX_IMMORTAL_SINGLETON_TYPE INetwork {
 public:
 	// This interface abstracts the physical or simulated network, event loop and hardware that FoundationDB is running
 	// on. Note that there are tools for disk access, scheduling, etc as well as networking, and that almost all access
@@ -180,6 +189,8 @@ public:
 
 	virtual double timer_monotonic() = 0;
 	// Similar to timer, but monotonic
+
+	virtual void _swiftEnqueue(void* task) = 0;
 
 	virtual Future<class Void> delay(double seconds, TaskPriority taskID) = 0;
 	// The given future will be set after seconds have elapsed
@@ -278,5 +289,12 @@ protected:
 
 	~INetwork() {} // Please don't try to delete through this interface!
 };
+
+/// A wrapper for `g_network` value  that lets you access global properties from Swift.
+namespace SwiftGNetwork {
+inline double timer() {
+	return g_network->timer();
+}
+} // namespace SwiftGNetwork
 
 #endif

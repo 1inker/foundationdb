@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -34,7 +34,9 @@
 //
 // Smoothers are used to avoid turbulent throttling behaviour.
 class GrvTransactionRateInfo {
-	double rate = 0.0;
+	double rateWindow{ 1.0 };
+	double maxEmptyQueueBudget{ 0.0 };
+	double rate{ 0.0 };
 	double limit{ 0.0 };
 	double budget{ 0.0 };
 	bool disabled{ true };
@@ -42,7 +44,7 @@ class GrvTransactionRateInfo {
 	Smoother smoothReleased;
 
 public:
-	explicit GrvTransactionRateInfo(double rate = 0.0);
+	GrvTransactionRateInfo(double rateWindow, double maxEmptyQueueBudget, double rate);
 
 	// Determines the number of transactions that this proxy is allowed to release
 	// in this release window.

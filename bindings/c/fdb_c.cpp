@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -88,8 +88,9 @@ extern "C" DLLEXPORT fdb_bool_t fdb_error_predicate(int predicate_test, fdb_erro
 		       code == error_code_future_version || code == error_code_database_locked ||
 		       code == error_code_grv_proxy_memory_limit_exceeded ||
 		       code == error_code_commit_proxy_memory_limit_exceeded ||
-		       code == error_code_batch_transaction_throttled || code == error_code_process_behind ||
-		       code == error_code_tag_throttled || code == error_code_proxy_tag_throttled;
+		       code == error_code_transaction_throttled_hot_shard || code == error_code_batch_transaction_throttled ||
+		       code == error_code_process_behind || code == error_code_tag_throttled ||
+		       code == error_code_proxy_tag_throttled || code == error_code_transaction_rejected_range_locked;
 	}
 	return false;
 }
@@ -355,6 +356,7 @@ void parseGetTenant(Optional<KeyRef>& dest, FDBBGTenantPrefix const* source) {
 void parseGetEncryptionKey(BlobGranuleCipherKey& dest, FDBBGEncryptionKey const* source) {
 	dest.encryptDomainId = source->domain_id;
 	dest.baseCipherId = source->base_key_id;
+	dest.baseCipherKCV = source->base_kcv;
 	dest.salt = source->random_salt;
 	dest.baseCipher = StringRef(source->base_key.key, source->base_key.key_length);
 }
@@ -371,6 +373,7 @@ void parseGetEncryptionKeyCtx(Optional<BlobGranuleCipherKeysCtx>& dest, FDBBGEnc
 void setEncryptionKey(FDBBGEncryptionKey* dest, const BlobGranuleCipherKey& source) {
 	dest->domain_id = source.encryptDomainId;
 	dest->base_key_id = source.baseCipherId;
+	dest->base_kcv = source.baseCipherKCV;
 	dest->random_salt = source.salt;
 	dest->base_key.key = source.baseCipher.begin();
 	dest->base_key.key_length = source.baseCipher.size();
@@ -379,7 +382,9 @@ void setEncryptionKey(FDBBGEncryptionKey* dest, const BlobGranuleCipherKey& sour
 void setEncryptionKeyCtx(FDBBGEncryptionCtx* dest, const BlobGranuleCipherKeysCtx& source) {
 	dest->present = true;
 	setEncryptionKey(&dest->textKey, source.textCipherKey);
+	dest->textKCV = source.textCipherKey.baseCipherKCV;
 	setEncryptionKey(&dest->headerKey, source.headerCipherKey);
+	dest->headerKCV = source.headerCipherKey.baseCipherKCV;
 	dest->iv.key = source.ivRef.begin();
 	dest->iv.key_length = source.ivRef.size();
 }
@@ -1071,7 +1076,6 @@ extern "C" DLLEXPORT FDBFuture* fdb_transaction_get_mapped_range(FDBTransaction*
                                                                  int target_bytes,
                                                                  FDBStreamingMode mode,
                                                                  int iteration,
-                                                                 int matchIndex,
                                                                  fdb_bool_t snapshot,
                                                                  fdb_bool_t reverse) {
 	FDBFuture* r = validate_and_update_parameters(limit, target_bytes, mode, iteration, reverse);
@@ -1084,7 +1088,6 @@ extern "C" DLLEXPORT FDBFuture* fdb_transaction_get_mapped_range(FDBTransaction*
 	                        KeySelectorRef(KeyRef(end_key_name, end_key_name_length), end_or_equal, end_offset),
 	                        StringRef(mapper_name, mapper_name_length),
 	                        GetRangeLimits(limit, target_bytes),
-	                        matchIndex,
 	                        snapshot,
 	                        reverse)
 	                    .extractPtr());

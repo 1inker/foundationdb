@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -1241,8 +1241,9 @@ ACTOR Future<RangeResult> tryFetchRange(Database cx,
 			if (e.code() == error_code_transaction_too_old)
 				*isTooOld = true;
 			output.more = true;
-			if (begin.isFirstGreaterOrEqual())
-				output.readThrough = begin.getKey();
+			if (begin.isFirstGreaterOrEqual()) {
+				output.setReadThrough(begin.getKey());
+			}
 			return output;
 		}
 		throw;
@@ -1401,6 +1402,7 @@ ACTOR Future<Void> fetchKeys(StorageCacheData* data, AddingCacheRange* cacheRang
 					// TODO: NEELAM: what's this for?
 					// FIXME: remove when we no longer support upgrades from 5.X
 					if (debug_getRangeRetries >= 100) {
+						ASSERT(false);
 						data->cx->enableLocalityLoadBalance = EnableLocalityLoadBalance::False;
 					}
 

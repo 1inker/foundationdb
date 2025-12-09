@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -310,7 +310,6 @@ MappedKeyValueArrayFuture Transaction::get_mapped_range(const uint8_t* begin_key
                                                         int target_bytes,
                                                         FDBStreamingMode mode,
                                                         int iteration,
-                                                        int matchIndex,
                                                         fdb_bool_t snapshot,
                                                         fdb_bool_t reverse) {
 	return MappedKeyValueArrayFuture(fdb_transaction_get_mapped_range(tr_,
@@ -328,7 +327,6 @@ MappedKeyValueArrayFuture Transaction::get_mapped_range(const uint8_t* begin_key
 	                                                                  target_bytes,
 	                                                                  mode,
 	                                                                  iteration,
-	                                                                  matchIndex,
 	                                                                  snapshot,
 	                                                                  reverse));
 }

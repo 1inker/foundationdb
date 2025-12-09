@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -67,6 +67,15 @@ TraceEvent debugMutationEnabled(const char* context, Version version, MutationRe
 	return TraceEvent();
 }
 
+TraceEvent debugEncrptedMutationEnabled(const char* context, Version version, MutationRef const& mutation, UID id) {
+	ASSERT(mutation.type == mutation.Encrypted);
+	MutationRef fmutation = Standalone(mutation);
+	Arena tempArena;
+	ArenaReader reader(tempArena, mutation.param2, AssumeVersion(ProtocolVersion::withEncryptionAtRest()));
+	reader >> fmutation;
+	return debugMutationEnabled(context, version, fmutation, id);
+}
+
 TraceEvent debugKeyRangeEnabled(const char* context, Version version, KeyRangeRef const& keys, UID id) {
 	return debugMutation(context, version, MutationRef(MutationRef::DebugKeyRange, keys.begin, keys.end), id);
 }
@@ -81,12 +90,12 @@ TraceEvent debugTagsAndMessageEnabled(const char* context, Version version, Stri
 		}
 		TagsAndMessage msg;
 		msg.loadFromArena(&rdr, nullptr);
-		bool logAdapterMessage = std::any_of(
-		    msg.tags.begin(), msg.tags.end(), [](const Tag& t) { return t == txsTag || t.locality == tagLocalityTxs; });
+		bool logAdapterMessage =
+		    std::any_of(msg.tags.begin(), msg.tags.end(), [](const Tag& t) { return t.locality == tagLocalityTxs; });
 		StringRef mutationData = msg.getMessageWithoutTags();
 		uint8_t mutationType = *mutationData.begin();
 		if (logAdapterMessage) {
-			// Skip the message, as there will always be an idential non-logAdapterMessage mutation
+			// Skip the message, as there will always be an identical non-logAdapterMessage mutation
 			// that we can match against in the same commit.
 		} else if (LogProtocolMessage::startsLogProtocolMessage(mutationType)) {
 			BinaryReader br(mutationData, AssumeVersion(rdr.protocolVersion()));
@@ -117,7 +126,11 @@ TraceEvent debugTagsAndMessageEnabled(const char* context, Version version, Stri
 
 #if MUTATION_TRACKING_ENABLED
 TraceEvent debugMutation(const char* context, Version version, MutationRef const& mutation, UID id) {
-	return debugMutationEnabled(context, version, mutation, id);
+	if (mutation.type == mutation.Encrypted) {
+		return debugEncrptedMutationEnabled(context, version, mutation, id);
+	} else {
+		return debugMutationEnabled(context, version, mutation, id);
+	}
 }
 TraceEvent debugKeyRange(const char* context, Version version, KeyRangeRef const& keys, UID id) {
 	return debugKeyRangeEnabled(context, version, keys, id);

@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -53,6 +53,28 @@ Future<decltype(std::declval<Function>()(Reference<ReadYourWritesTransaction>())
 			state decltype(std::declval<Function>()(Reference<ReadYourWritesTransaction>()).getValue()) result =
 			    wait(func(tr));
 			wait(tr->commit());
+			return result;
+		} catch (Error& e) {
+			wait(tr->onError(e));
+		}
+	}
+}
+
+// Debug version of runRYWTransaction. It logs the function name and the committed version of the transaction.
+// Note the function name is required, e.g., taskFunc->getName() for TaskFuncBase.
+ACTOR template <class Function>
+Future<decltype(std::declval<Function>()(Reference<ReadYourWritesTransaction>()).getValue())>
+runRYWTransactionDebug(Database cx, StringRef name, Function func) {
+	state Reference<ReadYourWritesTransaction> tr(new ReadYourWritesTransaction(cx));
+	loop {
+		try {
+			// func should be idempodent; otherwise, retry will get undefined result
+			state decltype(std::declval<Function>()(Reference<ReadYourWritesTransaction>()).getValue()) result =
+			    wait(func(tr));
+			wait(tr->commit());
+			TraceEvent("DebugRunRYWTransaction")
+			    .detail("Function", name)
+			    .detail("CommitVersion", tr->getCommittedVersion());
 			return result;
 		} catch (Error& e) {
 			wait(tr->onError(e));

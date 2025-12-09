@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -30,32 +30,34 @@
 #include "fdbclient/TaskBucket.h"
 #include "fdbclient/Notified.h"
 #include "flow/IAsyncFile.h"
-#include "fdbclient/KeyBackedTypes.h"
+#include "fdbclient/KeyBackedTypes.actor.h"
 #include <ctime>
 #include <climits>
 #include "fdbclient/BackupContainer.h"
 #include "flow/actorcompiler.h" // has to be last include
 
-FDB_DECLARE_BOOLEAN_PARAM(LockDB);
-FDB_DECLARE_BOOLEAN_PARAM(UnlockDB);
-FDB_DECLARE_BOOLEAN_PARAM(StopWhenDone);
-FDB_DECLARE_BOOLEAN_PARAM(Verbose);
-FDB_DECLARE_BOOLEAN_PARAM(WaitForComplete);
-FDB_DECLARE_BOOLEAN_PARAM(ForceAction);
-FDB_DECLARE_BOOLEAN_PARAM(Terminator);
-FDB_DECLARE_BOOLEAN_PARAM(IncrementalBackupOnly);
-FDB_DECLARE_BOOLEAN_PARAM(UsePartitionedLog);
-FDB_DECLARE_BOOLEAN_PARAM(OnlyApplyMutationLogs);
-FDB_DECLARE_BOOLEAN_PARAM(SnapshotBackupUseTenantCache);
-FDB_DECLARE_BOOLEAN_PARAM(InconsistentSnapshotOnly);
-FDB_DECLARE_BOOLEAN_PARAM(ShowErrors);
-FDB_DECLARE_BOOLEAN_PARAM(AbortOldBackup);
-FDB_DECLARE_BOOLEAN_PARAM(DstOnly); // TODO: More descriptive name?
-FDB_DECLARE_BOOLEAN_PARAM(WaitForDestUID);
-FDB_DECLARE_BOOLEAN_PARAM(CheckBackupUID);
-FDB_DECLARE_BOOLEAN_PARAM(DeleteData);
-FDB_DECLARE_BOOLEAN_PARAM(SetValidation);
-FDB_DECLARE_BOOLEAN_PARAM(PartialBackup);
+FDB_BOOLEAN_PARAM(LockDB);
+FDB_BOOLEAN_PARAM(UnlockDB);
+FDB_BOOLEAN_PARAM(StopWhenDone);
+FDB_BOOLEAN_PARAM(Verbose);
+FDB_BOOLEAN_PARAM(WaitForComplete);
+FDB_BOOLEAN_PARAM(ForceAction);
+FDB_BOOLEAN_PARAM(Terminator);
+FDB_BOOLEAN_PARAM(IncrementalBackupOnly);
+FDB_BOOLEAN_PARAM(UsePartitionedLog);
+FDB_BOOLEAN_PARAM(OnlyApplyMutationLogs);
+FDB_BOOLEAN_PARAM(SnapshotBackupUseTenantCache);
+FDB_BOOLEAN_PARAM(InconsistentSnapshotOnly);
+FDB_BOOLEAN_PARAM(ShowErrors);
+FDB_BOOLEAN_PARAM(AbortOldBackup);
+FDB_BOOLEAN_PARAM(DstOnly); // TODO: More descriptive name?
+FDB_BOOLEAN_PARAM(WaitForDestUID);
+FDB_BOOLEAN_PARAM(CheckBackupUID);
+FDB_BOOLEAN_PARAM(DeleteData);
+FDB_BOOLEAN_PARAM(SetValidation);
+FDB_BOOLEAN_PARAM(PartialBackup);
+
+extern Optional<std::string> fileBackupAgentProxy;
 
 class BackupAgentBase : NonCopyable {
 public:
@@ -156,7 +158,7 @@ public:
 
 	/** RESTORE **/
 
-	enum ERestoreState { UNITIALIZED = 0, QUEUED = 1, STARTING = 2, RUNNING = 3, COMPLETED = 4, ABORTED = 5 };
+	enum ERestoreState { UNINITIALIZED = 0, QUEUED = 1, STARTING = 2, RUNNING = 3, COMPLETED = 4, ABORTED = 5 };
 	static StringRef restoreStateText(ERestoreState id);
 	static Key getPauseKey();
 
@@ -201,7 +203,8 @@ public:
 	                        UnlockDB = UnlockDB::True,
 	                        OnlyApplyMutationLogs = OnlyApplyMutationLogs::False,
 	                        InconsistentSnapshotOnly = InconsistentSnapshotOnly::False,
-	                        Optional<std::string> const& encryptionKeyFileName = {});
+	                        Optional<std::string> const& encryptionKeyFileName = {},
+	                        Optional<std::string> blobManifestUrl = {});
 
 	Future<Version> restore(Database cx,
 	                        Optional<Database> cxOrig,
@@ -218,7 +221,8 @@ public:
 	                        OnlyApplyMutationLogs = OnlyApplyMutationLogs::False,
 	                        InconsistentSnapshotOnly = InconsistentSnapshotOnly::False,
 	                        Version beginVersion = ::invalidVersion,
-	                        Optional<std::string> const& encryptionKeyFileName = {});
+	                        Optional<std::string> const& encryptionKeyFileName = {},
+	                        Optional<std::string> blobManifestUrl = {});
 
 	Future<Version> restore(Database cx,
 	                        Optional<Database> cxOrig,
@@ -236,7 +240,8 @@ public:
 	                        OnlyApplyMutationLogs onlyApplyMutationLogs = OnlyApplyMutationLogs::False,
 	                        InconsistentSnapshotOnly inconsistentSnapshotOnly = InconsistentSnapshotOnly::False,
 	                        Version beginVersion = ::invalidVersion,
-	                        Optional<std::string> const& encryptionKeyFileName = {});
+	                        Optional<std::string> const& encryptionKeyFileName = {},
+	                        Optional<std::string> blobManifestUrl = {});
 
 	Future<Version> atomicRestore(Database cx,
 	                              Key tagName,
@@ -276,7 +281,8 @@ public:
 	                          StopWhenDone = StopWhenDone::True,
 	                          UsePartitionedLog = UsePartitionedLog::False,
 	                          IncrementalBackupOnly = IncrementalBackupOnly::False,
-	                          Optional<std::string> const& encryptionKeyFileName = {});
+	                          Optional<std::string> const& encryptionKeyFileName = {},
+	                          Optional<std::string> const& blobManifestUrl = {});
 	Future<Void> submitBackup(Database cx,
 	                          Key outContainer,
 	                          Optional<std::string> proxy,
@@ -288,7 +294,8 @@ public:
 	                          StopWhenDone stopWhenDone = StopWhenDone::True,
 	                          UsePartitionedLog partitionedLog = UsePartitionedLog::False,
 	                          IncrementalBackupOnly incrementalBackupOnly = IncrementalBackupOnly::False,
-	                          Optional<std::string> const& encryptionKeyFileName = {}) {
+	                          Optional<std::string> const& encryptionKeyFileName = {},
+	                          Optional<std::string> const& blobManifestUrl = {}) {
 		return runRYWTransactionFailIfLocked(cx, [=](Reference<ReadYourWritesTransaction> tr) {
 			return submitBackup(tr,
 			                    outContainer,
@@ -301,7 +308,8 @@ public:
 			                    stopWhenDone,
 			                    partitionedLog,
 			                    incrementalBackupOnly,
-			                    encryptionKeyFileName);
+			                    encryptionKeyFileName,
+			                    blobManifestUrl);
 		});
 	}
 
@@ -545,7 +553,7 @@ Future<Void> eraseLogData(Reference<ReadYourWritesTransaction> tr,
                           CheckBackupUID = CheckBackupUID::False,
                           Version backupUid = 0);
 Key getApplyKey(Version version, Key backupUid);
-Key getLogKey(Version version, Key backupUid);
+Key getLogKey(Version version, Key backupUid, int blockSize = CLIENT_KNOBS->LOG_RANGE_BLOCK_SIZE);
 Version getLogKeyVersion(Key key);
 std::pair<Version, uint32_t> decodeBKMutationLogKey(Key key);
 Future<Void> logError(Database cx, Key keyErrors, const std::string& message);
@@ -636,7 +644,7 @@ public:
 	Key prefix;
 };
 
-class KeyBackedTaskConfig : public KeyBackedStruct {
+class KeyBackedTaskConfig : public KeyBackedClass {
 protected:
 	UID uid;
 	Subspace configSpace;
@@ -647,7 +655,7 @@ public:
 	} TaskParams;
 
 	KeyBackedTaskConfig(StringRef prefix, UID uid = UID())
-	  : KeyBackedStruct(prefix), uid(uid), configSpace(uidPrefixKey("uid->config/"_sr.withPrefix(prefix), uid)) {}
+	  : KeyBackedClass(prefix), uid(uid), configSpace(uidPrefixKey("uid->config/"_sr.withPrefix(prefix), uid)) {}
 
 	KeyBackedTaskConfig(StringRef prefix, Reference<Task> task)
 	  : KeyBackedTaskConfig(prefix, TaskParams.uid().get(task)) {}
@@ -684,11 +692,11 @@ public:
 		// restore uid. Get this uid's tag, then get the KEY for the tag's uid but don't read it.  That becomes the
 		// validation key which TaskBucket will check, and its value must be this restore config's uid.
 		UID u = uid; // 'this' could be invalid in lambda
-		Key p = prefix;
+		Key p = subspace.key();
 		return map(tag().get(tr), [u, p, task](Optional<std::string> const& tag) -> Void {
 			if (!tag.present())
 				throw restore_error();
-			// Validation contition is that the uidPair key must be exactly {u, false}
+			// Validation condition is that the uidPair key must be exactly {u, false}
 			TaskBucket::setValidationCondition(
 			    task, KeyBackedTag(tag.get(), p).key, TupleCodec<UidAndAbortedFlagT>::pack({ u, false }));
 			return Void();
@@ -890,7 +898,7 @@ public:
 	// Latest version for which all prior versions have saved by backup workers.
 	KeyBackedProperty<Version> latestBackupWorkerSavedVersion() { return configSpace.pack(__FUNCTION__sr); }
 
-	// Stop differntial logging if already started or don't start after completing KV ranges
+	// Stop differential logging if already started or don't start after completing KV ranges
 	KeyBackedProperty<bool> stopWhenDone() { return configSpace.pack(__FUNCTION__sr); }
 
 	// Enable snapshot backup file encryption
@@ -960,6 +968,8 @@ public:
 
 		return updateErrorInfo(cx, e, details);
 	}
+
+	KeyBackedProperty<bool> blobBackupEnabled() { return configSpace.pack(__FUNCTION__sr); }
 };
 
 // Helper class for reading restore data from a buffer and throwing the right errors.

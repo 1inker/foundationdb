@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -140,6 +140,8 @@ class AsyncFileCached final : public IAsyncFile, public ReferenceCounted<AsyncFi
 	friend struct AFCPage;
 
 public:
+	virtual StringRef getClassName() override { return "AsyncFileCached"_sr; }
+
 	// Opens a file that uses the FDB in-memory page cache
 	static Future<Reference<IAsyncFile>> open(std::string filename, int flags, int mode) {
 		//TraceEvent("AsyncFileCachedOpen").detail("Filename", filename);

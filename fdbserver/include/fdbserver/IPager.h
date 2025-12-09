@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -27,7 +27,7 @@
 #include "fdbclient/FDBTypes.h"
 #include "fdbclient/GetEncryptCipherKeys.h"
 #include "fdbclient/Tenant.h"
-#include "fdbserver/IClosable.h"
+#include "fdbclient/IClosable.h"
 #include "flow/EncryptUtils.h"
 #include "flow/Error.h"
 #include "flow/FastAlloc.h"
@@ -107,7 +107,8 @@ enum EncodingType : uint8_t {
 
 static constexpr std::array EncryptedEncodingTypes = { AESEncryption, AESEncryptionWithAuth, XOREncryption_TestOnly };
 inline bool isEncodingTypeEncrypted(EncodingType encoding) {
-	return std::count(EncryptedEncodingTypes.begin(), EncryptedEncodingTypes.end(), encoding) > 0;
+	return std::find(EncryptedEncodingTypes.begin(), EncryptedEncodingTypes.end(), encoding) !=
+	       EncryptedEncodingTypes.end();
 }
 
 inline bool isEncodingTypeAESEncrypted(EncodingType encoding) {
@@ -206,7 +207,7 @@ private:
 //
 // preWrite() must be called before writing a page to disk to update checksums and encrypt as needed
 // After reading a page from disk,
-//   postReadHeader() must be called to verify the verison, main, and encoding headers
+//   postReadHeader() must be called to verify the version, main, and encoding headers
 //   postReadPayload() must be called, after potentially setting encryption secret, to verify and possibly
 //                     decrypt the payload
 class ArenaPage : public ReferenceCounted<ArenaPage>, public FastAllocated<ArenaPage> {
@@ -282,7 +283,7 @@ public:
 	// Redwood header version 1
 	// Protects all headers with a 64-bit XXHash checksum
 	// Most other fields are forensic in nature and are not required to be set for correct
-	// behavior but they can faciliate forensic investigation of data on disk.  Some of them
+	// behavior but they can facilitate forensic investigation of data on disk.  Some of them
 	// could be used for sanity checks at runtime.
 	struct RedwoodHeaderV1 {
 		PageType pageType;
@@ -433,28 +434,25 @@ public:
 			                                  getEncryptAuthTokenMode(ENCRYPT_HEADER_AUTH_TOKEN_MODE_SINGLE),
 			                                  BlobCipherMetrics::KV_REDWOOD);
 			Arena arena;
-			StringRef ciphertext;
-			if (CLIENT_KNOBS->ENABLE_CONFIGURABLE_ENCRYPTION) {
-				BlobCipherEncryptHeaderRef headerRef;
-				ciphertext = cipher.encrypt(payload, len, &headerRef, arena);
-				Standalone<StringRef> serializedHeader = BlobCipherEncryptHeaderRef::toStringRef(headerRef);
-				ASSERT(serializedHeader.size() <= headerSize);
-				memcpy(h->encryptionHeaderBuf, serializedHeader.begin(), serializedHeader.size());
-				if (serializedHeader.size() < headerSize) {
-					memset(h->encryptionHeaderBuf + serializedHeader.size(), 0, headerSize - serializedHeader.size());
-				}
-			} else {
-				ciphertext = cipher.encrypt(payload, len, &h->encryption, arena)->toStringRef();
+
+			BlobCipherEncryptHeaderRef headerRef;
+			cipher.encryptInplace(payload, len, &headerRef);
+
+			Standalone<StringRef> serializedHeader = BlobCipherEncryptHeaderRef::toStringRef(headerRef);
+			ASSERT(serializedHeader.size() <= BlobCipherEncryptHeader::headerSize);
+			memcpy(h->encryptionHeaderBuf, serializedHeader.begin(), serializedHeader.size());
+			if (serializedHeader.size() < BlobCipherEncryptHeader::headerSize) {
+				memset(h->encryptionHeaderBuf + serializedHeader.size(),
+				       0,
+				       BlobCipherEncryptHeader::headerSize - serializedHeader.size());
 			}
-			ASSERT_EQ(len, ciphertext.size());
-			memcpy(payload, ciphertext.begin(), len);
+
 			if constexpr (encodingType == AESEncryption) {
 				h->checksum = XXH3_64bits_withSeed(payload, len, seed);
 			}
 		}
 
 		static BlobCipherEncryptHeaderRef getEncryptionHeaderRef(const void* header) {
-			ASSERT(CLIENT_KNOBS->ENABLE_CONFIGURABLE_ENCRYPTION);
 			const Header* h = reinterpret_cast<const Header*>(header);
 			return BlobCipherEncryptHeaderRef::fromStringRef(
 			    StringRef(h->encryptionHeaderBuf, headerSize - (h->encryptionHeaderBuf - (const uint8_t*)h)));
@@ -464,7 +462,8 @@ public:
 		                   const TextAndHeaderCipherKeys& cipherKeys,
 		                   uint8_t* payload,
 		                   int len,
-		                   PhysicalPageID seed) {
+		                   PhysicalPageID seed,
+		                   double* decryptTime = nullptr) {
 			Header* h = reinterpret_cast<Header*>(header);
 			if constexpr (encodingType == AESEncryption) {
 				if (h->checksum != XXH3_64bits_withSeed(payload, len, seed)) {
@@ -472,23 +471,10 @@ public:
 				}
 			}
 			Arena arena;
-			StringRef plaintext;
-			if (CLIENT_KNOBS->ENABLE_CONFIGURABLE_ENCRYPTION) {
-				BlobCipherEncryptHeaderRef headerRef = getEncryptionHeaderRef(header);
-				DecryptBlobCipherAes256Ctr cipher(cipherKeys.cipherTextKey,
-				                                  cipherKeys.cipherHeaderKey,
-				                                  headerRef.getIV(),
-				                                  BlobCipherMetrics::KV_REDWOOD);
-				plaintext = cipher.decrypt(payload, len, headerRef, arena);
-			} else {
-				DecryptBlobCipherAes256Ctr cipher(cipherKeys.cipherTextKey,
-				                                  cipherKeys.cipherHeaderKey,
-				                                  h->encryption.iv,
-				                                  BlobCipherMetrics::KV_REDWOOD);
-				plaintext = cipher.decrypt(payload, len, h->encryption, arena)->toStringRef();
-			}
-			ASSERT_EQ(len, plaintext.size());
-			memcpy(payload, plaintext.begin(), len);
+			BlobCipherEncryptHeaderRef headerRef = getEncryptionHeaderRef(header);
+			DecryptBlobCipherAes256Ctr cipher(
+			    cipherKeys.cipherTextKey, cipherKeys.cipherHeaderKey, headerRef.getIV(), BlobCipherMetrics::KV_REDWOOD);
+			cipher.decryptInplace(payload, len, headerRef, decryptTime);
 		}
 	};
 
@@ -657,17 +643,17 @@ public:
 
 	// Pre:   postReadHeader has been called, encoding-specific parameters (such as the encryption secret) have been set
 	// Post:  Payload has been verified and decrypted if necessary
-	void postReadPayload(PhysicalPageID pageID) {
+	void postReadPayload(PhysicalPageID pageID, double* decryptTime = nullptr) {
 		if (page->encodingType == EncodingType::XXHash64) {
 			XXHashEncoder::decode(page->getEncodingHeader(), pPayload, payloadSize, pageID);
 		} else if (page->encodingType == EncodingType::XOREncryption_TestOnly) {
 			XOREncryptionEncoder::decode(page->getEncodingHeader(), encryptionKey, pPayload, payloadSize, pageID);
 		} else if (page->encodingType == EncodingType::AESEncryption) {
 			AESEncryptionEncoder<AESEncryption>::decode(
-			    page->getEncodingHeader(), encryptionKey.aesKey, pPayload, payloadSize, pageID);
+			    page->getEncodingHeader(), encryptionKey.aesKey, pPayload, payloadSize, pageID, decryptTime);
 		} else if (page->encodingType == EncodingType::AESEncryptionWithAuth) {
 			AESEncryptionEncoder<AESEncryptionWithAuth>::decode(
-			    page->getEncodingHeader(), encryptionKey.aesKey, pPayload, payloadSize, pageID);
+			    page->getEncodingHeader(), encryptionKey.aesKey, pPayload, payloadSize, pageID, decryptTime);
 		} else {
 			throw page_encoding_not_supported();
 		}
@@ -885,7 +871,7 @@ public:
 	// invalidate them or keep their versions around until the snapshots are no longer in use.
 	virtual void setOldestReadableVersion(Version v) = 0;
 
-	// Advance the commit version and the oldest readble version and commit until the remap queue is empty.
+	// Advance the commit version and the oldest readable version and commit until the remap queue is empty.
 	virtual Future<Void> clearRemapQueue() = 0;
 
 	// Get a pointer to an integer representing a byte count penalty the pager should apply against usable page cache

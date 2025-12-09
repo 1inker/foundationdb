@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -45,6 +45,7 @@ bool storageWiggleStatsEqual(StorageWiggleMetrics const& a, StorageWiggleMetrics
 	return res;
 }
 
+namespace {
 ACTOR Future<bool> IssueConfigurationChange(Database cx, std::string config, bool force) {
 	printf("Issuing configuration change: %s\n", config.c_str());
 	state ConfigurationResult res = wait(ManagementAPI::changeConfig(cx.getReference(), config, force));
@@ -54,6 +55,7 @@ ACTOR Future<bool> IssueConfigurationChange(Database cx, std::string config, boo
 	wait(delay(5.0)); // wait for read window
 	return true;
 }
+} // namespace
 
 // a wrapper for test protected method
 struct DDTeamCollectionTester : public DDTeamCollection {
@@ -154,10 +156,11 @@ struct PerpetualWiggleStatsWorkload : public TestWorkload {
 	PerpetualWiggleStatsWorkload(WorkloadContext const& wcx) : TestWorkload(wcx) {}
 
 	ACTOR static Future<Void> _setup(PerpetualWiggleStatsWorkload* self, Database cx) {
-		int oldMode = wait(setDDMode(cx, 0));
-		MoveKeysLock lock = wait(takeMoveKeysLock(cx, UID())); // force current DD to quit
+		wait(success(setDDMode(cx, 0)));
+		wait(success(takeMoveKeysLock(cx, UID()))); // force current DD to quit
 		bool success = wait(IssueConfigurationChange(cx, "storage_migration_type=disabled", true));
 		ASSERT(success);
+		wait(delay(30.0)); // make sure the DD has already quit before the test start
 		return Void();
 	}
 
@@ -210,7 +213,8 @@ struct PerpetualWiggleStatsWorkload : public TestWorkload {
 		                                      PromiseStream<GetMetricsRequest>(),
 		                                      Promise<UID>(),
 		                                      PromiseStream<Promise<int>>(),
-		                                      PromiseStream<Promise<int64_t>>() });
+		                                      PromiseStream<Promise<int64_t>>(),
+		                                      PromiseStream<RebalanceStorageQueueRequest>() });
 		tester.configuration.storageTeamSize = 3;
 		tester.configuration.perpetualStorageWiggleSpeed = 1;
 

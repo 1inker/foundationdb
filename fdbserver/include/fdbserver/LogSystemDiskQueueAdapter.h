@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -97,10 +97,6 @@ public:
 	Future<bool> initializeRecovery(location recoverAt) override { return false; }
 	Future<Standalone<StringRef>> readNext(int bytes) override;
 	IDiskQueue::location getNextReadLocation() const override;
-	IDiskQueue::location getNextCommitLocation() const override {
-		ASSERT(false);
-		throw internal_error();
-	}
 	IDiskQueue::location getNextPushLocation() const override {
 		ASSERT(false);
 		throw internal_error();

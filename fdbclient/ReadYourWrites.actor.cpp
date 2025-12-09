@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -77,20 +77,19 @@ public:
 
 	template <bool reverse>
 	struct GetMappedRangeReq {
-		GetMappedRangeReq(KeySelector begin, KeySelector end, Key mapper, int matchIndex, GetRangeLimits limits)
-		  : begin(begin), end(end), mapper(mapper), limits(limits), matchIndex(matchIndex) {}
+		GetMappedRangeReq(KeySelector begin, KeySelector end, Key mapper, GetRangeLimits limits)
+		  : begin(begin), end(end), mapper(mapper), limits(limits) {}
 		KeySelector begin, end;
 		Key mapper;
 		GetRangeLimits limits;
-		int matchIndex;
 		using Result = MappedRangeResult;
 	};
 
 	// read() Performs a read (get, getKey, getRange, etc), in the context of the given transaction.  Snapshot or RYW
-	// reads are distingushed by the type Iter being SnapshotCache::iterator or RYWIterator. Fills in the snapshot cache
-	// as a side effect but does not affect conflict ranges. Some (indicated) overloads of read are required to update
-	// the given *it to point to the key that was read, so that the corresponding overload of addConflictRange() can
-	// make use of it.
+	// reads are distinguished by the type Iter being SnapshotCache::iterator or RYWIterator. Fills in the snapshot
+	// cache as a side effect but does not affect conflict ranges. Some (indicated) overloads of read are required
+	// to update the given *it to point to the key that was read, so that the corresponding overload of
+	// addConflictRange() can make use of it.
 
 	ACTOR template <class Iter>
 	static Future<Optional<Value>> read(ReadYourWritesTransaction* ryw, GetValueReq read, Iter* it) {
@@ -1156,13 +1155,8 @@ public:
 			else
 				read.end = KeySelector(firstGreaterOrEqual(key), key.arena());
 		}
-		MappedRangeResult v = wait(ryw->tr.getMappedRange(read.begin,
-		                                                  read.end,
-		                                                  read.mapper,
-		                                                  read.limits,
-		                                                  read.matchIndex,
-		                                                  snapshot,
-		                                                  backwards ? Reverse::True : Reverse::False));
+		MappedRangeResult v = wait(ryw->tr.getMappedRange(
+		    read.begin, read.end, read.mapper, read.limits, snapshot, backwards ? Reverse::True : Reverse::False));
 		return v;
 	}
 
@@ -1604,8 +1598,8 @@ Optional<Value> getValueFromJSON(StatusObject statusObj) {
 	}
 }
 
-ACTOR Future<Optional<Value>> getJSON(Database db) {
-	StatusObject statusObj = wait(StatusClient::statusFetcher(db));
+ACTOR Future<Optional<Value>> getJSON(Database db, std::string jsonField = "") {
+	StatusObject statusObj = wait(StatusClient::statusFetcher(db, jsonField));
 	return getValueFromJSON(statusObj);
 }
 
@@ -1786,7 +1780,6 @@ Future<MappedRangeResult> ReadYourWritesTransaction::getMappedRange(KeySelector 
                                                                     KeySelector end,
                                                                     Key mapper,
                                                                     GetRangeLimits limits,
-                                                                    int matchIndex,
                                                                     Snapshot snapshot,
                                                                     Reverse reverse) {
 	if (getDatabase()->apiVersionAtLeast(630)) {
@@ -1834,9 +1827,9 @@ Future<MappedRangeResult> ReadYourWritesTransaction::getMappedRange(KeySelector 
 
 	Future<MappedRangeResult> result =
 	    reverse ? RYWImpl::readWithConflictRangeForGetMappedRange(
-	                  this, RYWImpl::GetMappedRangeReq<true>(begin, end, mapper, matchIndex, limits), snapshot)
+	                  this, RYWImpl::GetMappedRangeReq<true>(begin, end, mapper, limits), snapshot)
 	            : RYWImpl::readWithConflictRangeForGetMappedRange(
-	                  this, RYWImpl::GetMappedRangeReq<false>(begin, end, mapper, matchIndex, limits), snapshot);
+	                  this, RYWImpl::GetMappedRangeReq<false>(begin, end, mapper, limits), snapshot);
 
 	return result;
 }
@@ -2208,7 +2201,7 @@ RangeResult ReadYourWritesTransaction::getWriteConflictRangeIntersecting(KeyRang
 			// singleKeyRange, but share begin and end's memory
 			range = KeyRangeRef(key.substr(0, key.size() - 4), key.substr(0, key.size() - 3));
 		} else {
-			range = getVersionstampKeyRange(result.arena(), k, tr.getCachedReadVersion().orDefault(0), getMaxReadKey());
+			range = getVersionstampKeyRange(result.arena(), k, tr.getCachedReadVersion(), getMaxReadKey());
 		}
 		writeConflicts.insert(range.withPrefix(writeConflictRangeKeysRange.begin, result.arena()), "1"_sr);
 	}
@@ -2270,7 +2263,7 @@ void ReadYourWritesTransaction::atomicOp(const KeyRef& key, const ValueRef& oper
 	if (operationType == MutationRef::SetVersionstampedKey) {
 		CODE_PROBE(options.readYourWritesDisabled, "SetVersionstampedKey without ryw enabled");
 		// this does validation of the key and needs to be performed before the readYourWritesDisabled path
-		KeyRangeRef range = getVersionstampKeyRange(arena, k, tr.getCachedReadVersion().orDefault(0), getMaxReadKey());
+		KeyRangeRef range = getVersionstampKeyRange(arena, k, tr.getCachedReadVersion(), getMaxReadKey());
 		versionStampKeys.push_back(arena, k);
 		addWriteConflict = AddConflictRange::False;
 		if (!options.readYourWritesDisabled) {
@@ -2280,7 +2273,7 @@ void ReadYourWritesTransaction::atomicOp(const KeyRef& key, const ValueRef& oper
 		// k is the unversionstamped key provided by the user.  If we've filled in a minimum bound
 		// for the versionstamp, we need to make sure that's reflected when we insert it into the
 		// WriteMap below.
-		transformVersionstampKey(k, tr.getCachedReadVersion().orDefault(0), 0);
+		transformVersionstampKey(k, tr.getCachedReadVersion().map([](Version v) { return v + 1; }).orDefault(0), 0);
 	}
 
 	if (operationType == MutationRef::SetVersionstampedValue) {
@@ -2539,6 +2532,7 @@ void ReadYourWritesTransaction::setOption(FDBTransactionOptions::Option option, 
 }
 
 void ReadYourWritesTransaction::setOptionImpl(FDBTransactionOptions::Option option, Optional<StringRef> value) {
+	TraceEvent(SevVerbose, "TransactionSetOption").detail("Option", option).detail("Value", value);
 	switch (option) {
 	case FDBTransactionOptions::READ_YOUR_WRITES_DISABLE:
 		validateOptionValueNotPresent(value);
@@ -2576,11 +2570,13 @@ void ReadYourWritesTransaction::setOptionImpl(FDBTransactionOptions::Option opti
 
 	case FDBTransactionOptions::TIMEOUT:
 		options.timeoutInSeconds = extractIntOption(value, 0, std::numeric_limits<int>::max()) / 1000.0;
+		TraceEvent(SevDebug, "TransactionTimeout").detail("TimeoutInSeconds", options.timeoutInSeconds);
 		resetTimeout();
 		break;
 
 	case FDBTransactionOptions::RETRY_LIMIT:
 		options.maxRetries = (int)extractIntOption(value, -1, std::numeric_limits<int>::max());
+		TraceEvent(SevDebug, "TransactionRetryLimit").detail("MaxRetries", options.maxRetries);
 		break;
 
 	case FDBTransactionOptions::DEBUG_RETRY_LOGGING:

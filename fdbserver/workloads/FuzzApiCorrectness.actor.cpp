@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -168,7 +168,7 @@ struct FuzzApiCorrectnessWorkload : TestWorkload {
 
 		// See https://github.com/apple/foundationdb/issues/2424
 		if (BUGGIFY) {
-			enableBuggify(true, BuggifyType::Client);
+			enableClientBuggify();
 		}
 
 		if (adjacentKeys) {
@@ -225,7 +225,9 @@ struct FuzzApiCorrectnessWorkload : TestWorkload {
 			return TenantGroupNameRef(format("tenantgroup_%d", groupNum));
 		}
 	}
-	bool canUseTenant(Optional<TenantName> tenant) { return !tenant.present() || createdTenants.count(tenant.get()); }
+	bool canUseTenant(Optional<TenantName> tenant) {
+		return !tenant.present() || createdTenants.contains(tenant.get());
+	}
 
 	Future<Void> setup(Database const& cx) override {
 		if (clientId == 0) {
@@ -475,7 +477,7 @@ struct FuzzApiCorrectnessWorkload : TestWorkload {
 					if (waitLocation < operations.size()) {
 						int waitOp = deterministicRandom()->randomInt(waitLocation, operations.size());
 						wait(operations[waitOp]);
-						wait(delay(0.000001)); // to ensure errors have propgated from reads to commits
+						wait(delay(0.000001)); // to ensure errors have propagated from reads to commits
 						waitLocation = operations.size();
 					}
 				}

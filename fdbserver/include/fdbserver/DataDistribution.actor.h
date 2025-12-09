@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -24,6 +24,7 @@
 #elif !defined(FDBSERVER_DATA_DISTRIBUTION_ACTOR_H)
 #define FDBSERVER_DATA_DISTRIBUTION_ACTOR_H
 
+#include "fdbclient/BulkLoading.h"
 #include "fdbclient/NativeAPI.actor.h"
 #include "fdbserver/MoveKeys.actor.h"
 #include "fdbserver/TenantCache.h"
@@ -36,6 +37,7 @@
 #include "fdbserver/MoveKeys.actor.h"
 #include "fdbserver/ShardsAffectedByTeamFailure.h"
 #include "fdbclient/StorageWiggleMetrics.actor.h"
+#include "fdbclient/DataDistributionConfig.actor.h"
 #include <boost/heap/policies.hpp>
 #include <boost/heap/skew_heap.hpp>
 #include "flow/actorcompiler.h" // This must be the last #include.
@@ -53,6 +55,7 @@ public:
 		OTHER = 0,
 		REBALANCE_DISK,
 		REBALANCE_READ,
+		REBALANCE_WRITE,
 		MERGE_SHARD,
 		SIZE_SPLIT,
 		WRITE_SPLIT,
@@ -69,6 +72,8 @@ public:
 			return "RebalanceDisk";
 		case REBALANCE_READ:
 			return "RebalanceRead";
+		case REBALANCE_WRITE:
+			return "RebalanceWrite";
 		case MERGE_SHARD:
 			return "MergeShard";
 		case SIZE_SPLIT:
@@ -90,30 +95,10 @@ private:
 	Value value;
 };
 
-// One-to-one relationship to the priority knobs
-enum class DataMovementReason {
-	INVALID,
-	RECOVER_MOVE,
-	REBALANCE_UNDERUTILIZED_TEAM,
-	REBALANCE_OVERUTILIZED_TEAM,
-	REBALANCE_READ_OVERUTIL_TEAM,
-	REBALANCE_READ_UNDERUTIL_TEAM,
-	PERPETUAL_STORAGE_WIGGLE,
-	TEAM_HEALTHY,
-	TEAM_CONTAINS_UNDESIRED_SERVER,
-	TEAM_REDUNDANT,
-	MERGE_SHARD,
-	POPULATE_REGION,
-	TEAM_UNHEALTHY,
-	TEAM_2_LEFT,
-	TEAM_1_LEFT,
-	TEAM_FAILED,
-	TEAM_0_LEFT,
-	SPLIT_SHARD,
-	ENFORCE_MOVE_OUT_OF_PHYSICAL_SHARD
-};
 extern int dataMovementPriority(DataMovementReason moveReason);
 extern DataMovementReason priorityToDataMovementReason(int priority);
+
+DataMoveType getDataMoveTypeFromDataMoveId(const UID& dataMoveId);
 
 struct DDShardInfo;
 
@@ -163,7 +148,13 @@ struct RelocateShard {
 
 	bool isRestore() const { return this->dataMove != nullptr; }
 
+	void setParentRange(KeyRange const& parent);
+	Optional<KeyRange> getParentRange() const;
+
 private:
+	// If this rs comes from a splitting, parent range is the original range.
+	Optional<KeyRange> parent_range;
+
 	RelocateShard()
 	  : priority(0), cancelled(false), dataMoveId(anonymousShardId), reason(RelocateReason::OTHER),
 	    moveReason(DataMovementReason::INVALID) {}
@@ -196,15 +187,15 @@ private:
 public:
 	std::vector<KeyRange> keys;
 	Promise<GetTopKMetricsReply> reply; // topK storage metrics
-	double maxBytesReadPerKSecond = 0, minBytesReadPerKSecond = 0; // all returned shards won't exceed this read load
+	double maxReadLoadPerKSecond = 0, minReadLoadPerKSecond = 0; // all returned shards won't exceed this read load
 
 	GetTopKMetricsRequest() {}
 	GetTopKMetricsRequest(std::vector<KeyRange> const& keys,
 	                      int topK = 1,
-	                      double maxBytesReadPerKSecond = std::numeric_limits<double>::max(),
-	                      double minBytesReadPerKSecond = 0)
-	  : topK(topK), keys(keys), maxBytesReadPerKSecond(maxBytesReadPerKSecond),
-	    minBytesReadPerKSecond(minBytesReadPerKSecond) {
+	                      double maxReadLoadPerKSecond = std::numeric_limits<double>::max(),
+	                      double minReadLoadPerKSecond = 0)
+	  : topK(topK), keys(keys), maxReadLoadPerKSecond(maxReadLoadPerKSecond),
+	    minReadLoadPerKSecond(minReadLoadPerKSecond) {
 		ASSERT_GE(topK, 1);
 	}
 
@@ -220,8 +211,8 @@ private:
 	// larger read density means higher score
 	static bool compareByReadDensity(const GetTopKMetricsReply::KeyRangeStorageMetrics& a,
 	                                 const GetTopKMetricsReply::KeyRangeStorageMetrics& b) {
-		return a.metrics.bytesReadPerKSecond / std::max(a.metrics.bytes * 1.0, 1.0) >
-		       b.metrics.bytesReadPerKSecond / std::max(b.metrics.bytes * 1.0, 1.0);
+		return a.metrics.readLoadKSecond() / std::max(a.metrics.bytes * 1.0, 1.0) >
+		       b.metrics.readLoadKSecond() / std::max(b.metrics.bytes * 1.0, 1.0);
 	}
 };
 
@@ -234,6 +225,13 @@ struct GetMetricsListRequest {
 	GetMetricsListRequest(KeyRange const& keys, const int shardLimit) : keys(keys), shardLimit(shardLimit) {}
 };
 
+struct BulkLoadShardRequest {
+	BulkLoadState bulkLoadState;
+
+	BulkLoadShardRequest() {}
+	BulkLoadShardRequest(BulkLoadState const& bulkLoadState) : bulkLoadState(bulkLoadState) {}
+};
+
 // PhysicalShardCollection maintains physical shard concepts in data distribution
 // A physical shard contains one or multiple shards (key range)
 // PhysicalShardCollection is responsible for creation and maintenance of physical shards (including metrics)
@@ -242,11 +240,11 @@ struct GetMetricsListRequest {
 // For each shard (key-range) move, PhysicalShardCollection decides which physical shard and corresponding team(s) to
 // move The current design of PhysicalShardCollection assumes that there exists at most two teamCollections
 // TODO: unit test needed
-FDB_DECLARE_BOOLEAN_PARAM(InAnonymousPhysicalShard);
-FDB_DECLARE_BOOLEAN_PARAM(PhysicalShardHasMoreThanKeyRange);
-FDB_DECLARE_BOOLEAN_PARAM(InOverSizePhysicalShard);
-FDB_DECLARE_BOOLEAN_PARAM(PhysicalShardAvailable);
-FDB_DECLARE_BOOLEAN_PARAM(MoveKeyRangeOutPhysicalShard);
+FDB_BOOLEAN_PARAM(InAnonymousPhysicalShard);
+FDB_BOOLEAN_PARAM(PhysicalShardHasMoreThanKeyRange);
+FDB_BOOLEAN_PARAM(InOverSizePhysicalShard);
+FDB_BOOLEAN_PARAM(PhysicalShardAvailable);
+FDB_BOOLEAN_PARAM(MoveKeyRangeOutPhysicalShard);
 
 struct ShardMetrics {
 	StorageMetrics metrics;
@@ -265,6 +263,7 @@ struct ShardMetrics {
 struct ShardTrackedData {
 	Future<Void> trackShard;
 	Future<Void> trackBytes;
+	Future<Void> trackUsableRegion;
 	Reference<AsyncVar<Optional<ShardMetrics>>> stats;
 };
 
@@ -395,7 +394,7 @@ private:
 	// A physical shard is available if the current metric + moveInMetrics <= a threshold
 	PhysicalShardAvailable checkPhysicalShardAvailable(uint64_t physicalShardID, StorageMetrics const& moveInMetrics);
 
-	// Reduce the metics of input physical shard by the input metrics
+	// Reduce the metrics of input physical shard by the input metrics
 	void reduceMetricsForMoveOut(uint64_t physicalShardID, StorageMetrics const& metrics);
 
 	// Add the input metrics to the metrics of input physical shard
@@ -419,7 +418,7 @@ private:
 	// Checks the consistency between the mapping of physical shards and key ranges.
 	void checkKeyRangePhysicalShardMapping();
 
-	// Return a string concating the input IDs interleaving with " "
+	// Return a string concatenating the input IDs interleaving with " "
 	std::string convertIDsToString(std::set<uint64_t> ids);
 
 	// Reset TransitionStartTime
@@ -461,6 +460,18 @@ private:
 	double lastTransitionStartTime;
 };
 
+struct RebalanceStorageQueueRequest {
+	UID serverId;
+	std::vector<ShardsAffectedByTeamFailure::Team> teams;
+	bool primary;
+
+	RebalanceStorageQueueRequest() {}
+	RebalanceStorageQueueRequest(UID serverId,
+	                             const std::vector<ShardsAffectedByTeamFailure::Team>& teams,
+	                             bool primary)
+	  : serverId(serverId), teams(teams), primary(primary) {}
+};
+
 // DDShardInfo is so named to avoid link-time name collision with ShardInfo within the StorageServer
 struct DDShardInfo {
 	Key key;
@@ -478,18 +489,23 @@ struct DDShardInfo {
 };
 
 struct InitialDataDistribution : ReferenceCounted<InitialDataDistribution> {
-	InitialDataDistribution() : dataMoveMap(std::make_shared<DataMove>()) {}
+	InitialDataDistribution()
+	  : dataMoveMap(std::make_shared<DataMove>()),
+	    userRangeConfig(makeReference<DDConfiguration::RangeConfigMapSnapshot>(allKeys.begin, allKeys.end)) {}
 
 	// Read from dataDistributionModeKey. Whether DD is disabled. DD can be disabled persistently (mode = 0). Set mode
 	// to 1 will enable all disabled parts
 	int mode;
+	int bulkLoadMode = 0;
 	std::vector<std::pair<StorageServerInterface, ProcessClass>> allServers;
 	std::set<std::vector<UID>> primaryTeams;
 	std::set<std::vector<UID>> remoteTeams;
 	std::vector<DDShardInfo> shards;
+	std::vector<UID> toCleanDataMoveTombstone;
 	Optional<Key> initHealthyZoneValue; // set for maintenance mode
 	KeyRangeMap<std::shared_ptr<DataMove>> dataMoveMap;
 	std::vector<AuditStorageState> auditStates;
+	Reference<DDConfiguration::RangeConfigMapSnapshot> userRangeConfig;
 };
 
 // Holds the permitted size and IO Bounds for a shard
@@ -511,53 +527,209 @@ ShardSizeBounds getShardSizeBounds(KeyRangeRef shard, int64_t maxShardSize);
 // Determines the maximum shard size based on the size of the database
 int64_t getMaxShardSize(double dbSizeEstimate);
 
-#ifndef __INTEL_COMPILER
-#pragma endregion
-#endif
-
-// FIXME(xwang): Delete Old DD Actors once the refactoring is done
-/////////////////////////////// Old DD Actors //////////////////////////////////////
-#ifndef __INTEL_COMPILER
-#pragma region Old DD Actors
-#endif
+bool ddLargeTeamEnabled();
 
 struct TeamCollectionInterface {
 	PromiseStream<GetTeamRequest> getTeam;
 };
 
-ACTOR Future<Void> dataDistributionTracker(Reference<InitialDataDistribution> initData,
-                                           Reference<IDDTxnProcessor> db,
-                                           PromiseStream<RelocateShard> output,
-                                           Reference<ShardsAffectedByTeamFailure> shardsAffectedByTeamFailure,
-                                           Reference<PhysicalShardCollection> physicalShardCollection,
-                                           PromiseStream<GetMetricsRequest> getShardMetrics,
-                                           FutureStream<GetTopKMetricsRequest> getTopKMetrics,
-                                           PromiseStream<GetMetricsListRequest> getShardMetricsList,
-                                           FutureStream<Promise<int64_t>> getAverageShardBytes,
-                                           Promise<Void> readyToStart,
-                                           Reference<AsyncVar<bool>> zeroHealthyTeams,
-                                           UID distributorId,
-                                           KeyRangeMap<ShardTrackedData>* shards,
-                                           bool* trackerCancelled,
-                                           Optional<Reference<TenantCache>> ddTenantCache);
+struct DDBulkLoadTask {
+	BulkLoadState coreState;
+	Version commitVersion = invalidVersion;
+	Promise<Void> completeAck; // satisfied when a data move for this task completes for the first time, where the task
+	                           // metadata phase has been complete
 
-ACTOR Future<Void> dataDistributionQueue(Reference<IDDTxnProcessor> db,
-                                         PromiseStream<RelocateShard> output,
-                                         FutureStream<RelocateShard> input,
-                                         PromiseStream<GetMetricsRequest> getShardMetrics,
-                                         PromiseStream<GetTopKMetricsRequest> getTopKMetrics,
-                                         Reference<AsyncVar<bool>> processingUnhealthy,
-                                         Reference<AsyncVar<bool>> processingWiggle,
-                                         std::vector<TeamCollectionInterface> teamCollections,
-                                         Reference<ShardsAffectedByTeamFailure> shardsAffectedByTeamFailure,
-                                         Reference<PhysicalShardCollection> physicalShardCollection,
-                                         MoveKeysLock lock,
-                                         PromiseStream<Promise<int64_t>> getAverageShardBytes,
-                                         FutureStream<Promise<int>> getUnhealthyRelocationCount,
-                                         UID distributorId,
-                                         int teamSize,
-                                         int singleRegionTeamSize,
-                                         const DDEnabledState* ddEnabledState);
+	DDBulkLoadTask() = default;
+
+	DDBulkLoadTask(BulkLoadState coreState, Version commitVersion, Promise<Void> completeAck)
+	  : coreState(coreState), commitVersion(commitVersion), completeAck(completeAck) {}
+
+	bool operator==(const DDBulkLoadTask& rhs) const {
+		return coreState == rhs.coreState && commitVersion == rhs.commitVersion;
+	}
+
+	std::string toString() const {
+		return coreState.toString() + ", [CommitVersion]: " + std::to_string(commitVersion);
+	}
+};
+
+inline bool bulkLoadIsEnabled(int bulkLoadModeValue) {
+	return SERVER_KNOBS->SHARD_ENCODE_LOCATION_METADATA && bulkLoadModeValue == 1;
+}
+
+class BulkLoadTaskCollection : public ReferenceCounted<BulkLoadTaskCollection> {
+public:
+	BulkLoadTaskCollection(UID ddId, int maxParallelism)
+	  : ddId(ddId), maxParallelism(maxParallelism), numRunningTasks(0) {
+		bulkLoadTaskMap.insert(allKeys, Optional<DDBulkLoadTask>());
+	}
+
+	// Return true if there exists a bulk load task
+	bool overlappingTask(KeyRange range) {
+		for (auto it : bulkLoadTaskMap.intersectingRanges(range)) {
+			if (!it->value().present()) {
+				continue;
+			}
+			return true;
+		}
+		return false;
+	}
+
+	// Return true if there exists a bulk load task since the given commit version
+	bool overlappingTaskSince(KeyRange range, Version sinceCommitVersion) {
+		for (auto it : bulkLoadTaskMap.intersectingRanges(range)) {
+			if (!it->value().present()) {
+				continue;
+			}
+			if (it->value().get().commitVersion > sinceCommitVersion) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	// Add a task and this task becomes visible to DDTracker and DDQueue
+	// DDTracker stops any shard boundary change overlapping the task range
+	// DDQueue attaches the task to following data moves until the task has been completed
+	// If there are overlapped old tasks, make it outdated by sending a signal to completeAck
+	void publishTask(const BulkLoadState& bulkLoadState, Version commitVersion, Promise<Void> completeAck) {
+		if (overlappingTaskSince(bulkLoadState.getRange(), commitVersion)) {
+			throw bulkload_task_outdated();
+		}
+		DDBulkLoadTask task(bulkLoadState, commitVersion, completeAck);
+		TraceEvent(SevDebug, "DDBulkLoadCollectionPublishTask", ddId)
+		    .setMaxEventLength(-1)
+		    .setMaxFieldLength(-1)
+		    .detail("Range", bulkLoadState.getRange())
+		    .detail("Task", task.toString());
+		// For any overlapping task, make it outdated
+		for (auto it : bulkLoadTaskMap.intersectingRanges(bulkLoadState.getRange())) {
+			if (!it->value().present()) {
+				continue;
+			}
+			if (it->value().get().coreState.getTaskId() == bulkLoadState.getTaskId()) {
+				ASSERT(it->value().get().coreState.getRange() == bulkLoadState.getRange());
+				// In case that the task has been already triggered
+				// Avoid repeatedly being triggered by throwing the error
+				// then the current doBulkLoadTask will sliently exit
+				throw bulkload_task_outdated();
+			}
+			if (it->value().get().completeAck.canBeSet()) {
+				it->value().get().completeAck.sendError(bulkload_task_outdated());
+				TraceEvent(SevInfo, "DDBulkLoadCollectionPublishTaskOverwriteTask", ddId)
+				    .setMaxEventLength(-1)
+				    .setMaxFieldLength(-1)
+				    .detail("NewRange", bulkLoadState.getRange())
+				    .detail("NewTask", task.toString())
+				    .detail("OldTaskRange", it->range())
+				    .detail("OldTask", it->value().get().toString());
+			}
+		}
+		bulkLoadTaskMap.insert(bulkLoadState.getRange(), task);
+		return;
+	}
+
+	// This method is called when there is a data move assigned to run the bulk load task
+	void startTask(const BulkLoadState& bulkLoadState) {
+		for (auto it : bulkLoadTaskMap.intersectingRanges(bulkLoadState.getRange())) {
+			if (!it->value().present() || it->value().get().coreState.getTaskId() != bulkLoadState.getTaskId()) {
+				throw bulkload_task_outdated();
+			}
+			TraceEvent(SevDebug, "DDBulkLoadCollectionStartTask", ddId)
+			    .detail("Range", bulkLoadState.getRange())
+			    .detail("TaskRange", it->range())
+			    .detail("Task", it->value().get().toString());
+		}
+		return;
+	}
+
+	// Send complete signal to indicate this task has been completed
+	void terminateTask(const BulkLoadState& bulkLoadState) {
+		for (auto it : bulkLoadTaskMap.intersectingRanges(bulkLoadState.getRange())) {
+			if (!it->value().present() || it->value().get().coreState.getTaskId() != bulkLoadState.getTaskId()) {
+				throw bulkload_task_outdated();
+			}
+			// It is possible that the task has been completed by a past data move
+			if (it->value().get().completeAck.canBeSet()) {
+				it->value().get().completeAck.send(Void());
+				TraceEvent(SevDebug, "DDBulkLoadCollectionTerminateTask", ddId)
+				    .detail("Range", bulkLoadState.getRange())
+				    .detail("TaskRange", it->range())
+				    .detail("Task", it->value().get().toString());
+			}
+		}
+		return;
+	}
+
+	// Erase any metadata on the map for the input bulkload task
+	void eraseTask(const BulkLoadState& bulkLoadState) {
+		std::vector<KeyRange> rangesToClear;
+		for (auto it : bulkLoadTaskMap.intersectingRanges(bulkLoadState.getRange())) {
+			if (!it->value().present() || it->value().get().coreState.getTaskId() != bulkLoadState.getTaskId()) {
+				continue;
+			}
+			TraceEvent(SevDebug, "DDBulkLoadCollectionEraseTaskdata", ddId)
+			    .detail("Range", bulkLoadState.getRange())
+			    .detail("TaskRange", it->range())
+			    .detail("Task", it->value().get().toString());
+			rangesToClear.push_back(it->range());
+		}
+		for (const auto& rangeToClear : rangesToClear) {
+			bulkLoadTaskMap.insert(rangeToClear, Optional<DDBulkLoadTask>());
+		}
+		bulkLoadTaskMap.coalesce(normalKeys);
+		return;
+	}
+
+	// Get the task which has exactly the same range as the input range
+	Optional<DDBulkLoadTask> getTaskByRange(KeyRange range) const {
+		Optional<DDBulkLoadTask> res;
+		for (auto it : bulkLoadTaskMap.intersectingRanges(range)) {
+			if (!it->value().present()) {
+				continue;
+			}
+			DDBulkLoadTask bulkLoadTask = it->value().get();
+			TraceEvent(SevDebug, "DDBulkLoadCollectionGetPublishedTaskEach", ddId)
+			    .detail("Range", range)
+			    .detail("TaskRange", it->range())
+			    .detail("Task", bulkLoadTask.toString());
+			if (bulkLoadTask.coreState.getRange() == range) {
+				ASSERT(!res.present());
+				res = bulkLoadTask;
+			}
+		}
+		TraceEvent(SevDebug, "DDBulkLoadCollectionGetPublishedTask", ddId)
+		    .detail("Range", range)
+		    .detail("Task", res.present() ? describe(res.get()) : "");
+		return res;
+	}
+
+	inline void decrementTaskCounter() {
+		ASSERT(numRunningTasks.get() <= maxParallelism);
+		numRunningTasks.set(numRunningTasks.get() - 1);
+		ASSERT(numRunningTasks.get() >= 0);
+	}
+
+	// return true if succeed
+	inline bool tryStart() {
+		if (numRunningTasks.get() < maxParallelism) {
+			numRunningTasks.set(numRunningTasks.get() + 1);
+			return true;
+		} else {
+			return false;
+		}
+	}
+
+	inline bool canStart() const { return numRunningTasks.get() < maxParallelism; }
+	inline Future<Void> waitUntilChanged() const { return numRunningTasks.onChange(); }
+
+private:
+	KeyRangeMap<Optional<DDBulkLoadTask>> bulkLoadTaskMap;
+	UID ddId;
+	AsyncVar<int> numRunningTasks;
+	int maxParallelism;
+};
+
 #ifndef __INTEL_COMPILER
 #pragma endregion
 #endif
@@ -598,7 +770,7 @@ struct StorageWiggler : ReferenceCounted<StorageWiggler> {
 	void removeServer(const UID& serverId);
 	// update metadata and adjust priority_queue
 	void updateMetadata(const UID& serverId, const StorageMetadataType& metadata);
-	bool contains(const UID& serverId) const { return pq_handles.count(serverId) > 0; }
+	bool contains(const UID& serverId) const { return pq_handles.contains(serverId); }
 	bool empty() const { return wiggle_pq.empty(); }
 
 	// It's guarantee that When a.metadata >= b.metadata, if !necessary(a) then !necessary(b)

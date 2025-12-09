@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -42,6 +42,10 @@
 #include "flow/actorcompiler.h" // This must be the last #include.
 
 ACTOR Future<Void> allAlternativesFailedDelay(Future<Void> okFuture);
+
+enum ComparisonType { TSS_COMPARISON, REPLICA_COMPARISON };
+
+enum RequiredReplicas { BEST_EFFORT = -2, ALL_REPLICAS = -1 };
 
 struct ModelHolder : NonCopyable, public ReferenceCounted<ModelHolder> {
 	QueueModel* model;
@@ -147,7 +151,7 @@ Future<Void> tssComparison(Req req,
 				    (g_network->isSimulated() && g_simulator->tssMode == ISimulator::TSSMode::EnabledDropMutations)
 				        ? SevWarnAlways
 				        : SevError,
-				    TSS_mismatchTraceName(req));
+				    LB_mismatchTraceName(req, TSS_COMPARISON));
 				mismatchEvent.setMaxEventLength(FLOW_KNOBS->TSS_LARGE_TRACE_SIZE);
 				mismatchEvent.detail("TSSID", tssData.tssId);
 
@@ -195,7 +199,7 @@ Future<Void> tssComparison(Req req,
 					    .detail("TeamCheckMatchNeither", numMatchNeither);
 				}
 				if (tssData.metrics->shouldRecordDetailedMismatch()) {
-					TSS_traceMismatch(mismatchEvent, req, src.get(), tss.get().get());
+					TSS_traceMismatch(mismatchEvent, req, src.get(), tss.get().get(), TSS_COMPARISON);
 
 					CODE_PROBE(FLOW_KNOBS->LOAD_BALANCE_TSS_MISMATCH_TRACE_FULL, "Tracing Full TSS Mismatch");
 					CODE_PROBE(!FLOW_KNOBS->LOAD_BALANCE_TSS_MISMATCH_TRACE_FULL,
@@ -211,7 +215,7 @@ Future<Void> tssComparison(Req req,
 						                         g_simulator->tssMode == ISimulator::TSSMode::EnabledDropMutations)
 						                            ? SevWarnAlways
 						                            : SevError,
-						                        TSS_mismatchTraceName(req));
+						                        LB_mismatchTraceName(req, TSS_COMPARISON));
 						summaryEvent.detail("TSSID", tssData.tssId).detail("MismatchId", mismatchUID);
 					}
 				} else {
@@ -240,8 +244,173 @@ Future<Void> tssComparison(Req req,
 	return Void();
 }
 
-FDB_DECLARE_BOOLEAN_PARAM(AtMostOnce);
-FDB_DECLARE_BOOLEAN_PARAM(TriedAllOptions);
+ACTOR template <class Resp>
+Future<Void> waitForQuorumReplies(std::vector<Future<Optional<ErrorOr<Resp>>>>* replies, int required) {
+	state int outstandingReplies = (int)replies->size();
+	state int requiredReplies = std::min(required, (int)replies->size());
+	state std::vector<Future<Optional<ErrorOr<Resp>>>> ongoingReplies;
+	loop {
+		ongoingReplies.clear();
+		for (auto& reply : (*replies)) {
+			if (!reply.isReady()) {
+				ongoingReplies.push_back(reply);
+			}
+		}
+		ASSERT(ongoingReplies.size() == outstandingReplies);
+
+		if (requiredReplies == 0 || outstandingReplies == 0) {
+			break;
+		}
+
+		wait(quorum(ongoingReplies, std::min(requiredReplies, outstandingReplies)));
+
+		for (auto& reply : ongoingReplies) {
+			if (reply.isReady()) {
+				outstandingReplies--;
+				if (!reply.isError() && reply.get().present() && !reply.get().get().isError()) {
+					Optional<LoadBalancedReply> lbReply = getLoadBalancedReply(&reply.get().get().get());
+					if (lbReply.present() && !lbReply.get().error.present()) {
+						requiredReplies--;
+					}
+				}
+			}
+		}
+	}
+
+	return Void();
+}
+
+ACTOR template <class Req, class Resp, class Interface, class Multi, bool P>
+Future<Void> replicaComparison(Req req,
+                               Future<ErrorOr<Resp>> fSource,
+                               uint64_t srcEndpointId,
+                               Reference<MultiInterface<Multi>> ssTeam,
+                               RequestStream<Req, P> Interface::*channel,
+                               int requiredReplicas) {
+	state ErrorOr<Resp> src;
+
+	if (ssTeam->size() <= 1 || requiredReplicas == 0) {
+		return Void();
+	}
+
+	wait(store(src, fSource));
+
+	if (src.isError()) {
+		ASSERT_WE_THINK(false); // TODO: Change this into an ASSERT after getting enough test coverage.
+		if (requiredReplicas == ALL_REPLICAS) {
+			throw src.getError();
+		}
+	} else {
+		state Optional<LoadBalancedReply> srcLB = getLoadBalancedReply(&src.get());
+
+		if (srcLB.present() && srcLB.get().error.present()) {
+			ASSERT_WE_THINK(false); // TODO: Change this into an ASSERT after getting enough test coverage.
+			if (requiredReplicas == ALL_REPLICAS) {
+				throw srcLB.get().error.get();
+			}
+		} else if (!srcLB.present() || !srcLB.get().error.present()) {
+			// Verify that the other SS servers in the team have the same data.
+			state std::vector<Future<Optional<ErrorOr<Resp>>>> restOfTeamFutures;
+			restOfTeamFutures.reserve(ssTeam->size() - 1);
+			for (int i = 0; i < ssTeam->size(); i++) {
+				RequestStream<Req, P> const* si = &ssTeam->get(i, channel);
+				if (si->getEndpoint().token.first() !=
+				    srcEndpointId) { // don't re-request to SS we already have a response from
+					if (!IFailureMonitor::failureMonitor().getState(si->getEndpoint()).failed) {
+						resetReply(req);
+						restOfTeamFutures.push_back((
+						    requiredReplicas == BEST_EFFORT
+						        ? timeout(si->tryGetReply(req), FLOW_KNOBS->LOAD_BALANCE_FETCH_REPLICA_TIMEOUT)
+						        : timeout(errorOr(si->getReply(req)), FLOW_KNOBS->LOAD_BALANCE_FETCH_REPLICA_TIMEOUT)));
+					} else if (requiredReplicas == ALL_REPLICAS) {
+						TraceEvent(SevWarnAlways, "UnreachableStorageServer")
+						    .detail("SSID", ssTeam->getInterface(i).id());
+						throw unreachable_storage_replica();
+					}
+				}
+			}
+
+			if (requiredReplicas == BEST_EFFORT || requiredReplicas == ALL_REPLICAS) {
+				wait(waitForAllReady(restOfTeamFutures));
+			} else {
+				wait(waitForQuorumReplies(&restOfTeamFutures, requiredReplicas));
+			}
+
+			int numError = 0;
+			int numMismatch = 0;
+			int numFetchReplicaTimeout = 0;
+			int replicaErrorCode = error_code_success;
+			int successfulReplies = 0;
+			for (Future<Optional<ErrorOr<Resp>>> f : restOfTeamFutures) {
+				if (!f.isReady()) {
+					ASSERT(requiredReplicas > 0);
+					continue;
+				}
+				if (f.isError()) {
+					numError++;
+					replicaErrorCode = f.getError().code();
+				} else if (!f.get().present()) {
+					numFetchReplicaTimeout++;
+					replicaErrorCode = error_code_timed_out;
+				} else if (f.get().get().isError()) {
+					numError++;
+					replicaErrorCode = f.get().get().getError().code();
+				} else {
+					Optional<LoadBalancedReply> fLB = getLoadBalancedReply(&f.get().get().get());
+
+					ASSERT(srcLB.present() ==
+					       fLB.present()); // getLoadBalancedReply returned different responses for same templated type
+
+					if (fLB.present()) {
+						if (fLB.get().error.present()) {
+							numError++;
+							replicaErrorCode = fLB.get().error.get().code();
+						} else {
+							if (!TSS_doCompare(
+							        src.get(),
+							        f.get().get().get())) { // re-use TSS compare logic to compare the replicas
+								numMismatch++;
+								TraceEvent mismatchEvent(
+								    (requiredReplicas == BEST_EFFORT || requiredReplicas == ALL_REPLICAS)
+								        ? SevError
+								        : SevWarnAlways,
+								    LB_mismatchTraceName(req, REPLICA_COMPARISON));
+								mismatchEvent.detail("ReplicaFetchErrors", numError)
+								    .detail("ReplicaFetchTimeouts", numFetchReplicaTimeout);
+								// Re-use TSS trace mechanism to log replica mismatch information.
+								TSS_traceMismatch(
+								    mismatchEvent, req, src.get(), f.get().get().get(), REPLICA_COMPARISON);
+							}
+							if (++successfulReplies == requiredReplicas) {
+								break;
+							}
+						}
+					}
+				}
+			}
+
+			if (numMismatch) {
+				throw storage_replica_comparison_error();
+			} else if (((numError || numFetchReplicaTimeout) && (requiredReplicas == ALL_REPLICAS)) ||
+			           (successfulReplies != requiredReplicas && requiredReplicas > 0 &&
+			            restOfTeamFutures.size() >= requiredReplicas)) {
+				const char* type = numError ? "ReplicaComparisonReadError" : "ReplicaComparisonTimeoutError";
+				TraceEvent(SevWarnAlways, type)
+				    .detail("TeamSize", restOfTeamFutures.size() + 1)
+				    .detail("RequiredReplies", requiredReplicas)
+				    .detail("SuccessfulReplies", successfulReplies)
+				    .detail("SSError", replicaErrorCode);
+
+				throw Error((requiredReplicas == ALL_REPLICAS) ? replicaErrorCode
+				                                               : error_code_unreachable_storage_replica);
+			}
+		}
+	}
+	return Void();
+}
+
+FDB_BOOLEAN_PARAM(AtMostOnce);
+FDB_BOOLEAN_PARAM(TriedAllOptions);
 
 // Stores state for a request made by the load balancer
 template <class Request, class Interface, class Multi, bool P>
@@ -251,9 +420,15 @@ struct RequestData : NonCopyable {
 	Future<Reply> response;
 	Reference<ModelHolder> modelHolder;
 	TriedAllOptions triedAllOptions{ false };
+	RequestStream<Request, P> const* requestStream = nullptr;
 
 	bool requestStarted = false; // true once the request has been sent to an alternative
 	bool requestProcessed = false; // true once a response has been received and handled by checkAndProcessResult
+
+	bool compareReplicas = false;
+	Future<Void> comparisonResult;
+
+	RequestData(bool compareReplicas = false) : compareReplicas(compareReplicas) {}
 
 	// Whether or not the response future is valid
 	// This is true once setupRequest is called, even though at that point the response is Never().
@@ -286,6 +461,26 @@ struct RequestData : NonCopyable {
 		}
 	}
 
+	Future<Void> maybeDoReplicaComparison(Request& request,
+	                                      QueueModel* model,
+	                                      Reference<MultiInterface<Multi>> alternatives,
+	                                      RequestStream<Request, P> Interface::*channel,
+	                                      int requiredReplicas) {
+		if (model && (compareReplicas || FLOW_KNOBS->ENABLE_REPLICA_CONSISTENCY_CHECK_ON_READS)) {
+			ASSERT(requestStream != nullptr);
+			int requiredReplicaCount =
+			    compareReplicas ? requiredReplicas : FLOW_KNOBS->CONSISTENCY_CHECK_REQUIRED_REPLICAS;
+			return replicaComparison(request,
+			                         response,
+			                         requestStream->getEndpoint().token.first(),
+			                         alternatives,
+			                         channel,
+			                         requiredReplicaCount);
+		}
+
+		return Void();
+	}
+
 	// Initializes the request state and starts it, possibly after a backoff delay
 	void startRequest(
 	    double backoff,
@@ -296,6 +491,7 @@ struct RequestData : NonCopyable {
 	    Reference<MultiInterface<Multi>> alternatives, // alternatives and channel passed through for TSS check
 	    RequestStream<Request, P> Interface::*channel) {
 		modelHolder = Reference<ModelHolder>();
+		requestStream = stream;
 		requestStarted = false;
 
 		if (backoff > 0) {
@@ -401,7 +597,6 @@ struct RequestData : NonCopyable {
 	// processed so we can update the queue model.
 	void makeLaggingRequest() {
 		ASSERT(response.isValid());
-		ASSERT(!response.isReady());
 		ASSERT(modelHolder);
 		ASSERT(modelHolder->model);
 
@@ -439,6 +634,8 @@ struct RequestData : NonCopyable {
 // list of servers.
 // When model is set, load balance among alternatives in the same DC aims to balance request queue length on these
 // interfaces. If too many interfaces in the same DC are bad, try remote interfaces.
+// If compareReplicas is set, does a consistency check by fetching and comparing results from storage
+// replicas (as many as specified by "requiredReplicas") and throws an exception if an inconsistency is found.
 ACTOR template <class Interface, class Request, class Multi, bool P>
 Future<REPLY_TYPE(Request)> loadBalance(
     Reference<MultiInterface<Multi>> alternatives,
@@ -447,10 +644,12 @@ Future<REPLY_TYPE(Request)> loadBalance(
     TaskPriority taskID = TaskPriority::DefaultPromiseEndpoint,
     AtMostOnce atMostOnce =
         AtMostOnce::False, // if true, throws request_maybe_delivered() instead of retrying automatically
-    QueueModel* model = nullptr) {
+    QueueModel* model = nullptr,
+    bool compareReplicas = false,
+    int requiredReplicas = 0) {
 
-	state RequestData<Request, Interface, Multi, P> firstRequestData;
-	state RequestData<Request, Interface, Multi, P> secondRequestData;
+	state RequestData<Request, Interface, Multi, P> firstRequestData(compareReplicas);
+	state RequestData<Request, Interface, Multi, P> secondRequestData(compareReplicas);
 
 	state Optional<uint64_t> firstRequestEndpoint;
 	state Future<Void> secondDelay = Never();
@@ -639,9 +838,14 @@ Future<REPLY_TYPE(Request)> loadBalance(
 			numAttempts = 0; // now that we've got a server back, reset the backoff
 		} else if (!stream) {
 			// Only the first location is available.
-			ErrorOr<REPLY_TYPE(Request)> result = wait(firstRequestData.response);
+			wait(success(firstRequestData.response));
 			if (firstRequestData.checkAndProcessResult(atMostOnce)) {
-				return result.get();
+				// Do consistency check, if requested.
+				wait(
+				    firstRequestData.maybeDoReplicaComparison(request, model, alternatives, channel, requiredReplicas));
+
+				ASSERT(firstRequestData.response.isReady());
+				return firstRequestData.response.get().get();
 			}
 
 			firstRequestEndpoint = Optional<uint64_t>();
@@ -661,22 +865,35 @@ Future<REPLY_TYPE(Request)> loadBalance(
 			}
 			secondRequestData.startRequest(backoff, triedAllOptions, stream, request, model, alternatives, channel);
 
+			state bool firstRequestSuccessful = false;
+			state bool secondRequestSuccessful = false;
+
 			loop choose {
-				when(ErrorOr<REPLY_TYPE(Request)> result =
-				         wait(firstRequestData.response.isValid() ? firstRequestData.response : Never())) {
+				when(wait(success(firstRequestData.response.isValid() ? firstRequestData.response : Never()))) {
 					if (firstRequestData.checkAndProcessResult(atMostOnce)) {
-						return result.get();
+						firstRequestSuccessful = true;
+						break;
 					}
 
 					firstRequestEndpoint = Optional<uint64_t>();
 				}
-				when(ErrorOr<REPLY_TYPE(Request)> result = wait(secondRequestData.response)) {
+				when(wait(success(secondRequestData.response))) {
 					if (secondRequestData.checkAndProcessResult(atMostOnce)) {
-						return result.get();
+						secondRequestSuccessful = true;
 					}
 
 					break;
 				}
+			}
+
+			if (firstRequestSuccessful || secondRequestSuccessful) {
+				// Do consistency check, by comparing results from storage replicas, if requested.
+				state RequestData<Request, Interface, Multi, P>* requestData =
+				    firstRequestSuccessful ? &firstRequestData : &secondRequestData;
+				wait(requestData->maybeDoReplicaComparison(request, model, alternatives, channel, requiredReplicas));
+
+				ASSERT(requestData->response.isReady());
+				return requestData->response.get().get();
 			}
 
 			if (++numAttempts >= alternatives->size()) {
@@ -703,7 +920,7 @@ Future<REPLY_TYPE(Request)> loadBalance(
 
 			loop {
 				choose {
-					when(ErrorOr<REPLY_TYPE(Request)> result = wait(firstRequestData.response)) {
+					when(wait(success(firstRequestData.response))) {
 						if (model) {
 							model->secondMultiplier =
 							    std::max(model->secondMultiplier - FLOW_KNOBS->SECOND_REQUEST_MULTIPLIER_DECAY, 1.0);
@@ -713,7 +930,12 @@ Future<REPLY_TYPE(Request)> loadBalance(
 						}
 
 						if (firstRequestData.checkAndProcessResult(atMostOnce)) {
-							return result.get();
+							// Do consistency check, by comparing results from storage replicas, if requested.
+							wait(firstRequestData.maybeDoReplicaComparison(
+							    request, model, alternatives, channel, requiredReplicas));
+
+							ASSERT(firstRequestData.response.isReady());
+							return firstRequestData.response.get().get();
 						}
 
 						firstRequestEndpoint = Optional<uint64_t>();

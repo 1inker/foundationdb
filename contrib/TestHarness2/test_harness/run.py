@@ -17,7 +17,7 @@ import uuid
 from functools import total_ordering
 from pathlib import Path
 from test_harness.version import Version
-from test_harness.config import config
+from test_harness.config import config, BuggifyOptionValue
 from typing import Dict, List, Pattern, OrderedDict
 
 from test_harness.summarize import Summary, SummaryTree
@@ -70,6 +70,7 @@ class TestPicker:
         self.restart_test: Pattern = re.compile(r".*-\d+\.(txt|toml)")
         self.follow_test: Pattern = re.compile(r".*-[2-9]\d*\.(txt|toml)")
         self.old_binaries: OrderedDict[Version, Path] = binaries
+        self.rare_priority: int = int(os.getenv("RARE_PRIORITY", 10))
 
         for subdir in self.test_dir.iterdir():
             if subdir.is_dir() and subdir.name in config.test_dirs:
@@ -195,6 +196,8 @@ class TestPicker:
                 test_class = test_name
             if priority is None:
                 priority = 1.0
+            if is_rare(path) and priority <= 1.0:
+                priority = self.rare_priority
             if (
                 self.include_tests_regex.search(test_class) is None
                 or self.exclude_tests_regex.search(test_class) is not None
@@ -228,15 +231,29 @@ class TestPicker:
         return res
 
     def choose_test(self) -> List[Path]:
-        min_runtime: float | None = None
         candidates: List[TestDescription] = []
-        for _, v in self.tests.items():
-            this_time = v.total_runtime * v.priority
-            if min_runtime is None or this_time < min_runtime:
-                min_runtime = this_time
-                candidates = [v]
-            elif this_time == min_runtime:
-                candidates.append(v)
+
+        if config.random.random() < 0.99:
+            # 99% of the time, select a test with the least runtime
+            min_runtime: float | None = None
+            for _, v in self.tests.items():
+                this_time = v.total_runtime * v.priority
+                if min_runtime is None or this_time < min_runtime:
+                    min_runtime = this_time
+                    candidates = [v]
+                elif this_time == min_runtime:
+                    candidates.append(v)
+        else:
+            # 1% of the time, select the test with the fewest runs, rather than the test
+            # with the least runtime. This is to improve coverage for long-running tests
+            min_runs: int | None = None
+            for _, v in self.tests.items():
+                if min_runs is None or v.num_runs < min_runs:
+                    min_runs = v.num_runs
+                    candidates = [v]
+                elif v.num_runs == min_runs:
+                    candidates.append(v)
+
         candidates.sort()
         choice = config.random.randint(0, len(candidates) - 1)
         test = candidates[choice]
@@ -304,9 +321,16 @@ def is_restarting_test(test_file: Path):
     return False
 
 
+def is_negative(test_file: Path):
+    return test_file.parts[-2] == "negative"
+
+
 def is_no_sim(test_file: Path):
     return test_file.parts[-2] == "noSim"
 
+
+def is_rare(test_file: Path):
+	return test_file.parts[-2] == "rare"
 
 class ResourceMonitor(threading.Thread):
     def __init__(self):
@@ -389,7 +413,7 @@ class TestRun:
     def delete_simdir(self):
         shutil.rmtree(self.temp_path / Path("simfdb"))
 
-    def _run_rocksdb_logtool(self):
+    def _run_joshua_logtool(self):
         """Calls Joshua LogTool to upload the test logs if 1) test failed 2) test is RocksDB related"""
         if not os.path.exists("joshua_logtool.py"):
             raise RuntimeError("joshua_logtool.py missing")
@@ -401,9 +425,14 @@ class TestRun:
             str(self.uid),
             "--log-directory",
             str(self.temp_path),
-            "--check-rocksdb"
+            "--check-rocksdb",
         ]
-        subprocess.run(command, check=True)
+        result = subprocess.run(command, capture_output=True, text=True)
+        return {
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+            "exit_code": result.returncode,
+        }
 
     def run(self):
         command: List[str] = []
@@ -449,7 +478,7 @@ class TestRun:
             command.append("--restarting")
         if self.buggify_enabled:
             command += ["-b", "on"]
-        if config.crash_on_error:
+        if config.crash_on_error and not is_negative(self.test_file):
             command.append("--crash")
         if config.long_running:
             # disable simulation speedup
@@ -488,15 +517,28 @@ class TestRun:
         resources.join()
         # we're rounding times up, otherwise we will prefer running very short tests (<1s)
         self.run_time = math.ceil(resources.time())
+        self.summary.is_negative_test = is_negative(self.test_file)
         self.summary.runtime = resources.time()
         self.summary.max_rss = resources.max_rss
         self.summary.was_killed = did_kill
         self.summary.valgrind_out_file = valgrind_file
         self.summary.error_out = err_out
         self.summary.summarize(self.temp_path, " ".join(command))
+        if not self.summary.is_negative_test and not self.summary.ok():
+            logtool_result = self._run_joshua_logtool()
+            child = SummaryTree("JoshuaLogTool")
+            child.attributes["ExitCode"] = str(logtool_result["exit_code"])
+            child.attributes["StdOut"] = logtool_result["stdout"]
+            child.attributes["StdErr"] = logtool_result["stderr"]
+            self.summary.out.append(child)
+        else:
+            child = SummaryTree("JoshuaLogTool")
+            child.attributes["IsNegative"] = str(self.summary.is_negative_test)
+            child.attributes["IsOk"] = str(self.summary.ok())
+            child.attributes["HasError"] = str(self.summary.error)
+            child.attributes["JoshuaLogToolIgnored"] = str(True)
+            self.summary.out.append(child)
 
-        if not self.summary.ok():
-            self._run_rocksdb_logtool()
         return self.summary.ok()
 
 
@@ -549,7 +591,12 @@ class TestRunner:
                 not is_no_sim(file)
                 and config.random.random() < config.unseed_check_ratio
             )
-            buggify_enabled: bool = config.random.random() < config.buggify_on_ratio
+            buggify_enabled: bool = False
+            if config.buggify.value == BuggifyOptionValue.ON:
+                buggify_enabled = True
+            elif config.buggify.value == BuggifyOptionValue.RANDOM:
+                buggify_enabled = config.random.random() < config.buggify_on_ratio
+
             # FIXME: support unseed checks for restarting tests
             run = TestRun(
                 binary,
@@ -564,12 +611,21 @@ class TestRunner:
             result = result and run.success
             test_picker.add_time(test_files[0], run.run_time, run.summary.out)
             decorate_summary(run.summary.out, file, seed + count, run.buggify_enabled)
-            if unseed_check and run.summary.unseed:
+            if (
+                unseed_check
+                and run.summary.unseed is not None
+                and run.summary.unseed >= 0
+            ):
                 run.summary.out.append(run.summary.list_simfdb())
             run.summary.out.dump(sys.stdout)
             if not result:
                 return False
-            if count == 0 and unseed_check and run.summary.unseed is not None:
+            if (
+                count == 0
+                and unseed_check
+                and run.summary.unseed is not None
+                and run.summary.unseed >= 0
+            ):
                 run2 = TestRun(
                     binary,
                     file.absolute(),

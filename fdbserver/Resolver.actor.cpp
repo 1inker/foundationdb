@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -76,23 +76,24 @@ public:
 
 	// Adds state transactions between two versions to the reply message.
 	// "initialShardChanged" indicates if commitVersion has shard changes.
-	// Returns if shardChanged has ever happened for these versions.
+	// Returns if shardChanged or a state transaction has ever happened for these versions.
 	[[nodiscard]] bool applyStateTxnsToBatchReply(ResolveTransactionBatchReply* reply,
 	                                              Version firstUnseenVersion,
 	                                              Version commitVersion,
 	                                              bool initialShardChanged) {
-		bool shardChanged = initialShardChanged;
+		bool shardChangedOrStateTxn = initialShardChanged;
 		auto stateTransactionItr = recentStateTransactions.lower_bound(firstUnseenVersion);
 		auto endItr = recentStateTransactions.lower_bound(commitVersion);
 		// Resolver only sends back prior state txns back, because the proxy
 		// sends this request has them and will apply them via applyMetadataToCommittedTransactions();
 		// and other proxies will get this version's state txns as a prior version.
 		for (; stateTransactionItr != endItr; ++stateTransactionItr) {
-			shardChanged = shardChanged || stateTransactionItr->value.first;
+			shardChangedOrStateTxn =
+			    shardChangedOrStateTxn || stateTransactionItr->value.first || stateTransactionItr->value.second.size();
 			reply->stateMutations.push_back(reply->arena, stateTransactionItr->value.second);
 			reply->arena.dependsOn(stateTransactionItr->value.second.arena());
 		}
-		return shardChanged;
+		return shardChangedOrStateTxn;
 	}
 
 	bool empty() const { return recentStateTransactionSizes.empty(); }
@@ -216,6 +217,31 @@ struct Resolver : ReferenceCounted<Resolver> {
 };
 } // namespace
 
+ACTOR Future<Void> versionReady(Resolver* self, ProxyRequestsInfo* proxyInfo, Version prevVersion) {
+	loop {
+		if (self->recentStateTransactionsInfo.size() &&
+		    proxyInfo->lastVersion <= self->recentStateTransactionsInfo.firstVersion()) {
+			self->neededVersion.set(std::max(self->neededVersion.get(), prevVersion));
+		}
+
+		// Update queue depth metric before waiting. Check if we're going to be one of the waiters or not.
+		int waiters = self->version.numWaiting();
+		if (self->version.get() < prevVersion) {
+			waiters++;
+		}
+		self->queueDepthDist->sampleRecordCounter(waiters);
+
+		choose {
+			when(wait(self->version.whenAtLeast(prevVersion))) {
+				// Update queue depth metric after waiting.
+				self->queueDepthDist->sampleRecordCounter(self->version.numWaiting());
+				return Void();
+			}
+			when(wait(self->checkNeededVersion.onTrigger())) {}
+		}
+	}
+}
+
 ACTOR Future<Void> resolveBatch(Reference<Resolver> self,
                                 ResolveTransactionBatchRequest req,
                                 Reference<AsyncVar<ServerDBInfo> const> db) {
@@ -267,28 +293,7 @@ ACTOR Future<Void> resolveBatch(Reference<Resolver> self,
 		g_traceBatch.addEvent("CommitDebug", debugID.get().first(), "Resolver.resolveBatch.AfterQueueSizeCheck");
 	}
 
-	loop {
-		if (self->recentStateTransactionsInfo.size() &&
-		    proxyInfo.lastVersion <= self->recentStateTransactionsInfo.firstVersion()) {
-			self->neededVersion.set(std::max(self->neededVersion.get(), req.prevVersion));
-		}
-
-		// Update queue depth metric before waiting. Check if we're going to be one of the waiters or not.
-		int waiters = self->version.numWaiting();
-		if (self->version.get() < req.prevVersion) {
-			waiters++;
-		}
-		self->queueDepthDist->sampleRecordCounter(waiters);
-
-		choose {
-			when(wait(self->version.whenAtLeast(req.prevVersion))) {
-				// Update queue depth metric after waiting.
-				self->queueDepthDist->sampleRecordCounter(self->version.numWaiting());
-				break;
-			}
-			when(wait(self->checkNeededVersion.onTrigger())) {}
-		}
-	}
+	wait(versionReady(self.getPtr(), &proxyInfo, req.prevVersion));
 
 	if (check_yield(TaskPriority::DefaultEndpoint)) {
 		wait(delay(0, TaskPriority::Low) || delay(SERVER_KNOBS->COMMIT_SLEEP_TIME)); // FIXME: Is this still right?
@@ -426,7 +431,7 @@ ACTOR Future<Void> resolveBatch(Reference<Resolver> self,
 		// If shardChanged at or before this commit version, the proxy may have computed
 		// the wrong set of groups. Then we need to broadcast to all groups below.
 		stateTransactionsPair.first = toCommit && toCommit->isShardChanged();
-		bool shardChanged = self->recentStateTransactionsInfo.applyStateTxnsToBatchReply(
+		bool shardChangedOrStateTxn = self->recentStateTransactionsInfo.applyStateTxnsToBatchReply(
 		    &reply, firstUnseenVersion, req.version, toCommit && toCommit->isShardChanged());
 
 		// Adds private mutation messages to the reply message.
@@ -478,7 +483,7 @@ ACTOR Future<Void> resolveBatch(Reference<Resolver> self,
 				reply.tpcvMap.clear();
 			} else {
 				std::set<uint16_t> writtenTLogs;
-				if (shardChanged || reply.privateMutationCount) {
+				if (shardChangedOrStateTxn || req.txnStateTransactions.size() || !req.writtenTags.size()) {
 					for (int i = 0; i < self->numLogs; i++) {
 						writtenTLogs.insert(i);
 					}
@@ -661,7 +666,7 @@ ACTOR Future<Void> processTransactionStateRequestPart(Reference<Resolver> self,
 	ASSERT(pContext->pResolverData.getPtr() != nullptr);
 	ASSERT(pContext->pActors != nullptr);
 
-	if (pContext->receivedSequences.count(request.sequence)) {
+	if (pContext->receivedSequences.contains(request.sequence)) {
 		// This part is already received. Still we will re-broadcast it to other CommitProxies & Resolvers
 		pContext->pActors->send(broadcastTxnRequest(request, SERVER_KNOBS->TXN_STATE_SEND_AMOUNT, true));
 		wait(yield());
@@ -790,7 +795,7 @@ ACTOR Future<Void> checkRemoved(Reference<AsyncVar<ServerDBInfo> const> db,
                                 ResolverInterface myInterface) {
 	loop {
 		if (db->get().recoveryCount >= recoveryCount &&
-		    !std::count(db->get().resolvers.begin(), db->get().resolvers.end(), myInterface))
+		    std::find(db->get().resolvers.begin(), db->get().resolvers.end(), myInterface) == db->get().resolvers.end())
 			throw worker_removed();
 		wait(db->onChange());
 	}

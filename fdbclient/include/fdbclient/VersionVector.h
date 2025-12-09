@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2021 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -121,7 +121,7 @@ public:
 		delta.clear();
 
 		if (refVersion == maxVersion) {
-			return; // rerurn an invalid version vector
+			return; // return an invalid version vector
 		}
 
 		if (CLIENT_KNOBS->SEND_ENTIRE_VERSION_VECTOR) {

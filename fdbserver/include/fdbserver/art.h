@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -314,9 +314,6 @@ public:
 	art_iterator insert_if_absent(KeyRef& key, void* value, int* replaced);
 
 	void erase(const art_iterator& it);
-
-	uint64_t count() { return size; }
-
 }; // art_tree
 
 struct art_iterator {

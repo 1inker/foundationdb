@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -40,7 +40,8 @@ void GrvProxyTagThrottler::TagQueue::setRate(double rate) {
 	if (rateInfo.present()) {
 		rateInfo.get().setRate(rate);
 	} else {
-		rateInfo = GrvTransactionRateInfo(rate);
+		rateInfo = GrvTransactionRateInfo(
+		    SERVER_KNOBS->TAG_THROTTLE_RATE_WINDOW, SERVER_KNOBS->TAG_THROTTLE_MAX_EMPTY_QUEUE_BUDGET, rate);
 	}
 }
 
@@ -112,14 +113,17 @@ void GrvProxyTagThrottler::addRequest(GetReadVersionRequest const& req) {
 		TraceEvent(SevWarnAlways, "GrvProxyTagThrottler_MultipleTags")
 		    .suppressFor(60.0)
 		    .detail("NumTags", req.tags.size())
-		    .detail("UsingTag", printable(tag));
+		    .detail("UsingTag", tag);
 	}
 	queues[tag].requests.emplace_back(req);
 }
 
-void GrvProxyTagThrottler::releaseTransactions(double elapsed,
-                                               Deque<GetReadVersionRequest>& outBatchPriority,
-                                               Deque<GetReadVersionRequest>& outDefaultPriority) {
+GrvProxyTagThrottler::ReleaseTransactionsResult GrvProxyTagThrottler::releaseTransactions(
+    double elapsed,
+    Deque<GetReadVersionRequest>& outBatchPriority,
+    Deque<GetReadVersionRequest>& outDefaultPriority) {
+	ReleaseTransactionsResult result;
+
 	// Pointer to a TagQueue with some extra metadata stored alongside
 	struct TagQueueHandle {
 		// Store pointers here to avoid frequent std::unordered_map lookups
@@ -181,6 +185,7 @@ void GrvProxyTagThrottler::releaseTransactions(double elapsed,
 				if (tagQueueHandle.queue->isMaxThrottled(maxThrottleDuration)) {
 					// Requests in this queue have been throttled too long and errors
 					// should be sent to clients.
+					result.rejectedRequests += tagQueueHandle.queue->requests.size();
 					tagQueueHandle.queue->rejectRequests(latencyBandsMap);
 				}
 				break;
@@ -190,8 +195,12 @@ void GrvProxyTagThrottler::releaseTransactions(double elapsed,
 					*(tagQueueHandle.numReleased) += count;
 					delayedReq.updateProxyTagThrottledDuration(latencyBandsMap);
 					if (delayedReq.req.priority == TransactionPriority::BATCH) {
+						result.batchPriorityTransactionsReleased += delayedReq.req.transactionCount;
+						++result.batchPriorityRequestsReleased;
 						outBatchPriority.push_back(delayedReq.req);
 					} else if (delayedReq.req.priority == TransactionPriority::DEFAULT) {
+						result.defaultPriorityTransactionsReleased += delayedReq.req.transactionCount;
+						++result.defaultPriorityRequestsReleased;
 						outDefaultPriority.push_back(delayedReq.req);
 					} else {
 						// Immediate priority transactions should bypass the GrvProxyTagThrottler
@@ -223,6 +232,8 @@ void GrvProxyTagThrottler::releaseTransactions(double elapsed,
 	// If the capacity is increased, that means the vector has been illegally resized, potentially
 	// corrupting memory
 	ASSERT_EQ(transactionsReleased.capacity(), transactionsReleasedInitialCapacity);
+
+	return result;
 }
 
 void GrvProxyTagThrottler::addLatencyBandThreshold(double value) {
@@ -473,9 +484,9 @@ TEST_CASE("/GrvProxyTagThrottler/Fifo") {
 // Tests that while throughput is low, the tag throttler
 // does not accumulate too much budget.
 //
-// A server is setup to server 10 transactions per second,
+// A server is setup to server 100 transactions per second,
 // then runs idly for 60 seconds. Then a client starts
-// and attempts 20 transactions per second for 60 seconds.
+// and attempts 200 transactions per second for 60 seconds.
 // The server throttles the client to only achieve
 // 10 transactions per second during this 60 second window.
 // If the throttler is allowed to accumulate budget indefinitely
@@ -486,16 +497,16 @@ TEST_CASE("/GrvProxyTagThrottler/LimitedIdleBudget") {
 	state TransactionTagMap<uint32_t> counters;
 	{
 		TransactionTagMap<double> rates;
-		rates["sampleTag"_sr] = 10.0;
+		rates["sampleTag"_sr] = 100.0;
 		throttler.updateRates(rates);
 	}
 	tagSet.addTag("sampleTag"_sr);
 
 	state Future<Void> server = mockServer(&throttler);
 	wait(delay(60.0));
-	state Future<Void> client = mockClient(&throttler, TransactionPriority::DEFAULT, tagSet, 1, 20.0, &counters);
+	state Future<Void> client = mockClient(&throttler, TransactionPriority::DEFAULT, tagSet, 1, 200.0, &counters);
 	wait(timeout(client && server, 60.0, Void()));
 	TraceEvent("TagQuotaTest_LimitedIdleBudget").detail("Counter", counters["sampleTag"_sr]);
-	ASSERT(isNear(counters["sampleTag"_sr], 60.0 * 10.0));
+	ASSERT(isNear(counters["sampleTag"_sr], 60.0 * 100.0));
 	return Void();
 }

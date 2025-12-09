@@ -3,7 +3,7 @@
 #
 # This source file is part of the FoundationDB open source project
 #
-# Copyright 2013-2020 Apple Inc. and the FoundationDB project authors
+# Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -82,7 +82,12 @@ class DistributionRateModel(RateModel):
         self.rate = None
 
     def get_rate(self, time):
-        if self.frequency == 0 or int((time - self.last_change) / self.frequency) > int(self.last_change / self.frequency) or self.rate is None:
+        if (
+            self.frequency == 0
+            or int((time - self.last_change) / self.frequency)
+            > int(self.last_change / self.frequency)
+            or self.rate is None
+        ):
             self.last_change = time
             self.rate = self.distribution()
 

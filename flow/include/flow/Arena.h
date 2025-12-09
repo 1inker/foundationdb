@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,20 +20,22 @@
 
 #ifndef FLOW_ARENA_H
 #define FLOW_ARENA_H
-#include <array>
-#include <iterator>
 #pragma once
 
 #include "flow/BooleanParam.h"
+#include "flow/Error.h"
 #include "flow/FastAlloc.h"
 #include "flow/FastRef.h"
-#include "flow/Error.h"
-#include "flow/Trace.h"
+#include "flow/IRandom.h"
 #include "flow/ObjectSerializerTraits.h"
 #include "flow/FileIdentifier.h"
+#include "flow/swift_support.h"
 #include "flow/Optional.h"
+#include "flow/Traceable.h"
 #include <algorithm>
+#include <array>
 #include <boost/functional/hash.hpp>
+#include <iterator>
 #include <stdint.h>
 #include <string_view>
 #include <string>
@@ -62,7 +64,7 @@ struct TrackIt {
 #define TRACKIT_ASSIGN(o) *(TrackItType*)this = *(TrackItType*)&(o)
 
 	// The type name T is in the TrackIt output so that objects that inherit TrackIt multiple times
-	// can be tracked propertly, otherwise the create and delete addresses appear duplicative.
+	// can be tracked properly, otherwise the create and delete addresses appear duplicative.
 	// This function returns just the string "T]" parsed from the __PRETTY_FUNCTION__ macro.  There
 	// doesn't seem to be a better portable way to do this.
 	static const char* __trackit__type() {
@@ -93,7 +95,7 @@ protected:
 	NonCopyable& operator=(const NonCopyable&) = delete;
 };
 
-FDB_DECLARE_BOOLEAN_PARAM(FastInaccurateEstimate);
+FDB_BOOLEAN_PARAM(FastInaccurateEstimate);
 
 // Tag struct to indicate that the block containing allocated memory needs to be zero-ed out after use
 struct WipeAfterUse {};
@@ -162,7 +164,7 @@ struct ArenaBlockRef {
 	uint32_t nextBlockOffset;
 };
 
-FDB_DECLARE_BOOLEAN_PARAM(IsSecureMem);
+FDB_BOOLEAN_PARAM(IsSecureMem);
 
 struct ArenaBlock : NonCopyable, ThreadSafeReferenceCounted<ArenaBlock> {
 	enum {
@@ -260,13 +262,6 @@ inline void save(Archive& ar, const Optional<T>& value) {
 		ar << value.get();
 	}
 }
-
-template <class T>
-struct Traceable<Optional<T>> : std::conditional<Traceable<T>::value, std::true_type, std::false_type>::type {
-	static std::string toString(const Optional<T>& value) {
-		return value.present() ? Traceable<T>::toString(value.get()) : "[not set]";
-	}
-};
 
 template <class T>
 struct union_like_traits<Optional<T>> : std::true_type {
@@ -667,26 +662,21 @@ struct TraceableString<StringRef> {
 template <>
 struct Traceable<StringRef> : TraceableStringImpl<StringRef> {};
 
+template <>
+struct fmt::formatter<StringRef> : FormatUsingTraceable<StringRef> {};
+
 inline std::string StringRef::printable() const {
 	return Traceable<StringRef>::toString(*this);
 }
 
 template <class T>
-struct Traceable<Standalone<T>> : std::conditional<Traceable<T>::value, std::true_type, std::false_type>::type {
-	static std::string toString(const Standalone<T>& value) { return Traceable<T>::toString(value); }
-};
+struct Traceable<Standalone<T>> : Traceable<T> {};
+
+template <class T>
+struct fmt::formatter<Standalone<T>> : fmt::formatter<T> {};
 
 #define __FILE__sr StringRef(reinterpret_cast<const uint8_t*>(__FILE__), sizeof(__FILE__) - 1)
 #define __FUNCTION__sr StringRef(reinterpret_cast<const uint8_t*>(__FUNCTION__), sizeof(__FUNCTION__) - 1)
-
-template <>
-struct fmt::formatter<StringRef> : formatter<std::string_view> {
-	template <typename FormatContext>
-	auto format(const StringRef& str, FormatContext& ctx) -> decltype(ctx.out()) {
-		std::string_view view(reinterpret_cast<const char*>(str.begin()), str.size());
-		return formatter<string_view>::format(view, ctx);
-	}
-};
 
 inline StringRef operator"" _sr(const char* str, size_t size) {
 	return StringRef(reinterpret_cast<const uint8_t*>(str), size);
@@ -730,6 +720,40 @@ inline static StringRef makeAlignedString(int alignment, int length, Arena& aren
 // is only legitimate if you know where the StringRef's memory came from and that it is not shared!
 inline static uint8_t* mutateString(StringRef& s) {
 	return const_cast<uint8_t*>(s.begin());
+}
+
+template <class... StringRefType>
+static Standalone<StringRef> concatenateStrings(StringRefType... strs) {
+	int totalSize = 0;
+	for (auto const& s : { strs... }) {
+		totalSize += s.size();
+	}
+
+	Standalone<StringRef> str = makeString(totalSize);
+	uint8_t* buf = mutateString(str);
+
+	for (auto const& s : { strs... }) {
+		buf = s.copyTo(buf);
+	}
+
+	return str;
+}
+
+template <class... StringRefType>
+static StringRef concatenateStrings(Arena& arena, StringRefType... strs) {
+	int totalSize = 0;
+	for (auto const& s : { strs... }) {
+		totalSize += s.size();
+	}
+
+	StringRef str = makeString(totalSize, arena);
+	uint8_t* buf = mutateString(str);
+
+	for (auto const& s : { strs... }) {
+		buf = s.copyTo(buf);
+	}
+
+	return str;
 }
 
 template <class Archive>
@@ -1108,7 +1132,7 @@ public:
 		m_size--;
 	}
 
-	void pop_front(int count) {
+	void pop_front(int count = 1) {
 		VPS::invalidate();
 		count = std::min(m_size, count);
 

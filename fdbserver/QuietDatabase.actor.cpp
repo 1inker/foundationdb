@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,6 +22,9 @@
 #include <vector>
 #include <map>
 
+#include <boost/lexical_cast.hpp>
+#include <fmt/ranges.h>
+
 #include "fdbclient/FDBOptions.g.h"
 #include "fdbclient/SystemData.h"
 #include "fdbrpc/simulator.h"
@@ -35,7 +38,6 @@
 #include "fdbserver/Knobs.h"
 #include "fdbserver/WorkerInterface.actor.h"
 #include "fdbclient/ManagementAPI.actor.h"
-#include <boost/lexical_cast.hpp>
 #include "flow/actorcompiler.h" // This must be the last #include.
 
 ACTOR Future<std::vector<WorkerDetails>> getWorkers(Reference<AsyncVar<ServerDBInfo> const> dbInfo, int flags = 0) {
@@ -394,13 +396,24 @@ ACTOR Future<TraceEventFields> getStorageMetricsTimeout(UID storage, WorkerInter
 	state int retries = 0;
 	loop {
 		++retries;
-		state Future<TraceEventFields> result =
+		state Future<TraceEventFields> eventLogReply =
 		    wi.eventLogRequest.getReply(EventLogRequest(StringRef(storage.toString() + "/StorageMetrics")));
 		state Future<Void> timeout = delay(30.0);
+		state TraceEventFields storageMetrics;
 		choose {
-			when(TraceEventFields res = wait(result)) {
-				if (version == invalidVersion || getDurableVersion(res) >= static_cast<int64_t>(version)) {
-					return res;
+			when(wait(store(storageMetrics, eventLogReply))) {
+				try {
+					if (version == invalidVersion ||
+					    getDurableVersion(storageMetrics) >= static_cast<int64_t>(version)) {
+						return storageMetrics;
+					}
+				} catch (Error& e) {
+					TraceEvent("QuietDatabaseFailure")
+					    .error(e)
+					    .detail("Reason", "Failed to extract DurableVersion from StorageMetrics")
+					    .detail("SSID", storage)
+					    .detail("StorageMetrics", storageMetrics.toString());
+					throw;
 				}
 			}
 			when(wait(timeout)) {
@@ -539,7 +552,7 @@ ACTOR Future<bool> getTeamCollectionValid(Database cx, WorkerInterface dataDistr
 			// The if condition should be consistent with the condition in serverTeamRemover() and
 			// machineTeamRemover() that decides if redundant teams exist.
 			// Team number is always valid when we disable teamRemover, which avoids false positive in simulation test.
-			// The minimun team number per server (and per machine) should be no less than 0 so that newly added machine
+			// The minimum team number per server (and per machine) should be no less than 0 so that newly added machine
 			// can host data on it.
 			//
 			// If the machineTeamRemover does not remove the machine team with the most machine teams,
@@ -564,7 +577,7 @@ ACTOR Future<bool> getTeamCollectionValid(Database cx, WorkerInterface dataDistr
 				// When DESIRED_TEAMS_PER_SERVER == 1, we see minMachineTeamOnMachine can be 0 in one out of 30k test
 				// cases. Only check DESIRED_TEAMS_PER_SERVER == 3 for now since it is mostly used configuration.
 				// TODO: Remove the constraint SERVER_KNOBS->DESIRED_TEAMS_PER_SERVER == 3 to ensure that
-				// the minimun team number per server (and per machine) is always > 0 for any number of replicas
+				// the minimum team number per server (and per machine) is always > 0 for any number of replicas
 				TraceEvent("GetTeamCollectionValid")
 				    .detail("CurrentServerTeams", currentTeams)
 				    .detail("DesiredTeams", desiredTeams)
@@ -788,13 +801,13 @@ ACTOR Future<Void> reconfigureAfter(Database cx,
                                     Reference<AsyncVar<ServerDBInfo> const> dbInfo,
                                     std::string context) {
 	wait(delay(time));
-	wait(repairDeadDatacenter(cx, dbInfo, context));
+	wait(uncancellable(repairDeadDatacenter(cx, dbInfo, context)));
 	return Void();
 }
 
 struct QuietDatabaseChecker {
-	ProcessEvents::Callback timeoutCallback = [this](StringRef name, StringRef msg, Error const& e) {
-		logFailure(name, msg, e);
+	ProcessEvents::Callback timeoutCallback = [this](StringRef name, std::any const& msg, Error const& e) {
+		logFailure(name, std::any_cast<StringRef>(msg), e);
 	};
 	double start = now();
 	double maxDDRunTime;
@@ -867,6 +880,141 @@ struct QuietDatabaseChecker {
 	}
 };
 
+ACTOR Future<Void> enableConsistencyScanInSim(Database db) {
+	state Reference<ReadYourWritesTransaction> tr = makeReference<ReadYourWritesTransaction>(db);
+	state ConsistencyScanState cs;
+	if (!g_network->isSimulated()) {
+		return Void();
+	}
+	TraceEvent("ConsistencyScan_SimEnable").log();
+	loop {
+		try {
+			SystemDBWriteLockedNow(db.getReference())->setOptions(tr);
+			state ConsistencyScanState::Config config = wait(cs.config().getD(tr));
+
+			// Enable if disabled, otherwise sometimes update the scan min version to restart it
+			if (!config.enabled && g_simulator->consistencyScanState < ISimulator::SimConsistencyScanState::Enabled) {
+				if (!g_simulator->doInjectConsistencyScanCorruption.present()) {
+					g_simulator->doInjectConsistencyScanCorruption = BUGGIFY_WITH_PROB(0.1);
+					TraceEvent("ConsistencyScan_DoInjectCorruption")
+					    .detail("Val", g_simulator->doInjectConsistencyScanCorruption.get());
+				}
+
+				g_simulator->updateConsistencyScanState(ISimulator::SimConsistencyScanState::DisabledStart,
+				                                        ISimulator::SimConsistencyScanState::Enabling);
+				config.enabled = true;
+			} else {
+				if (config.enabled && g_simulator->restarted &&
+				    g_simulator->consistencyScanState == ISimulator::SimConsistencyScanState::DisabledStart) {
+					TraceEvent("ConsistencyScan_SimEnableAlreadyDoneFromRestart").log();
+					g_simulator->updateConsistencyScanState(ISimulator::SimConsistencyScanState::DisabledStart,
+					                                        ISimulator::SimConsistencyScanState::Enabling);
+				}
+				if (BUGGIFY_WITH_PROB(0.5)) {
+					config.minStartVersion = tr->getReadVersion().get();
+				}
+			}
+			// also change the rate
+			config.maxReadByteRate = deterministicRandom()->randomInt(1, 50e6);
+			config.targetRoundTimeSeconds = deterministicRandom()->randomSkewedUInt32(1, 100);
+			config.minRoundTimeSeconds = deterministicRandom()->randomSkewedUInt32(1, 100);
+
+			if (config.enabled) {
+				cs.config().set(tr, config);
+				wait(tr->commit());
+
+				g_simulator->updateConsistencyScanState(ISimulator::SimConsistencyScanState::Enabling,
+				                                        ISimulator::SimConsistencyScanState::Enabled);
+				TraceEvent("ConsistencyScan_SimEnabled")
+				    .detail("MaxReadByteRate", config.maxReadByteRate)
+				    .detail("TargetRoundTimeSeconds", config.targetRoundTimeSeconds)
+				    .detail("MinRoundTimeSeconds", config.minRoundTimeSeconds);
+				CODE_PROBE(true, "Consistency Scan enabled in simulation");
+			}
+
+			break;
+		} catch (Error& e) {
+			wait(tr->onError(e));
+		}
+	}
+
+	return Void();
+}
+
+ACTOR Future<Void> disableConsistencyScanInSim(Database db, bool waitForCompletion) {
+	state Reference<ReadYourWritesTransaction> tr = makeReference<ReadYourWritesTransaction>(db);
+	state ConsistencyScanState cs;
+	if (!g_network->isSimulated()) {
+		return Void();
+	}
+
+	if (waitForCompletion) {
+		TraceEvent("ConsistencyScan_SimDisableWaiting").log();
+		printf("Waiting for consistency scan to complete...\n");
+		loop {
+			bool waitForCorruption = g_simulator->doInjectConsistencyScanCorruption.present() &&
+			                         g_simulator->doInjectConsistencyScanCorruption.get();
+			if (((waitForCorruption &&
+			      g_simulator->consistencyScanState >= ISimulator::SimConsistencyScanState::Enabled_FoundCorruption) ||
+			     (!waitForCorruption &&
+			      g_simulator->consistencyScanState >= ISimulator::SimConsistencyScanState::Enabled))) {
+				break;
+			}
+			wait(delay(1.0));
+		}
+	}
+	TraceEvent("ConsistencyScan_SimDisable").log();
+	loop {
+		try {
+			SystemDBWriteLockedNow(db.getReference())->setOptions(tr);
+			state ConsistencyScanState::Config config = wait(cs.config().getD(tr));
+			state bool skipDisable = false;
+			// see if any rounds have completed
+			if (waitForCompletion) {
+				state ConsistencyScanState::RoundStats statsCurrentRound = wait(cs.currentRoundStats().getD(tr));
+				state ConsistencyScanState::StatsHistoryMap::RangeResultType olderStats =
+				    wait(cs.roundStatsHistory().getRange(tr, {}, {}, 1, Snapshot::False, Reverse::False));
+				if (olderStats.results.empty() && !statsCurrentRound.complete) {
+					TraceEvent("ConsistencyScan_SimDisable_NoRoundsCompleted").log();
+					skipDisable = true;
+				}
+			}
+
+			// Enable if disable, else set the scan min version to restart it
+			if (config.enabled) {
+				// state was either enabled or enabled_foundcorruption
+				g_simulator->updateConsistencyScanState(ISimulator::SimConsistencyScanState::Enabled,
+				                                        ISimulator::SimConsistencyScanState::Complete);
+				g_simulator->updateConsistencyScanState(ISimulator::SimConsistencyScanState::Enabled_FoundCorruption,
+				                                        ISimulator::SimConsistencyScanState::Complete);
+				config.enabled = false;
+			} else {
+				TraceEvent("ConsistencyScan_SimDisableAlreadyDisabled").log();
+				printf("Consistency scan already complete.\n");
+				return Void();
+			}
+
+			if (skipDisable) {
+				wait(delay(2.0));
+				tr->reset();
+			} else {
+				cs.config().set(tr, config);
+				wait(tr->commit());
+				break;
+			}
+		} catch (Error& e) {
+			wait(tr->onError(e));
+		}
+	}
+
+	g_simulator->updateConsistencyScanState(ISimulator::SimConsistencyScanState::Complete,
+	                                        ISimulator::SimConsistencyScanState::DisabledEnd);
+	CODE_PROBE(true, "Consistency Scan disabled in simulation");
+	TraceEvent("ConsistencyScan_SimDisabled").log();
+	printf("Consistency scan complete.\n");
+	return Void();
+}
+
 // Waits until a database quiets down (no data in flight, small tlog queue, low SQ, no active data distribution). This
 // requires the database to be available and healthy in order to succeed.
 ACTOR Future<Void> waitForQuietDatabase(Database cx,
@@ -878,7 +1026,7 @@ ACTOR Future<Void> waitForQuietDatabase(Database cx,
                                         int64_t maxDataDistributionQueueSize = 0,
                                         int64_t maxPoppedVersionLag = 30e6,
                                         int64_t maxVersionOffset = 1e6) {
-	state QuietDatabaseChecker checker(isBuggifyEnabled(BuggifyType::General) ? 4000.0 : 1000.0);
+	state QuietDatabaseChecker checker(isGeneralBuggifyEnabled() ? 4000.0 : 1000.0);
 	state Future<Void> reconfig =
 	    reconfigureAfter(cx, 100 + (deterministicRandom()->random01() * 100), dbInfo, "QuietDatabase");
 	state Future<int64_t> dataInFlight;
@@ -890,7 +1038,7 @@ ACTOR Future<Void> waitForQuietDatabase(Database cx,
 	state Future<bool> storageServersRecruiting;
 	state Future<int64_t> versionOffset;
 	state Future<Version> dcLag;
-	state Version maxDcLag = 30e6;
+	state Version maxDcLag = 100e6;
 	state std::string traceMessage = "QuietDatabase" + phase + "Begin";
 	TraceEvent(traceMessage.c_str()).log();
 
@@ -898,7 +1046,7 @@ ACTOR Future<Void> waitForQuietDatabase(Database cx,
 	if (g_network->isSimulated())
 		wait(delay(5.0));
 
-	TraceEvent("QuietDatabaseWaitingOnFullRecovery").log();
+	TraceEvent("QuietDatabaseWaitingOnFullRecovery").detail("Phase", phase).log();
 	while (dbInfo->get().recoveryState != RecoveryState::FULLY_RECOVERED) {
 		wait(dbInfo->onChange());
 	}
@@ -909,6 +1057,8 @@ ACTOR Future<Void> waitForQuietDatabase(Database cx,
 	printf("Set perpetual_storage_wiggle=0 ...\n");
 	state Version version = wait(setPerpetualStorageWiggle(cx, false, LockAware::True));
 	printf("Set perpetual_storage_wiggle=0 Done.\n");
+
+	wait(disableConsistencyScanInSim(cx, false));
 
 	// Require 3 consecutive successful quiet database checks spaced 2 second apart
 	state int numSuccesses = 0;

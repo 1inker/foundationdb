@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -28,6 +28,7 @@
 #include "fdbrpc/DDSketch.h"
 #include "fdbserver/workloads/workloads.actor.h"
 #include "flow/TDMetric.actor.h"
+#include <boost/lexical_cast.hpp>
 #include "flow/actorcompiler.h" // This must be the last #include.
 DESCR struct TransactionSuccessMetric {
 	int64_t totalLatency; // ns

@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -136,13 +136,14 @@ struct OldTLogConf {
 	constexpr static FileIdentifier file_identifier = 16233772;
 	std::vector<TLogSet> tLogs;
 	Version epochBegin, epochEnd;
+	Version recoverAt;
 	int32_t logRouterTags;
 	int32_t txsTags;
 	std::set<int8_t>
 	    pseudoLocalities; // Tracking pseudo localities, e.g., tagLocalityLogRouterMapped, used in the old epoch.
 	LogEpoch epoch;
 
-	OldTLogConf() : epochBegin(0), epochEnd(0), logRouterTags(0), txsTags(0), epoch(0) {}
+	OldTLogConf() : epochBegin(0), epochEnd(0), recoverAt(0), logRouterTags(0), txsTags(0), epoch(0) {}
 	explicit OldTLogConf(const OldLogData&);
 
 	std::string toString() const {
@@ -155,7 +156,7 @@ struct OldTLogConf {
 
 	template <class Ar>
 	void serialize(Ar& ar) {
-		serializer(ar, tLogs, epochBegin, epochEnd, logRouterTags, pseudoLocalities, txsTags, epoch);
+		serializer(ar, tLogs, epochBegin, epochEnd, logRouterTags, pseudoLocalities, txsTags, epoch, recoverAt);
 	}
 };
 

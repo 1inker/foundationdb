@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -36,7 +36,6 @@
 #include "fdbclient/StorageServerInterface.h"
 #include "fdbclient/TagThrottle.actor.h"
 #include "fdbclient/VersionVector.h"
-
 #include "fdbrpc/Stats.h"
 #include "fdbrpc/TimedRequest.h"
 
@@ -66,6 +65,7 @@ struct CommitProxyInterface {
 	PublicRequestStream<struct ExpireIdempotencyIdRequest> expireIdempotencyId;
 	PublicRequestStream<struct GetTenantIdRequest> getTenantId;
 	PublicRequestStream<struct GetBlobGranuleLocationsRequest> getBlobGranuleLocations;
+	RequestStream<struct SetThrottledShardRequest> setThrottledShard;
 
 	UID id() const { return commit.getEndpoint().token; }
 	std::string toString() const { return id().shortString(); }
@@ -97,6 +97,8 @@ struct CommitProxyInterface {
 			getTenantId = PublicRequestStream<struct GetTenantIdRequest>(commit.getEndpoint().getAdjustedEndpoint(11));
 			getBlobGranuleLocations = PublicRequestStream<struct GetBlobGranuleLocationsRequest>(
 			    commit.getEndpoint().getAdjustedEndpoint(12));
+			setThrottledShard =
+			    RequestStream<struct SetThrottledShardRequest>(commit.getEndpoint().getAdjustedEndpoint(13));
 		}
 	}
 
@@ -116,6 +118,7 @@ struct CommitProxyInterface {
 		streams.push_back(expireIdempotencyId.getReceiver());
 		streams.push_back(getTenantId.getReceiver());
 		streams.push_back(getBlobGranuleLocations.getReceiver());
+		streams.push_back(setThrottledShard.getReceiver());
 		FlowTransport::transport().addEndpoints(streams);
 	}
 };
@@ -525,7 +528,7 @@ struct GetBlobGranuleLocationsRequest {
 	}
 };
 
-struct GetRawCommittedVersionReply {
+struct SWIFT_CXX_IMPORT_OWNED GetRawCommittedVersionReply {
 	constexpr static FileIdentifier file_identifier = 1314732;
 	Optional<UID> debugID;
 	Version version;
@@ -544,7 +547,7 @@ struct GetRawCommittedVersionReply {
 	}
 };
 
-struct GetRawCommittedVersionRequest {
+struct SWIFT_CXX_IMPORT_OWNED GetRawCommittedVersionRequest {
 	constexpr static FileIdentifier file_identifier = 12954034;
 	SpanContext spanContext;
 	Optional<UID> debugID;
@@ -563,7 +566,7 @@ struct GetRawCommittedVersionRequest {
 	}
 };
 
-struct GetStorageServerRejoinInfoReply {
+struct SWIFT_CXX_IMPORT_OWNED GetStorageServerRejoinInfoReply {
 	constexpr static FileIdentifier file_identifier = 9469225;
 	Version version;
 	Tag tag;
@@ -723,14 +726,16 @@ struct ExclusionSafetyCheckRequest {
 struct GlobalConfigRefreshReply {
 	constexpr static FileIdentifier file_identifier = 12680327;
 	Arena arena;
+	Version version;
 	RangeResultRef result;
 
 	GlobalConfigRefreshReply() {}
-	GlobalConfigRefreshReply(Arena const& arena, RangeResultRef result) : arena(arena), result(result) {}
+	GlobalConfigRefreshReply(Arena const& arena, Version version, RangeResultRef result)
+	  : arena(arena), version(version), result(result) {}
 
 	template <class Ar>
 	void serialize(Ar& ar) {
-		serializer(ar, result, arena);
+		serializer(ar, result, version, arena);
 	}
 };
 
@@ -747,6 +752,33 @@ struct GlobalConfigRefreshRequest {
 	template <class Ar>
 	void serialize(Ar& ar) {
 		serializer(ar, lastKnown, reply);
+	}
+};
+
+struct SetThrottledShardReply {
+	constexpr static FileIdentifier file_identifier = 2828140;
+
+	SetThrottledShardReply() {}
+
+	template <class Ar>
+	void serialize(Ar& ar) {
+		serializer(ar);
+	}
+};
+
+struct SetThrottledShardRequest {
+	constexpr static FileIdentifier file_identifier = 2828141;
+	std::vector<KeyRange> throttledShards;
+	double expirationTime;
+	ReplyPromise<SetThrottledShardReply> reply;
+
+	SetThrottledShardRequest() {}
+	explicit SetThrottledShardRequest(std::vector<KeyRange> throttledShards, double expirationTime)
+	  : throttledShards(throttledShards), expirationTime(expirationTime) {}
+
+	template <class Ar>
+	void serialize(Ar& ar) {
+		serializer(ar, throttledShards, expirationTime, reply);
 	}
 };
 

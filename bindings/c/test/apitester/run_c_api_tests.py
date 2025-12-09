@@ -4,7 +4,7 @@
 #
 # This source file is part of the FoundationDB open source project
 #
-# Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+# Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -149,7 +149,7 @@ def run_tester(args, cluster, test_file):
         else:
             reason = "exit code: %d" % ret_code
         get_logger().error(
-            "\n'%s' did not complete succesfully (%s)" % (cmd[0], reason)
+            "\n'%s' did not complete successfully (%s)" % (cmd[0], reason)
         )
         if log_dir is not None and not args.disable_log_dump:
             dump_client_logs(log_dir)

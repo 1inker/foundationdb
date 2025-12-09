@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -55,7 +55,10 @@ class GrvProxyTagThrottler {
 		Deque<DelayedRequest> requests;
 
 		TagQueue() = default;
-		explicit TagQueue(double rate) : rateInfo(rate) {}
+		explicit TagQueue(double rate)
+		  : rateInfo(GrvTransactionRateInfo(SERVER_KNOBS->TAG_THROTTLE_RATE_WINDOW,
+		                                    SERVER_KNOBS->TAG_THROTTLE_MAX_EMPTY_QUEUE_BUDGET,
+		                                    rate)) {}
 
 		void setRate(double rate);
 		bool isMaxThrottled(double maxThrottleDuration) const;
@@ -76,12 +79,20 @@ public:
 	// Called with rates received from ratekeeper
 	void updateRates(TransactionTagMap<double> const& newRates);
 
+	struct ReleaseTransactionsResult {
+		uint64_t batchPriorityTransactionsReleased{ 0 };
+		uint64_t batchPriorityRequestsReleased{ 0 };
+		uint64_t defaultPriorityTransactionsReleased{ 0 };
+		uint64_t defaultPriorityRequestsReleased{ 0 };
+		uint64_t rejectedRequests{ 0 };
+	};
+
 	// elapsed indicates the amount of time since the last epoch was run.
 	// If a request is ready to be executed, it is sent to the deque
 	// corresponding to its priority. If not, the request remains queued.
-	void releaseTransactions(double elapsed,
-	                         Deque<GetReadVersionRequest>& outBatchPriority,
-	                         Deque<GetReadVersionRequest>& outDefaultPriority);
+	ReleaseTransactionsResult releaseTransactions(double elapsed,
+	                                              Deque<GetReadVersionRequest>& outBatchPriority,
+	                                              Deque<GetReadVersionRequest>& outDefaultPriority);
 
 	void addRequest(GetReadVersionRequest const&);
 

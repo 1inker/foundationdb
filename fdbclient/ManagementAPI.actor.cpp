@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "fdbclient/GenericManagementAPI.actor.h"
+#include "fdbclient/RangeLock.h"
 #include "fmt/format.h"
 #include "fdbclient/Knobs.h"
 #include "flow/Arena.h"
@@ -236,7 +237,7 @@ std::map<std::string, std::string> configForToken(std::string const& mode) {
 			}
 		}
 
-		if (key == "storage_engine" || key == "log_engine") {
+		if (key == "storage_engine" || key == "log_engine" || key == "perpetual_storage_wiggle_engine") {
 			StringRef s = value;
 
 			// Parse as engine_name[:p=v]... to handle future storage engine params
@@ -269,7 +270,7 @@ std::map<std::string, std::string> configForToken(std::string const& mode) {
 	} else if (mode == "ssd" || mode == "ssd-2") {
 		logType = KeyValueStoreType::SSD_BTREE_V2;
 		storeType = KeyValueStoreType::SSD_BTREE_V2;
-	} else if (mode == "ssd-redwood-1" || mode == "ssd-redwood-1-experimental") {
+	} else if (mode == "ssd-redwood-1") {
 		logType = KeyValueStoreType::SSD_BTREE_V2;
 		storeType = KeyValueStoreType::SSD_REDWOOD_V1;
 	} else if (mode == "ssd-rocksdb-v1") {
@@ -284,7 +285,7 @@ std::map<std::string, std::string> configForToken(std::string const& mode) {
 	} else if (mode == "memory-1") {
 		logType = KeyValueStoreType::MEMORY;
 		storeType = KeyValueStoreType::MEMORY;
-	} else if (mode == "memory-radixtree-beta") {
+	} else if (mode == "memory-radixtree" || mode == "memory-radixtree-beta") {
 		logType = KeyValueStoreType::SSD_BTREE_V2;
 		storeType = KeyValueStoreType::MEMORY_RADIXTREE;
 	}
@@ -673,7 +674,10 @@ TEST_CASE("/ManagementAPI/ChangeConfig/TenantAndEncryptMode") {
 	return Void();
 }
 
-ACTOR Future<DatabaseConfiguration> getDatabaseConfiguration(Transaction* tr) {
+ACTOR Future<DatabaseConfiguration> getDatabaseConfiguration(Transaction* tr, bool useSystemPriority) {
+	if (useSystemPriority) {
+		tr->setOption(FDBTransactionOptions::PRIORITY_SYSTEM_IMMEDIATE);
+	}
 	tr->setOption(FDBTransactionOptions::READ_LOCK_AWARE);
 	tr->setOption(FDBTransactionOptions::READ_SYSTEM_KEYS);
 	RangeResult res = wait(tr->getRange(configKeys, CLIENT_KNOBS->TOO_MANY));
@@ -683,11 +687,11 @@ ACTOR Future<DatabaseConfiguration> getDatabaseConfiguration(Transaction* tr) {
 	return config;
 }
 
-ACTOR Future<DatabaseConfiguration> getDatabaseConfiguration(Database cx) {
+ACTOR Future<DatabaseConfiguration> getDatabaseConfiguration(Database cx, bool useSystemPriority) {
 	state Transaction tr(cx);
 	loop {
 		try {
-			DatabaseConfiguration config = wait(getDatabaseConfiguration(&tr));
+			DatabaseConfiguration config = wait(getDatabaseConfiguration(&tr, useSystemPriority));
 			return config;
 		} catch (Error& e) {
 			wait(tr.onError(e));
@@ -1043,7 +1047,6 @@ ACTOR Future<Optional<ClusterConnectionString>> getClusterConnectionStringFromSt
 			return Optional<ClusterConnectionString>();
 		}
 
-		Version readVersion = wait(tr->getReadVersion());
 		state Optional<Value> currentKey = wait(tr->get(coordinatorsKey));
 		if (g_network->isSimulated() && currentKey.present()) {
 			// If the change coordinators request succeeded, the coordinators
@@ -1188,7 +1191,8 @@ ACTOR Future<Optional<CoordinatorsResult>> changeQuorumChecker(Transaction* tr,
 	if (g_network->isSimulated()) {
 		int i = 0;
 		int protectedCount = 0;
-		while ((protectedCount < ((desiredCoordinators.size() / 2) + 1)) && (i < desiredCoordinators.size())) {
+		int minimumCoordinators = (desiredCoordinators.size() / 2) + 1;
+		while (protectedCount < minimumCoordinators && i < desiredCoordinators.size()) {
 			auto process = g_simulator->getProcessByAddress(desiredCoordinators[i]);
 			auto addresses = process->addresses;
 
@@ -1204,6 +1208,15 @@ ACTOR Future<Optional<CoordinatorsResult>> changeQuorumChecker(Transaction* tr,
 			TraceEvent("ProtectCoordinator").detail("Address", desiredCoordinators[i]).backtrace();
 			protectedCount++;
 			i++;
+		}
+
+		if (protectedCount < minimumCoordinators) {
+			TraceEvent("NotEnoughReliableCoordinators")
+			    .detail("NumReliable", protectedCount)
+			    .detail("MinimumRequired", minimumCoordinators)
+			    .detail("ConnectionString", conn->toString());
+
+			return CoordinatorsResult::COORDINATOR_UNREACHABLE;
 		}
 	}
 
@@ -1457,7 +1470,7 @@ struct AutoQuorumChange final : IQuorumChange {
 			desiredCount = redundancy * 2 - 1;
 		}
 
-		std::vector<AddressExclusion> excl = wait(getExcludedServers(tr));
+		std::vector<AddressExclusion> excl = wait(getAllExcludedServers(tr));
 		state std::set<AddressExclusion> excluded(excl.begin(), excl.end());
 
 		std::vector<ProcessData> _workers = wait(getWorkers(tr));
@@ -1603,23 +1616,37 @@ Reference<IQuorumChange> autoQuorumChange(int desired) {
 	return Reference<IQuorumChange>(new AutoQuorumChange(desired));
 }
 
-void excludeServers(Transaction& tr, std::vector<AddressExclusion>& servers, bool failed) {
-	tr.setOption(FDBTransactionOptions::ACCESS_SYSTEM_KEYS);
-	tr.setOption(FDBTransactionOptions::PRIORITY_SYSTEM_IMMEDIATE);
-	tr.setOption(FDBTransactionOptions::LOCK_AWARE);
-	tr.setOption(FDBTransactionOptions::USE_PROVISIONAL_PROXIES);
-	std::string excludeVersionKey = deterministicRandom()->randomUniqueID().toString();
-	auto serversVersionKey = failed ? failedServersVersionKey : excludedServersVersionKey;
-	tr.addReadConflictRange(singleKeyRange(serversVersionKey)); // To conflict with parallel includeServers
-	tr.set(serversVersionKey, excludeVersionKey);
+ACTOR Future<Void> excludeServers(Transaction* tr, std::vector<AddressExclusion> servers, bool failed) {
+	tr->setOption(FDBTransactionOptions::ACCESS_SYSTEM_KEYS);
+	tr->setOption(FDBTransactionOptions::PRIORITY_SYSTEM_IMMEDIATE);
+	tr->setOption(FDBTransactionOptions::LOCK_AWARE);
+	tr->setOption(FDBTransactionOptions::USE_PROVISIONAL_PROXIES);
+	std::vector<AddressExclusion> excl = wait(failed ? getExcludedFailedServerList(tr) : getExcludedServerList(tr));
+	std::set<AddressExclusion> exclusions(excl.begin(), excl.end());
+	bool containNewExclusion = false;
 	for (auto& s : servers) {
+		if (exclusions.find(s) != exclusions.end()) {
+			continue;
+		}
+		containNewExclusion = true;
 		if (failed) {
-			tr.set(encodeFailedServersKey(s), StringRef());
+			tr->set(encodeFailedServersKey(s), StringRef());
 		} else {
-			tr.set(encodeExcludedServersKey(s), StringRef());
+			tr->set(encodeExcludedServersKey(s), StringRef());
 		}
 	}
-	TraceEvent("ExcludeServersCommit").detail("Servers", describe(servers)).detail("ExcludeFailed", failed);
+
+	if (containNewExclusion) {
+		std::string excludeVersionKey = deterministicRandom()->randomUniqueID().toString();
+		auto serversVersionKey = failed ? failedServersVersionKey : excludedServersVersionKey;
+		tr->addReadConflictRange(singleKeyRange(serversVersionKey)); // To conflict with parallel includeServers
+		tr->set(serversVersionKey, excludeVersionKey);
+	}
+	TraceEvent("ExcludeServersCommit")
+	    .detail("Servers", describe(servers))
+	    .detail("ExcludeFailed", failed)
+	    .detail("ExclusionUpdated", containNewExclusion);
+	return Void();
 }
 
 ACTOR Future<Void> excludeServers(Database cx, std::vector<AddressExclusion> servers, bool failed) {
@@ -1652,7 +1679,7 @@ ACTOR Future<Void> excludeServers(Database cx, std::vector<AddressExclusion> ser
 		state Transaction tr(cx);
 		loop {
 			try {
-				excludeServers(tr, servers, failed);
+				wait(excludeServers(&tr, servers, failed));
 				wait(tr.commit());
 				return Void();
 			} catch (Error& e) {
@@ -1664,23 +1691,36 @@ ACTOR Future<Void> excludeServers(Database cx, std::vector<AddressExclusion> ser
 }
 
 // excludes localities by setting the keys in api version below 7.0
-void excludeLocalities(Transaction& tr, std::unordered_set<std::string> localities, bool failed) {
-	tr.setOption(FDBTransactionOptions::ACCESS_SYSTEM_KEYS);
-	tr.setOption(FDBTransactionOptions::PRIORITY_SYSTEM_IMMEDIATE);
-	tr.setOption(FDBTransactionOptions::LOCK_AWARE);
-	tr.setOption(FDBTransactionOptions::USE_PROVISIONAL_PROXIES);
-	std::string excludeVersionKey = deterministicRandom()->randomUniqueID().toString();
-	auto localityVersionKey = failed ? failedLocalityVersionKey : excludedLocalityVersionKey;
-	tr.addReadConflictRange(singleKeyRange(localityVersionKey)); // To conflict with parallel includeLocalities
-	tr.set(localityVersionKey, excludeVersionKey);
+ACTOR Future<Void> excludeLocalities(Transaction* tr, std::unordered_set<std::string> localities, bool failed) {
+	tr->setOption(FDBTransactionOptions::ACCESS_SYSTEM_KEYS);
+	tr->setOption(FDBTransactionOptions::PRIORITY_SYSTEM_IMMEDIATE);
+	tr->setOption(FDBTransactionOptions::LOCK_AWARE);
+	tr->setOption(FDBTransactionOptions::USE_PROVISIONAL_PROXIES);
+	std::vector<std::string> excl = wait(failed ? getExcludedFailedLocalityList(tr) : getExcludedLocalityList(tr));
+	std::set<std::string> exclusion(excl.begin(), excl.end());
+	bool containNewExclusion = false;
 	for (const auto& l : localities) {
+		if (exclusion.find(l) != exclusion.end()) {
+			continue;
+		}
+		containNewExclusion = true;
 		if (failed) {
-			tr.set(encodeFailedLocalityKey(l), StringRef());
+			tr->set(encodeFailedLocalityKey(l), StringRef());
 		} else {
-			tr.set(encodeExcludedLocalityKey(l), StringRef());
+			tr->set(encodeExcludedLocalityKey(l), StringRef());
 		}
 	}
-	TraceEvent("ExcludeLocalitiesCommit").detail("Localities", describe(localities)).detail("ExcludeFailed", failed);
+	if (containNewExclusion) {
+		std::string excludeVersionKey = deterministicRandom()->randomUniqueID().toString();
+		auto localityVersionKey = failed ? failedLocalityVersionKey : excludedLocalityVersionKey;
+		tr->addReadConflictRange(singleKeyRange(localityVersionKey)); // To conflict with parallel includeLocalities
+		tr->set(localityVersionKey, excludeVersionKey);
+	}
+	TraceEvent("ExcludeLocalitiesCommit")
+	    .detail("Localities", describe(localities))
+	    .detail("ExcludeFailed", failed)
+	    .detail("ExclusionUpdated", containNewExclusion);
+	return Void();
 }
 
 // Exclude the servers matching the given set of localities from use as state servers.
@@ -1716,7 +1756,7 @@ ACTOR Future<Void> excludeLocalities(Database cx, std::unordered_set<std::string
 		state Transaction tr(cx);
 		loop {
 			try {
-				excludeLocalities(tr, localities, failed);
+				wait(excludeLocalities(&tr, localities, failed));
 				wait(tr.commit());
 				return Void();
 			} catch (Error& e) {
@@ -1950,11 +1990,9 @@ ACTOR Future<Void> setClass(Database cx, AddressExclusion server, ProcessClass p
 	}
 }
 
-ACTOR Future<std::vector<AddressExclusion>> getExcludedServers(Transaction* tr) {
+ACTOR Future<std::vector<AddressExclusion>> getExcludedServerList(Transaction* tr) {
 	state RangeResult r = wait(tr->getRange(excludedServersKeys, CLIENT_KNOBS->TOO_MANY));
 	ASSERT(!r.more && r.size() < CLIENT_KNOBS->TOO_MANY);
-	state RangeResult r2 = wait(tr->getRange(failedServersKeys, CLIENT_KNOBS->TOO_MANY));
-	ASSERT(!r2.more && r2.size() < CLIENT_KNOBS->TOO_MANY);
 
 	std::vector<AddressExclusion> exclusions;
 	for (auto i = r.begin(); i != r.end(); ++i) {
@@ -1962,7 +2000,16 @@ ACTOR Future<std::vector<AddressExclusion>> getExcludedServers(Transaction* tr) 
 		if (a.isValid())
 			exclusions.push_back(a);
 	}
-	for (auto i = r2.begin(); i != r2.end(); ++i) {
+	uniquify(exclusions);
+	return exclusions;
+}
+
+ACTOR Future<std::vector<AddressExclusion>> getExcludedFailedServerList(Transaction* tr) {
+	state RangeResult r = wait(tr->getRange(failedServersKeys, CLIENT_KNOBS->TOO_MANY));
+	ASSERT(!r.more && r.size() < CLIENT_KNOBS->TOO_MANY);
+
+	std::vector<AddressExclusion> exclusions;
+	for (auto i = r.begin(); i != r.end(); ++i) {
 		auto a = decodeFailedServersKey(i->key);
 		if (a.isValid())
 			exclusions.push_back(a);
@@ -1971,14 +2018,54 @@ ACTOR Future<std::vector<AddressExclusion>> getExcludedServers(Transaction* tr) 
 	return exclusions;
 }
 
-ACTOR Future<std::vector<AddressExclusion>> getExcludedServers(Database cx) {
+ACTOR Future<std::vector<AddressExclusion>> getAllExcludedServers(Transaction* tr) {
+	state std::vector<AddressExclusion> exclusions;
+	// Request all exclusion based information concurrently.
+	state Future<std::vector<AddressExclusion>> fExcludedServers = getExcludedServerList(tr);
+	state Future<std::vector<AddressExclusion>> fExcludedFailed = getExcludedFailedServerList(tr);
+	state Future<std::vector<std::string>> fExcludedLocalities = getAllExcludedLocalities(tr);
+	state Future<std::vector<ProcessData>> fWorkers = getWorkers(tr);
+
+	// Wait until all data is gathered, we are not waiting here for the workers future to return
+	// instead we wait for the worker future only if we need the data.
+	wait(success(fExcludedServers) && success(fExcludedFailed) && success(fExcludedLocalities));
+	// Update the exclusions vector with all excluded servers.
+	auto excludedServers = fExcludedServers.get();
+	exclusions.insert(exclusions.end(), excludedServers.begin(), excludedServers.end());
+	auto excludedFailed = fExcludedFailed.get();
+	exclusions.insert(exclusions.end(), excludedFailed.begin(), excludedFailed.end());
+
+	// We have to return all servers that are excluded, this includes servers that are excluded
+	// based on the locality. Otherwise those excluded servers might be used, even if they shouldn't.
+	state std::vector<std::string> excludedLocalities = fExcludedLocalities.get();
+
+	// Only if at least one locality was found we have to perform this check.
+	if (!excludedLocalities.empty()) {
+		// First we have to fetch all workers to match the localities of each worker against the excluded localities.
+		wait(success(fWorkers));
+		state std::vector<ProcessData> workers = fWorkers.get();
+
+		for (const auto& locality : excludedLocalities) {
+			std::set<AddressExclusion> localityAddresses = getAddressesByLocality(workers, locality);
+			if (!localityAddresses.empty()) {
+				// Add all the server ipaddresses that belong to the given localities to the exclusionSet.
+				exclusions.insert(exclusions.end(), localityAddresses.begin(), localityAddresses.end());
+			}
+		}
+	}
+
+	uniquify(exclusions);
+	return exclusions;
+}
+
+ACTOR Future<std::vector<AddressExclusion>> getAllExcludedServers(Database cx) {
 	state Transaction tr(cx);
 	loop {
 		try {
 			tr.setOption(FDBTransactionOptions::READ_SYSTEM_KEYS);
 			tr.setOption(FDBTransactionOptions::PRIORITY_SYSTEM_IMMEDIATE); // necessary?
 			tr.setOption(FDBTransactionOptions::LOCK_AWARE);
-			std::vector<AddressExclusion> exclusions = wait(getExcludedServers(&tr));
+			std::vector<AddressExclusion> exclusions = wait(getAllExcludedServers(&tr));
 			return exclusions;
 		} catch (Error& e) {
 			wait(tr.onError(e));
@@ -1986,19 +2073,25 @@ ACTOR Future<std::vector<AddressExclusion>> getExcludedServers(Database cx) {
 	}
 }
 
-// Get the current list of excluded localities by reading the keys.
-ACTOR Future<std::vector<std::string>> getExcludedLocalities(Transaction* tr) {
+ACTOR Future<std::vector<std::string>> getExcludedLocalityList(Transaction* tr) {
 	state RangeResult r = wait(tr->getRange(excludedLocalityKeys, CLIENT_KNOBS->TOO_MANY));
 	ASSERT(!r.more && r.size() < CLIENT_KNOBS->TOO_MANY);
-	state RangeResult r2 = wait(tr->getRange(failedLocalityKeys, CLIENT_KNOBS->TOO_MANY));
-	ASSERT(!r2.more && r2.size() < CLIENT_KNOBS->TOO_MANY);
 
 	std::vector<std::string> excludedLocalities;
 	for (const auto& i : r) {
 		auto a = decodeExcludedLocalityKey(i.key);
 		excludedLocalities.push_back(a);
 	}
-	for (const auto& i : r2) {
+	uniquify(excludedLocalities);
+	return excludedLocalities;
+}
+
+ACTOR Future<std::vector<std::string>> getExcludedFailedLocalityList(Transaction* tr) {
+	state RangeResult r = wait(tr->getRange(failedLocalityKeys, CLIENT_KNOBS->TOO_MANY));
+	ASSERT(!r.more && r.size() < CLIENT_KNOBS->TOO_MANY);
+
+	std::vector<std::string> excludedLocalities;
+	for (const auto& i : r) {
 		auto a = decodeFailedLocalityKey(i.key);
 		excludedLocalities.push_back(a);
 	}
@@ -2006,15 +2099,32 @@ ACTOR Future<std::vector<std::string>> getExcludedLocalities(Transaction* tr) {
 	return excludedLocalities;
 }
 
+ACTOR Future<std::vector<std::string>> getAllExcludedLocalities(Transaction* tr) {
+	state std::vector<std::string> exclusions;
+	state Future<std::vector<std::string>> fExcludedLocalities = getExcludedLocalityList(tr);
+	state Future<std::vector<std::string>> fFailedLocalities = getExcludedFailedLocalityList(tr);
+
+	// Wait until all data is gathered.
+	wait(success(fExcludedLocalities) && success(fFailedLocalities));
+
+	auto excludedLocalities = fExcludedLocalities.get();
+	exclusions.insert(exclusions.end(), excludedLocalities.begin(), excludedLocalities.end());
+	auto failedLocalities = fFailedLocalities.get();
+	exclusions.insert(exclusions.end(), failedLocalities.begin(), failedLocalities.end());
+
+	uniquify(exclusions);
+	return exclusions;
+}
+
 // Get the list of excluded localities by reading the keys.
-ACTOR Future<std::vector<std::string>> getExcludedLocalities(Database cx) {
+ACTOR Future<std::vector<std::string>> getAllExcludedLocalities(Database cx) {
 	state Transaction tr(cx);
 	loop {
 		try {
 			tr.setOption(FDBTransactionOptions::READ_SYSTEM_KEYS);
 			tr.setOption(FDBTransactionOptions::PRIORITY_SYSTEM_IMMEDIATE);
 			tr.setOption(FDBTransactionOptions::LOCK_AWARE);
-			std::vector<std::string> exclusions = wait(getExcludedLocalities(&tr));
+			std::vector<std::string> exclusions = wait(getAllExcludedLocalities(&tr));
 			return exclusions;
 		} catch (Error& e) {
 			wait(tr.onError(e));
@@ -2036,21 +2146,56 @@ std::pair<std::string, std::string> decodeLocality(const std::string& locality) 
 	return std::make_pair("", "");
 }
 
-// Returns the list of IPAddresses of the workers that match the given locality.
-// Example: locality="dcid:primary" returns all the ip addresses of the workers in the primary dc.
-std::set<AddressExclusion> getAddressesByLocality(const std::vector<ProcessData>& workers,
-                                                  const std::string& locality) {
-	std::pair<std::string, std::string> localityKeyValue = decodeLocality(locality);
+// Returns the list of IPAddresses of the servers that match the given locality.
+// Example: locality="dcid:primary" returns all the ip addresses of the servers in the primary dc.
+std::set<AddressExclusion> getServerAddressesByLocality(
+    const std::map<std::string, StorageServerInterface> server_interfaces,
+    const std::string& locality) {
+	std::pair<std::string, std::string> locality_key_value = decodeLocality(locality);
+	std::set<AddressExclusion> locality_addresses;
 
-	std::set<AddressExclusion> localityAddresses;
-	for (int i = 0; i < workers.size(); i++) {
-		if (workers[i].locality.isPresent(localityKeyValue.first) &&
-		    workers[i].locality.get(localityKeyValue.first) == localityKeyValue.second) {
-			localityAddresses.insert(AddressExclusion(workers[i].address.ip, workers[i].address.port));
+	for (auto& server : server_interfaces) {
+		auto locality_value = server.second.locality.get(locality_key_value.first);
+		if (!locality_value.present()) {
+			continue;
+		}
+
+		if (locality_value.get() != locality_key_value.second) {
+			continue;
+		}
+
+		auto primary_address = server.second.address();
+		locality_addresses.insert(AddressExclusion(primary_address.ip, primary_address.port));
+		if (server.second.secondaryAddress().present()) {
+			auto secondary_address = server.second.secondaryAddress().get();
+			locality_addresses.insert(AddressExclusion(secondary_address.ip, secondary_address.port));
 		}
 	}
 
-	return localityAddresses;
+	return locality_addresses;
+}
+
+// Returns the list of IPAddresses of the workers that match the given locality.
+// Example: locality="locality_dcid:primary" returns all the ip addresses of the workers in the primary dc.
+std::set<AddressExclusion> getAddressesByLocality(const std::vector<ProcessData>& workers,
+                                                  const std::string& locality) {
+	std::pair<std::string, std::string> locality_key_value = decodeLocality(locality);
+	std::set<AddressExclusion> locality_addresses;
+
+	for (int i = 0; i < workers.size(); i++) {
+		auto locality_value = workers[i].locality.get(locality_key_value.first);
+		if (!locality_value.present()) {
+			continue;
+		}
+
+		if (locality_value.get() != locality_key_value.second) {
+			continue;
+		}
+
+		locality_addresses.insert(AddressExclusion(workers[i].address.ip, workers[i].address.port));
+	}
+
+	return locality_addresses;
 }
 
 ACTOR Future<Void> printHealthyZone(Database cx) {
@@ -2142,6 +2287,7 @@ ACTOR Future<int> setDDMode(Database cx, int mode) {
 		try {
 			tr.setOption(FDBTransactionOptions::LOCK_AWARE);
 			tr.setOption(FDBTransactionOptions::ACCESS_SYSTEM_KEYS);
+			tr.setOption(FDBTransactionOptions::PRIORITY_SYSTEM_IMMEDIATE);
 			Optional<Value> old = wait(tr.get(dataDistributionModeKey));
 			if (oldMode < 0) {
 				oldMode = 1;
@@ -2160,6 +2306,8 @@ ACTOR Future<int> setDDMode(Database cx, int mode) {
 			tr.set(dataDistributionModeKey, wr.toValue());
 			if (mode) {
 				// set DDMode to 1 will enable all disabled parts, for instance the SS failure monitors.
+				// set DDMode to 2 is a security mode which disables data moves but allows auditStorage part
+				// DDMode=2 is set when shard location metadata inconsistency is detected
 				Optional<Value> currentHealthyZoneValue = wait(tr.get(healthyZoneKey));
 				if (currentHealthyZoneValue.present() &&
 				    decodeHealthyZoneValue(currentHealthyZoneValue.get()).first == ignoreSSFailuresZoneString) {
@@ -2582,22 +2730,580 @@ ACTOR Future<Void> forceRecovery(Reference<IClusterConnectionRecord> clusterFile
 ACTOR Future<UID> auditStorage(Reference<IClusterConnectionRecord> clusterFile,
                                KeyRange range,
                                AuditType type,
-                               bool async) {
+                               KeyValueStoreType engineType,
+                               double timeoutSeconds) {
 	state Reference<AsyncVar<Optional<ClusterInterface>>> clusterInterface(new AsyncVar<Optional<ClusterInterface>>);
 	state Future<Void> leaderMon = monitorLeader<ClusterInterface>(clusterFile, clusterInterface);
-	TraceEvent(SevDebug, "ManagementAPIAuditStorageBegin");
-
-	loop {
+	TraceEvent(SevVerbose, "ManagementAPIAuditStorageTrigger").detail("AuditType", type).detail("Range", range);
+	state UID auditId;
+	try {
 		while (!clusterInterface->get().present()) {
 			wait(clusterInterface->onChange());
 		}
-
-		TriggerAuditRequest req(type, range);
-		req.async = async;
-		UID auditId = wait(clusterInterface->get().get().triggerAudit.getReply(req));
-		TraceEvent(SevDebug, "ManagementAPIAuditStorageEnd").detail("AuditID", auditId);
-		return auditId;
+		TraceEvent(SevVerbose, "ManagementAPIAuditStorageBegin").detail("AuditType", type).detail("Range", range);
+		TriggerAuditRequest req(type, range, engineType);
+		UID auditId_ = wait(timeoutError(clusterInterface->get().get().triggerAudit.getReply(req), timeoutSeconds));
+		auditId = auditId_;
+		TraceEvent(SevVerbose, "ManagementAPIAuditStorageEnd")
+		    .detail("AuditType", type)
+		    .detail("Range", range)
+		    .detail("AuditID", auditId);
+	} catch (Error& e) {
+		TraceEvent(SevInfo, "ManagementAPIAuditStorageError")
+		    .errorUnsuppressed(e)
+		    .detail("AuditType", type)
+		    .detail("Range", range)
+		    .detail("AuditID", auditId);
+		throw e;
 	}
+
+	return auditId;
+}
+
+ACTOR Future<UID> cancelAuditStorage(Reference<IClusterConnectionRecord> clusterFile,
+                                     AuditType type,
+                                     UID auditId,
+                                     double timeoutSeconds) {
+	state Reference<AsyncVar<Optional<ClusterInterface>>> clusterInterface(new AsyncVar<Optional<ClusterInterface>>);
+	state Future<Void> leaderMon = monitorLeader<ClusterInterface>(clusterFile, clusterInterface);
+	TraceEvent(SevVerbose, "ManagementAPICancelAuditStorageTrigger")
+	    .detail("AuditType", type)
+	    .detail("AuditId", auditId);
+	try {
+		while (!clusterInterface->get().present()) {
+			wait(clusterInterface->onChange());
+		}
+		TraceEvent(SevVerbose, "ManagementAPICancelAuditStorageBegin")
+		    .detail("AuditType", type)
+		    .detail("AuditId", auditId);
+		TriggerAuditRequest req(type, auditId);
+		UID auditId_ = wait(timeoutError(clusterInterface->get().get().triggerAudit.getReply(req), timeoutSeconds));
+		ASSERT(auditId_ == auditId);
+		TraceEvent(SevVerbose, "ManagementAPICancelAuditStorageEnd")
+		    .detail("AuditType", type)
+		    .detail("AuditID", auditId);
+	} catch (Error& e) {
+		TraceEvent(SevInfo, "ManagementAPICancelAuditStorageError")
+		    .errorUnsuppressed(e)
+		    .detail("AuditType", type)
+		    .detail("AuditID", auditId);
+		throw e;
+	}
+
+	return auditId;
+}
+
+ACTOR Future<int> setBulkLoadMode(Database cx, int mode) {
+	state Transaction tr(cx);
+	state BinaryWriter wr(Unversioned());
+	wr << mode;
+	loop {
+		try {
+			tr.setOption(FDBTransactionOptions::LOCK_AWARE);
+			tr.setOption(FDBTransactionOptions::ACCESS_SYSTEM_KEYS);
+			tr.setOption(FDBTransactionOptions::PRIORITY_SYSTEM_IMMEDIATE);
+			state int oldMode = 0;
+			Optional<Value> oldModeValue = wait(tr.get(bulkLoadModeKey));
+			if (oldModeValue.present()) {
+				BinaryReader rd(oldModeValue.get(), Unversioned());
+				rd >> oldMode;
+			}
+			if (oldMode != mode) {
+				BinaryWriter wrMyOwner(Unversioned());
+				wrMyOwner << dataDistributionModeLock;
+				tr.set(moveKeysLockOwnerKey, wrMyOwner.toValue());
+				BinaryWriter wrLastWrite(Unversioned());
+				wrLastWrite << deterministicRandom()->randomUniqueID(); // triger DD restarts
+				tr.set(moveKeysLockWriteKey, wrLastWrite.toValue());
+				tr.set(bulkLoadModeKey, wr.toValue());
+				wait(tr.commit());
+				TraceEvent("DDBulkLoadModeKeyChanged").detail("NewMode", mode).detail("OldMode", oldMode);
+			}
+			return oldMode;
+		} catch (Error& e) {
+			wait(tr.onError(e));
+		}
+	}
+}
+
+ACTOR Future<std::vector<BulkLoadState>> getValidBulkLoadTasksWithinRange(
+    Database cx,
+    KeyRange rangeToRead,
+    size_t limit = 10,
+    Optional<BulkLoadPhase> phase = Optional<BulkLoadPhase>()) {
+	state Transaction tr(cx);
+	state Key readBegin = rangeToRead.begin;
+	state Key readEnd = rangeToRead.end;
+	state RangeResult rangeResult;
+	state std::vector<BulkLoadState> res;
+	while (readBegin < readEnd) {
+		state int retryCount = 0;
+		loop {
+			try {
+				rangeResult.clear();
+				tr.setOption(FDBTransactionOptions::READ_SYSTEM_KEYS);
+				tr.setOption(FDBTransactionOptions::LOCK_AWARE);
+				wait(store(rangeResult,
+				           krmGetRanges(&tr,
+				                        bulkLoadPrefix,
+				                        KeyRangeRef(readBegin, readEnd),
+				                        CLIENT_KNOBS->KRM_GET_RANGE_LIMIT,
+				                        CLIENT_KNOBS->KRM_GET_RANGE_LIMIT_BYTES)));
+				break;
+			} catch (Error& e) {
+				if (retryCount > 30) {
+					throw timed_out();
+				}
+				wait(tr.onError(e));
+				retryCount++;
+			}
+		}
+		for (int i = 0; i < rangeResult.size() - 1; ++i) {
+			if (rangeResult[i].value.empty()) {
+				continue;
+			}
+			BulkLoadState bulkLoadState = decodeBulkLoadState(rangeResult[i].value);
+			KeyRange range = Standalone(KeyRangeRef(rangeResult[i].key, rangeResult[i + 1].key));
+			if (range != bulkLoadState.getRange()) {
+				ASSERT(bulkLoadState.getRange().contains(range));
+				continue;
+			}
+			if (!phase.present() || phase.get() == bulkLoadState.phase) {
+				res.push_back(bulkLoadState);
+			}
+			if (res.size() >= limit) {
+				return res;
+			}
+		}
+		readBegin = rangeResult.back().key;
+	}
+
+	return res;
+}
+
+// Submit bulkload task and overwrite any existing task and lock range
+ACTOR Future<Void> submitBulkLoadTask(Database cx, BulkLoadState bulkLoadTask) {
+	state Transaction tr(cx);
+	loop {
+		try {
+			tr.setOption(FDBTransactionOptions::LOCK_AWARE);
+			tr.setOption(FDBTransactionOptions::ACCESS_SYSTEM_KEYS);
+			if (bulkLoadTask.phase != BulkLoadPhase::Submitted) {
+				TraceEvent(g_network->isSimulated() ? SevError : SevWarnAlways, "SubmitBulkLoadTaskError")
+				    .setMaxEventLength(-1)
+				    .setMaxFieldLength(-1)
+				    .detail("Reason", "WrongPhase")
+				    .detail("Task", bulkLoadTask.toString());
+				throw bulkload_task_failed();
+			}
+			if (!normalKeys.contains(bulkLoadTask.getRange())) {
+				TraceEvent(g_network->isSimulated() ? SevError : SevWarnAlways, "SubmitBulkLoadTaskError")
+				    .setMaxEventLength(-1)
+				    .setMaxFieldLength(-1)
+				    .detail("Reason", "RangeOutOfScope")
+				    .detail("Task", bulkLoadTask.toString());
+				throw bulkload_task_failed();
+			}
+			wait(turnOffUserWriteTrafficForBulkLoad(&tr, bulkLoadTask.getRange()));
+			bulkLoadTask.submitTime = now();
+			wait(krmSetRange(&tr, bulkLoadPrefix, bulkLoadTask.getRange(), bulkLoadStateValue(bulkLoadTask)));
+			wait(tr.commit());
+			break;
+		} catch (Error& e) {
+			wait(tr.onError(e));
+		}
+	}
+	return Void();
+}
+
+// Get bulk load task metadata with range and taskId and phase selector
+// Throw error if the task is outdated or the task is not in any input phase at the tr read version
+ACTOR Future<BulkLoadState> getBulkLoadTask(Transaction* tr,
+                                            KeyRange range,
+                                            UID taskId,
+                                            std::vector<BulkLoadPhase> phases) {
+	state BulkLoadState bulkLoadState;
+	tr->setOption(FDBTransactionOptions::READ_SYSTEM_KEYS);
+	RangeResult result = wait(krmGetRanges(tr, bulkLoadPrefix, range));
+	if (result.size() > 2) {
+		throw bulkload_task_outdated();
+	} else if (result[0].value.empty()) {
+		throw bulkload_task_outdated();
+	}
+	ASSERT(result.size() == 2);
+	bulkLoadState = decodeBulkLoadState(result[0].value);
+	ASSERT(bulkLoadState.getTaskId().isValid());
+	if (taskId != bulkLoadState.getTaskId()) {
+		// This task is overwritten by a newer task
+		throw bulkload_task_outdated();
+	}
+	KeyRange currentRange = KeyRangeRef(result[0].key, result[1].key);
+	if (bulkLoadState.getRange() != currentRange) {
+		// This task is partially overwritten by a newer task
+		ASSERT(bulkLoadState.getRange().contains(currentRange));
+		throw bulkload_task_outdated();
+	}
+	if (phases.size() > 0 && !bulkLoadState.onAnyPhase(phases)) {
+		throw bulkload_task_outdated();
+	}
+	return bulkLoadState;
+}
+
+// Update bulkload task to acknowledge state and unlock the range
+ACTOR Future<Void> acknowledgeBulkLoadTask(Database cx, KeyRange range, UID taskId) {
+	state Transaction tr(cx);
+	loop {
+		state BulkLoadState bulkLoadState;
+		try {
+			tr.setOption(FDBTransactionOptions::LOCK_AWARE);
+			tr.setOption(FDBTransactionOptions::ACCESS_SYSTEM_KEYS);
+			wait(store(bulkLoadState,
+			           getBulkLoadTask(&tr, range, taskId, { BulkLoadPhase::Complete, BulkLoadPhase::Acknowledged })));
+			bulkLoadState.phase = BulkLoadPhase::Acknowledged;
+			ASSERT(range == bulkLoadState.getRange() && taskId == bulkLoadState.getTaskId());
+			ASSERT(normalKeys.contains(range));
+			wait(krmSetRange(&tr, bulkLoadPrefix, bulkLoadState.getRange(), bulkLoadStateValue(bulkLoadState)));
+			wait(turnOnUserWriteTrafficForBulkLoad(&tr, bulkLoadState.getRange()));
+			wait(tr.commit());
+			break;
+		} catch (Error& e) {
+			wait(tr.onError(e));
+		}
+	}
+	return Void();
+}
+
+// Persist a new owner if input uniqueId is not existing; Update description if input uniqueId exists
+ACTOR Future<Void> registerRangeLockOwner(Database cx, std::string uniqueId, std::string description) {
+	if (uniqueId.empty() || description.empty()) {
+		throw range_lock_failed();
+	}
+	state Transaction tr(cx);
+	loop {
+		try {
+			tr.setOption(FDBTransactionOptions::LOCK_AWARE);
+			tr.setOption(FDBTransactionOptions::ACCESS_SYSTEM_KEYS);
+			Optional<Value> res = wait(tr.get(rangeLockOwnerKeyFor(uniqueId)));
+			RangeLockOwner owner;
+			if (res.present()) {
+				owner = decodeRangeLockOwner(res.get());
+				ASSERT(owner.isValid());
+				if (owner.getDescription() == description) {
+					return Void();
+				}
+				owner.setDescription(description);
+			} else {
+				owner = RangeLockOwner(uniqueId, description);
+			}
+			tr.set(rangeLockOwnerKeyFor(uniqueId), rangeLockOwnerValue(owner));
+			wait(tr.commit());
+			return Void();
+		} catch (Error& e) {
+			wait(tr.onError(e));
+		}
+	}
+}
+
+ACTOR Future<Void> removeRangeLockOwner(Database cx, std::string uniqueId) {
+	if (uniqueId.empty()) {
+		throw range_lock_failed();
+	}
+	state Transaction tr(cx);
+	loop {
+		try {
+			tr.setOption(FDBTransactionOptions::LOCK_AWARE);
+			tr.setOption(FDBTransactionOptions::ACCESS_SYSTEM_KEYS);
+			Optional<Value> res = wait(tr.get(rangeLockOwnerKeyFor(uniqueId)));
+			if (!res.present()) {
+				return Void();
+			}
+			RangeLockOwner owner = decodeRangeLockOwner(res.get());
+			ASSERT(owner.isValid());
+			tr.clear(rangeLockOwnerKeyFor(uniqueId));
+			wait(tr.commit());
+			return Void();
+		} catch (Error& e) {
+			wait(tr.onError(e));
+		}
+	}
+}
+
+ACTOR Future<Optional<RangeLockOwner>> getRangeLockOwner(Database cx, std::string uniqueId) {
+	state Transaction tr(cx);
+	loop {
+		try {
+			tr.setOption(FDBTransactionOptions::READ_LOCK_AWARE);
+			tr.setOption(FDBTransactionOptions::READ_SYSTEM_KEYS);
+			Optional<Value> res = wait(tr.get(rangeLockOwnerKeyFor(uniqueId)));
+			if (!res.present()) {
+				return Optional<RangeLockOwner>();
+			}
+			RangeLockOwner owner = decodeRangeLockOwner(res.get());
+			ASSERT(owner.isValid());
+			return owner;
+		} catch (Error& e) {
+			wait(tr.onError(e));
+		}
+	}
+}
+
+ACTOR Future<std::vector<RangeLockOwner>> getAllRangeLockOwners(Database cx) {
+	state std::vector<RangeLockOwner> res;
+	state Key beginKey = rangeLockOwnerKeys.begin;
+	state Key endKey = rangeLockOwnerKeys.end;
+	state Transaction tr(cx);
+	loop {
+		state KeyRange rangeToRead = Standalone(KeyRangeRef(beginKey, endKey));
+		try {
+			tr.setOption(FDBTransactionOptions::READ_LOCK_AWARE);
+			tr.setOption(FDBTransactionOptions::READ_SYSTEM_KEYS);
+			RangeResult result = wait(tr.getRange(rangeToRead, CLIENT_KNOBS->TOO_MANY));
+			for (const auto& kv : result) {
+				RangeLockOwner owner = decodeRangeLockOwner(kv.value);
+				ASSERT(owner.isValid());
+				RangeLockOwnerName uidFromKey = decodeRangeLockOwnerKey(kv.key);
+				ASSERT(owner.getUniqueId() == uidFromKey);
+				res.push_back(owner);
+			}
+			if (result[result.size() - 1].key == endKey) {
+				return res;
+			} else {
+				beginKey = result[result.size() - 1].key;
+				tr.reset();
+			}
+		} catch (Error& e) {
+			wait(tr.onError(e));
+		}
+	}
+}
+
+// Not transactional
+ACTOR Future<std::vector<KeyRange>> getReadLockOnRange(Database cx, KeyRange range) {
+	if (range.end > normalKeys.end) {
+		throw range_lock_failed();
+	}
+	state std::vector<KeyRange> lockedRanges;
+	state Key beginKey = range.begin;
+	state Key endKey = range.end;
+	state Transaction tr(cx);
+	loop {
+		state KeyRange rangeToRead = Standalone(KeyRangeRef(beginKey, endKey));
+		try {
+			tr.setOption(FDBTransactionOptions::READ_LOCK_AWARE);
+			tr.setOption(FDBTransactionOptions::READ_SYSTEM_KEYS);
+			RangeResult result = wait(krmGetRanges(&tr, rangeLockPrefix, rangeToRead));
+			for (int i = 0; i < result.size() - 1; i++) {
+				if (result[i].value.empty()) {
+					continue;
+				}
+				RangeLockStateSet rangeLockStateSet = decodeRangeLockStateSet(result[i].value);
+				ASSERT(rangeLockStateSet.isValid());
+				if (rangeLockStateSet.isLockedFor(RangeLockType::ReadLockOnRange)) {
+					lockedRanges.push_back(Standalone(KeyRangeRef(result[i].key, result[i + 1].key)));
+				}
+			}
+			if (result[result.size() - 1].key == range.end) {
+				break;
+			} else {
+				beginKey = result[result.size() - 1].key;
+				tr.reset();
+			}
+		} catch (Error& e) {
+			wait(tr.onError(e));
+		}
+	}
+	return lockedRanges;
+}
+
+// Transactional
+ACTOR Future<Void> turnOffUserWriteTrafficForBulkLoad(Transaction* tr, KeyRange range) {
+	if (range.end > normalKeys.end) {
+		throw bulkload_task_failed();
+	}
+	tr->addWriteConflictRange(normalKeys);
+	// Validate
+	state Key beginKey = range.begin;
+	state Key endKey = range.end;
+	state KeyRange rangeToRead;
+	while (beginKey < endKey) {
+		rangeToRead = KeyRangeRef(beginKey, endKey);
+		RangeResult res = wait(krmGetRanges(tr, rangeLockPrefix, rangeToRead));
+		for (int i = 0; i < res.size() - 1; i++) {
+			if (res[i].value.empty()) {
+				continue;
+			}
+			RangeLockStateSet rangeLockStateSet = decodeRangeLockStateSet(res[i].value);
+			ASSERT(rangeLockStateSet.isValid());
+			for (const auto& [lockId, lock] : rangeLockStateSet.getLocks()) {
+				if (lock == RangeLockState(RangeLockType::ReadLockOnRange, rangeLockNameForBulkLoad)) {
+					continue;
+				}
+				// TODO(BulkLoad): should cancel this task
+				TraceEvent(SevError, "DDBulkLoadSeeUnexpectedRangeLock")
+				    .detail("Lock", lock.toString())
+				    .detail("Range", rangeToRead);
+				throw not_implemented();
+			}
+		}
+		beginKey = res[res.size() - 1].key;
+	}
+	// Lock range exclusively by overwiting the range
+	RangeLockStateSet rangeLockStateSet;
+	rangeLockStateSet.insertIfNotExist(RangeLockState(RangeLockType::ReadLockOnRange, rangeLockNameForBulkLoad));
+	wait(krmSetRangeCoalescing(tr, rangeLockPrefix, range, normalKeys, rangeLockStateSetValue(rangeLockStateSet)));
+	TraceEvent(SevInfo, "DDBulkLoadTurnOffWriteTraffic").detail("Range", range);
+	return Void();
+}
+
+// Transactional
+ACTOR Future<Void> turnOnUserWriteTrafficForBulkLoad(Transaction* tr, KeyRange range) {
+	if (range.end > normalKeys.end) {
+		throw bulkload_task_failed();
+	}
+	// Validate
+	state Key beginKey = range.begin;
+	state Key endKey = range.end;
+	state KeyRange rangeToRead;
+	while (beginKey < endKey) {
+		rangeToRead = KeyRangeRef(beginKey, endKey);
+		RangeResult res = wait(krmGetRanges(tr, rangeLockPrefix, rangeToRead));
+		for (int i = 0; i < res.size() - 1; i++) {
+			if (res[i].value.empty()) {
+				continue;
+			}
+			RangeLockStateSet rangeLockStateSet = decodeRangeLockStateSet(res[i].value);
+			ASSERT(rangeLockStateSet.isValid());
+			for (const auto& [lockId, lock] : rangeLockStateSet.getLocks()) {
+				if (lock != RangeLockState(RangeLockType::ReadLockOnRange, rangeLockNameForBulkLoad)) {
+					TraceEvent(SevError, "DDBulkLoadSeeUnexpectedRangeLock")
+					    .detail("Lock", lock.toString())
+					    .detail("Range", rangeToRead);
+					ASSERT_WE_THINK(false);
+					// TODO(BulkLoad): make lock exclusive to other applications
+					// This is unexpected because others should see the exclusive lock of bulk load
+					// and give up locking the range
+				}
+			}
+		}
+		beginKey = res[res.size() - 1].key;
+	}
+	// Unlock exclusively by overwiting the range
+	// TODO(BulkLoad): use exclusive write lock for bulk load in the future
+	wait(krmSetRangeCoalescing(tr, rangeLockPrefix, range, normalKeys, StringRef()));
+	TraceEvent(SevInfo, "DDBulkLoadTurnOnWriteTraffic").detail("Range", range);
+	return Void();
+}
+
+// Not transactional
+ACTOR Future<Void> takeReadLockOnRange(Database cx, KeyRange range, std::string ownerUniqueID) {
+	if (range.end > normalKeys.end) {
+		throw range_lock_failed();
+	}
+	state Key beginKey = range.begin;
+	state Key endKey = range.end;
+	state Transaction tr(cx);
+	loop {
+		state KeyRange rangeToLock = Standalone(KeyRangeRef(beginKey, endKey));
+		try {
+			tr.setOption(FDBTransactionOptions::LOCK_AWARE);
+			tr.setOption(FDBTransactionOptions::ACCESS_SYSTEM_KEYS);
+			tr.addWriteConflictRange(normalKeys);
+
+			// Step 1: Check owner
+			state Optional<Value> ownerValue = wait(tr.get(rangeLockOwnerKeyFor(ownerUniqueID)));
+			if (!ownerValue.present()) {
+				throw range_lock_failed();
+			}
+			state RangeLockOwner owner = decodeRangeLockOwner(ownerValue.get());
+			ASSERT(owner.isValid());
+
+			// Step 2: Get all locks on the range and add the new lock
+			state RangeResult result = wait(krmGetRanges(&tr, rangeLockPrefix, rangeToLock));
+			state int i = 0;
+			for (; i < result.size() - 1; i++) {
+				KeyRange lockRange = Standalone(KeyRangeRef(result[i].key, result[i + 1].key));
+				RangeLockStateSet rangeLockStateSet;
+				if (!result[i].value.empty()) {
+					rangeLockStateSet = decodeRangeLockStateSet(result[i].value);
+				}
+				rangeLockStateSet.insertIfNotExist(RangeLockState(RangeLockType::ReadLockOnRange, owner.getUniqueId()));
+				ASSERT(rangeLockStateSet.isValid());
+				wait(krmSetRangeCoalescing(
+				    &tr, rangeLockPrefix, lockRange, normalKeys, rangeLockStateSetValue(rangeLockStateSet)));
+				wait(tr.commit());
+				tr.reset();
+				beginKey = result[i + 1].key;
+				break;
+			}
+
+			// Step 3: Exit if all ranges have been locked
+			if (beginKey == range.end) {
+				break;
+			}
+
+			wait(delay(0.1));
+
+		} catch (Error& e) {
+			wait(tr.onError(e));
+		}
+	}
+	return Void();
+}
+
+// Not transactional
+ACTOR Future<Void> releaseReadLockOnRange(Database cx, KeyRange range, std::string ownerUniqueID) {
+	if (range.end > normalKeys.end) {
+		throw range_lock_failed();
+	}
+	state Key beginKey = range.begin;
+	state Key endKey = range.end;
+	state Transaction tr(cx);
+	loop {
+		state KeyRange rangeToLock = Standalone(KeyRangeRef(beginKey, endKey));
+		try {
+			tr.setOption(FDBTransactionOptions::LOCK_AWARE);
+			tr.setOption(FDBTransactionOptions::ACCESS_SYSTEM_KEYS);
+
+			// Step 1: Check owner
+			state Optional<Value> ownerValue = wait(tr.get(rangeLockOwnerKeyFor(ownerUniqueID)));
+			if (!ownerValue.present()) {
+				throw range_lock_failed();
+			}
+			state RangeLockOwner owner = decodeRangeLockOwner(ownerValue.get());
+			ASSERT(owner.isValid());
+
+			// Step 2: Get all locks on the range and remove the lock
+			state RangeResult result = wait(krmGetRanges(&tr, rangeLockPrefix, rangeToLock));
+			state int i = 0;
+			for (; i < result.size() - 1; i++) {
+				KeyRange lockRange = Standalone(KeyRangeRef(result[i].key, result[i + 1].key));
+				if (result[i].value.empty()) {
+					beginKey = result[i + 1].key;
+					continue;
+				}
+				RangeLockStateSet rangeLockStateSet = decodeRangeLockStateSet(result[i].value);
+				rangeLockStateSet.remove(RangeLockState(RangeLockType::ReadLockOnRange, owner.getUniqueId()));
+				ASSERT(rangeLockStateSet.isValid());
+				wait(krmSetRangeCoalescing(
+				    &tr, rangeLockPrefix, lockRange, normalKeys, rangeLockStateSetValue(rangeLockStateSet)));
+				wait(tr.commit());
+				tr.reset();
+				beginKey = result[i + 1].key;
+				break;
+			}
+
+			// Step 3: Exit if all ranges have been unlocked
+			if (beginKey == range.end) {
+				break;
+			}
+
+			wait(delay(0.1));
+
+		} catch (Error& e) {
+			wait(tr.onError(e));
+		}
+	}
+	return Void();
 }
 
 ACTOR Future<Void> waitForPrimaryDC(Database cx, StringRef dcId) {

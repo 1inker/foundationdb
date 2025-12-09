@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -32,7 +32,7 @@ EncryptCipherMode encryptModeFromString(const std::string& modeStr) {
 	} else if (modeStr == "AES-256-CTR") {
 		return ENCRYPT_CIPHER_MODE_AES_256_CTR;
 	} else {
-		TraceEvent("EncryptModeFromString").log();
+		TraceEvent("EncryptModeFromString").detail("Mode", modeStr);
 		throw not_implemented();
 	}
 }

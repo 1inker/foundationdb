@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -92,7 +92,7 @@ std::map<std::tuple<LogEpoch, Version, int>, std::map<Tag, Version>> BackupProgr
 				auto prev = std::prev(current);
 				// Previous epoch is gone, consolidate the progress.
 				for (auto [tag, version] : prev->second) {
-					if (toCheck.count(tag) > 0) {
+					if (toCheck.contains(tag)) {
 						progressIt->second[tag] = std::max(version, progressIt->second[tag]);
 						toCheck.erase(tag);
 					}

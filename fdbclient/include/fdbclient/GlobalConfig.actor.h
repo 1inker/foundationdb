@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -163,7 +163,10 @@ private:
 	// of the global configuration keyspace.
 	void erase(KeyRangeRef range);
 
-	ACTOR static Future<Void> refresh(GlobalConfig* self, Version lastKnown);
+	// Updates local copy of global configuration by reading the entire key-range
+	// from storage (proxied through the GrvProxies). Returns the version of the
+	// refreshed data.
+	ACTOR static Future<Version> refresh(GlobalConfig* self, Version lastKnown, Version largestSeen);
 	ACTOR static Future<Void> updater(GlobalConfig* self, const ClientDBInfo* dbInfo);
 
 	DatabaseContext* cx;

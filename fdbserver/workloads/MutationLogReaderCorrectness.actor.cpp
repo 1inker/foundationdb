@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -60,7 +60,7 @@ struct MutationLogReaderCorrectnessWorkload : TestWorkload {
 
 		beginVersion = deterministicRandom()->randomInt64(
 		    0, std::numeric_limits<int32_t>::max()); // intentionally not max of int64
-		records = deterministicRandom()->randomInt(0, 1e6);
+		records = deterministicRandom()->randomInt(0, 500e3);
 		versionRange = deterministicRandom()->randomInt64(records, std::numeric_limits<Version>::max());
 		versionIncrement = versionRange / (records + 1);
 

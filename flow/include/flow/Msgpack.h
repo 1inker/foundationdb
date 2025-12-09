@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -92,7 +92,7 @@ inline void serialize_value(const T& val, MsgpackBuffer& buf, uint8_t msgpack_ty
 inline void serialize_string(const uint8_t* c, int length, MsgpackBuffer& buf) {
 	if (length <= 31) {
 		// A size 0 string is ok. We still need to write a byte
-		// identifiying the item as a string, but can set the size to 0.
+		// identifying the item as a string, but can set the size to 0.
 		buf.write_byte(static_cast<uint8_t>(length) | 0b10100000);
 	} else if (length <= 255) {
 		buf.write_byte(0xd9);

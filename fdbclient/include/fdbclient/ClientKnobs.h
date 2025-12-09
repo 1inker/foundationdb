@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -26,10 +26,10 @@
 #include "flow/Knobs.h"
 #include "flow/flow.h"
 
-FDB_DECLARE_BOOLEAN_PARAM(Randomize);
-FDB_DECLARE_BOOLEAN_PARAM(IsSimulated);
+FDB_BOOLEAN_PARAM(Randomize);
+FDB_BOOLEAN_PARAM(IsSimulated);
 
-class ClientKnobs : public KnobsImpl<ClientKnobs> {
+class SWIFT_CXX_IMMORTAL_SINGLETON_TYPE ClientKnobs : public KnobsImpl<ClientKnobs> {
 public:
 	int TOO_MANY; // FIXME: this should really be split up so we can control these more specifically
 
@@ -80,6 +80,9 @@ public:
 	int64_t CHANGE_FEED_STREAM_MIN_BYTES;
 	double CHANGE_FEED_START_INTERVAL;
 	bool CHANGE_FEED_COALESCE_LOCATIONS;
+	int64_t CHANGE_FEED_CACHE_FLUSH_BYTES;
+	double CHANGE_FEED_CACHE_EXPIRE_TIME;
+	int64_t CHANGE_FEED_CACHE_LIMIT_BYTES;
 
 	int MAX_BATCH_SIZE;
 	double GRV_BATCH_TIMEOUT;
@@ -172,11 +175,13 @@ public:
 	double COPY_LOG_TASK_DURATION_NANOS;
 	int BACKUP_TASKS_PER_AGENT;
 	int BACKUP_POLL_PROGRESS_SECONDS;
-	int64_t VERSIONS_PER_SECOND; // Copy of SERVER_KNOBS, as we can't link with it
+	int64_t VERSIONS_PER_SECOND; // Copy of SERVER_KNOBS, as we can't link with it.
+	int64_t MAX_WRITE_TRANSACTION_LIFE_VERSIONS; // Copy of SERVER_KNOBS, as we can't link with it.
 	int SIM_BACKUP_TASKS_PER_AGENT;
 	int BACKUP_RANGEFILE_BLOCK_SIZE;
 	int BACKUP_LOGFILE_BLOCK_SIZE;
 	int BACKUP_DISPATCH_ADDTASK_SIZE;
+	bool BACKUP_ALLOW_DRYRUN;
 	int RESTORE_DISPATCH_ADDTASK_SIZE;
 	int RESTORE_DISPATCH_BATCH_SIZE;
 	int RESTORE_WRITE_TX_SIZE;
@@ -190,6 +195,11 @@ public:
 	double BACKUP_STATUS_JITTER;
 	double MIN_CLEANUP_SECONDS;
 	int64_t FASTRESTORE_ATOMICOP_WEIGHT; // workload amplication factor for atomic op
+	int RESTORE_RANGES_READ_BATCH;
+	int BLOB_GRANULE_RESTORE_CHECK_INTERVAL;
+	bool BACKUP_CONTAINER_LOCAL_ALLOW_RELATIVE_PATH;
+	bool ENABLE_REPLICA_CONSISTENCY_CHECK_ON_BACKUP_READS;
+	int CONSISTENCY_CHECK_REQUIRED_REPLICAS;
 
 	// Configuration
 	int32_t DEFAULT_AUTO_COMMIT_PROXIES;
@@ -244,9 +254,22 @@ public:
 	double BLOBSTORE_STATS_LOGGING_INTERVAL;
 	double BLOBSTORE_LATENCY_LOGGING_INTERVAL;
 	double BLOBSTORE_LATENCY_LOGGING_ACCURACY;
+	int BLOBSTORE_MAX_DELAY_RETRYABLE_ERROR;
+	int BLOBSTORE_MAX_DELAY_CONNECTION_FAILED;
 
-	int CONSISTENCY_CHECK_RATE_LIMIT_MAX;
-	int CONSISTENCY_CHECK_ONE_ROUND_TARGET_COMPLETION_TIME;
+	int CONSISTENCY_CHECK_RATE_LIMIT_MAX; // Available in both normal and urgent mode
+	int CONSISTENCY_CHECK_ONE_ROUND_TARGET_COMPLETION_TIME; // Available in normal mode
+	int CONSISTENCY_CHECK_URGENT_NEXT_WAIT_TIME; // Available in urgent mode
+	int CONSISTENCY_CHECK_URGENT_BATCH_SHARD_COUNT; // Available in urgent mode
+	int CONSISTENCY_CHECK_URGENT_RETRY_DEPTH_MAX; // Available in urgent mode
+	std::string CONSISTENCY_CHECK_URGENT_RANGE_BEGIN_0; // Available in urgent mode
+	std::string CONSISTENCY_CHECK_URGENT_RANGE_END_0; // Available in urgent mode
+	std::string CONSISTENCY_CHECK_URGENT_RANGE_BEGIN_1; // Available in urgent mode
+	std::string CONSISTENCY_CHECK_URGENT_RANGE_END_1; // Available in urgent mode
+	std::string CONSISTENCY_CHECK_URGENT_RANGE_BEGIN_2;
+	std::string CONSISTENCY_CHECK_URGENT_RANGE_END_2;
+	std::string CONSISTENCY_CHECK_URGENT_RANGE_BEGIN_3;
+	std::string CONSISTENCY_CHECK_URGENT_RANGE_END_3;
 
 	// fdbcli
 	int CLI_CONNECT_PARALLELISM;
@@ -270,6 +293,10 @@ public:
 	// Maximum duration that a transaction can be tag throttled by proxy before being rejected
 	double PROXY_MAX_TAG_THROTTLE_DURATION;
 
+	// Enable to automatically retry transactions in the presence of transaction_lock_rejection error
+	// Set to false only for the rangeLocking simulation test
+	bool TRANSACTION_LOCK_REJECTION_RETRIABLE;
+
 	// busyness reporting
 	double BUSYNESS_SPIKE_START_THRESHOLD;
 	double BUSYNESS_SPIKE_SATURATED_THRESHOLD;
@@ -278,6 +305,8 @@ public:
 	int BG_MAX_GRANULE_PARALLELISM;
 	int BG_TOO_MANY_GRANULES;
 	int64_t BLOB_METADATA_REFRESH_INTERVAL;
+	bool DETERMINISTIC_BLOB_METADATA;
+	bool ENABLE_BLOB_GRANULE_FILE_LOGICAL_SIZE;
 
 	// The coordinator key/value in storage server might be inconsistent to the value stored in the cluster file.
 	// This might happen when a recovery is happening together with a cluster controller coordinator key change.
@@ -304,14 +333,21 @@ public:
 	// key_not_found errors for. If TenantInfo::INVALID_TENANT is contained within the list then no tenants will be
 	// dropped. This Knob should ONLY be used in simulation for testing purposes
 	std::string SIMULATION_EKP_TENANT_IDS_TO_DROP;
-	bool ENABLE_CONFIGURABLE_ENCRYPTION;
 	int ENCRYPT_HEADER_FLAGS_VERSION;
 	int ENCRYPT_HEADER_AES_CTR_NO_AUTH_VERSION;
 	int ENCRYPT_HEADER_AES_CTR_AES_CMAC_AUTH_VERSION;
 	int ENCRYPT_HEADER_AES_CTR_HMAC_SHA_AUTH_VERSION;
+	double ENCRYPT_GET_CIPHER_KEY_LONG_REQUEST_THRESHOLD;
 
 	// REST KMS configurations
 	bool REST_KMS_ALLOW_NOT_SECURE_CONNECTION;
+	int SIM_KMS_VAULT_MAX_KEYS;
+
+	bool ENABLE_MUTATION_CHECKSUM;
+	// Enable to start accumulative checksum population and validation
+	bool ENABLE_ACCUMULATIVE_CHECKSUM;
+	// Enable to logging verbose trace events related to the accumulative checksum
+	bool ENABLE_ACCUMULATIVE_CHECKSUM_LOGGING;
 
 	ClientKnobs(Randomize randomize);
 	void initialize(Randomize randomize);

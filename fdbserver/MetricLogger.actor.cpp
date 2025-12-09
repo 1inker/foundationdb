@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -35,7 +35,7 @@
 #include "flow/TDMetric.actor.h"
 #include "fdbclient/DatabaseContext.h"
 #include "fdbclient/ReadYourWrites.h"
-#include "fdbclient/KeyBackedTypes.h"
+#include "fdbclient/KeyBackedTypes.actor.h"
 #include "fdbserver/MetricLogger.actor.h"
 #include "fdbserver/MetricClient.h"
 #include "flow/flow.h"
@@ -443,7 +443,7 @@ ACTOR Future<Void> startMetricsSimulationServer(MetricsDataModel model) {
 		int size = wait(serverSocket->receive(packet, packet + IUDPSocket::MAX_PACKET_SIZE));
 		auto message = packetString.substr(0, size);
 
-		// Let's just focus on statsd for now. For statsd, the message is expected to be seperated by newlines. We need
+		// Let's just focus on statsd for now. For statsd, the message is expected to be separated by newlines. We need
 		// to break each statsd metric and verify them individually.
 		if (model == MetricsDataModel::STATSD) {
 			std::string statsd_message = message.toString();

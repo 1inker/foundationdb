@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,9 +22,12 @@
 #define FDBCLIENT_FDBTYPES_H
 
 #include <algorithm>
+#include <array>
 #include <cinttypes>
+#include <regex>
 #include <set>
 #include <string>
+#include <variant>
 #include <vector>
 #include <unordered_set>
 #include <boost/functional/hash.hpp>
@@ -33,6 +36,7 @@
 #include "flow/ProtocolVersion.h"
 #include "flow/flow.h"
 #include "fdbclient/Status.h"
+#include "fdbrpc/Locality.h"
 
 typedef int64_t Version;
 typedef uint64_t LogEpoch;
@@ -43,11 +47,16 @@ typedef int64_t Generation;
 typedef UID SpanID;
 typedef uint64_t CoordinatorsHash;
 
+// invalidKey is intentionally far beyond the system space.  It is meant to be used as a safe initial value for a key
+// before it is set to something meaningful to avoid mistakes where a default constructed key is written to instead of
+// the intended target.
+static const KeyRef invalidKey = "\xff\xff\xff\xff\xff\xff\xff\xff"_sr;
+
 enum {
 	tagLocalitySpecial = -1, // tag with this locality means it is invalidTag (id=0), txsTag (id=1), or cacheTag (id=2)
 	tagLocalityLogRouter = -2,
 	tagLocalityRemoteLog = -3, // tag created by log router for remote (aka. not in Primary DC) tLogs
-	tagLocalityUpgraded = -4, // tlogs with old log format
+	tagLocalityUpgraded = -4, // tlogs with old log format (no longer applicable)
 	tagLocalitySatellite = -5,
 	tagLocalityLogRouterMapped = -6, // The pseudo tag used by log routers to pop the real LogRouter tag (i.e., -2)
 	tagLocalityTxs = -7,
@@ -146,15 +155,8 @@ struct hash<Tag> {
 } // namespace std
 
 static const Tag invalidTag{ tagLocalitySpecial, 0 };
-static const Tag txsTag{ tagLocalitySpecial, 1 };
+static const Tag txsTag{ tagLocalitySpecial, 1 }; // obsolete now
 static const Tag cacheTag{ tagLocalitySpecial, 2 };
-
-const int MATCH_INDEX_ALL = 0;
-const int MATCH_INDEX_NONE = 1;
-const int MATCH_INDEX_MATCHED_ONLY = 2;
-const int MATCH_INDEX_UNMATCHED_ONLY = 3;
-
-enum { txsTagOld = -1, invalidTagOld = -100 };
 
 struct TagsAndMessage {
 	StringRef message;
@@ -164,7 +166,7 @@ struct TagsAndMessage {
 	TagsAndMessage(StringRef message, VectorRef<Tag> tags) : message(message), tags(tags) {}
 
 	// Loads tags and message from a serialized buffer. "rd" is checkpointed at
-	// its begining position to allow the caller to rewind if needed.
+	// its beginning position to allow the caller to rewind if needed.
 	// T can be ArenaReader or BinaryReader.
 	template <class T>
 	void loadFromArena(T* rd, uint32_t* messageVersionSub) {
@@ -209,6 +211,10 @@ inline std::string describe(const Tag item) {
 
 inline std::string describe(const int item) {
 	return format("%d", item);
+}
+
+inline std::string describe(const Version item) {
+	return format("%ld", item);
 }
 
 // Allows describeList to work on a vector of std::string
@@ -336,13 +342,16 @@ struct KeyRangeRef {
 	bool isCovered(std::vector<KeyRangeRef>& ranges) {
 		ASSERT(std::is_sorted(ranges.begin(), ranges.end(), KeyRangeRef::ArbitraryOrder()));
 		KeyRangeRef clone(begin, end);
-
 		for (auto r : ranges) {
 			if (clone.begin < r.begin)
 				return false; // uncovered gap between clone.begin and r.begin
 			if (clone.end <= r.end)
 				return true; // range is fully covered
-			if (clone.end > r.begin)
+			// If a range of ranges is totally at the left of clone,
+			// clone needs not update
+			// If a range of ranges is partially at the left of clone,
+			// clone = clone - the overlap
+			if (clone.end > r.end && r.end > clone.begin)
 				// {clone.begin, r.end} is covered. need to check coverage for {r.end, clone.end}
 				clone = KeyRangeRef(r.end, clone.end);
 		}
@@ -399,7 +408,7 @@ struct KeyRangeRef {
 		}
 	};
 
-	std::string toString() const { return "Begin:" + begin.printable() + "End:" + end.printable(); }
+	std::string toString() const { return "{ begin=" + begin.printable() + "  end=" + end.printable() + " }"; }
 };
 
 template <>
@@ -747,11 +756,62 @@ struct GetRangeLimits {
 
 struct RangeResultRef : VectorRef<KeyValueRef> {
 	constexpr static FileIdentifier file_identifier = 3985192;
-	bool more; // True if (but not necessarily only if) values remain in the *key* range requested (possibly beyond the
-	           // limits requested) False implies that no such values remain
-	Optional<KeyRef> readThrough; // Only present when 'more' is true. When present, this value represent the end (or
-	                              // beginning if reverse) of the range which was read to produce these results. This is
-	                              // guaranteed to be less than the requested range.
+
+	// True if the range may have more keys in it (possibly beyond the specified limits).
+	// 'more' can be true even if there are no keys left in the range, e.g. if a shard boundary is hit, it may or may
+	// not have more keys left, but 'more' will be set to true in that case.
+	// Additionally, 'getRangeStream()' always sets 'more' to true and uses the 'end_of_stream' error to indicate that a
+	// range is exhausted.
+	// If 'more' is false, the range is guaranteed to have been exhausted.
+	bool more;
+
+	// Only present when 'more' is true, for example, when the read reaches the shard boundary, 'readThrough' is set to
+	// the shard boundary and the client's next range read should start with the 'readThrough'.
+	// But 'more' is true does not necessarily guarantee 'readThrough' is present, for example, when the read reaches
+	// size limit, 'readThrough' might not be set, the next read should just start from the keyAfter of the current
+	// query result's last key.
+	// In both cases, please use the getter function 'getReadThrough()' instead, which represents the end (or beginning
+	// if reverse) of the range which was read.
+	Optional<KeyRef> readThrough;
+
+	// return the value represents the end of the range which was read. If 'reverse' is true, returns the last key, as
+	// it should be used as the new "end" of the next query and the end key should be non-inclusive.
+	Key getReadThrough(bool reverse = false) const {
+		ASSERT(more);
+		if (readThrough.present()) {
+			return readThrough.get();
+		}
+		ASSERT(size() > 0);
+		return reverse ? back().key : keyAfter(back().key);
+	}
+
+	// Helper function to get the next range scan's BeginKeySelector, use it when the range read is non-reverse,
+	// otherwise, please use nextEndKeySelector().
+	KeySelectorRef nextBeginKeySelector() const {
+		ASSERT(more);
+		if (readThrough.present()) {
+			return firstGreaterOrEqual(readThrough.get());
+		}
+		ASSERT(size() > 0);
+		return firstGreaterThan(back().key);
+	}
+
+	// Helper function to get the next range scan's EndKeySelector, use it when the range read is reverse.
+	KeySelectorRef nextEndKeySelector() const {
+		ASSERT(more);
+		if (readThrough.present()) {
+			return firstGreaterOrEqual(readThrough.get());
+		}
+		ASSERT(size() > 0);
+		return firstGreaterOrEqual(back().key);
+	}
+
+	void setReadThrough(KeyRef key) {
+		ASSERT(more);
+		ASSERT(!readThrough.present());
+		readThrough = key;
+	}
+
 	bool readToBegin;
 	bool readThroughEnd;
 
@@ -771,7 +831,7 @@ struct RangeResultRef : VectorRef<KeyValueRef> {
 		serializer(ar, ((VectorRef<KeyValueRef>&)*this), more, readThrough, readToBegin, readThroughEnd);
 	}
 
-	int logicalSize() const {
+	int64_t logicalSize() const {
 		return VectorRef<KeyValueRef>::expectedSize() - VectorRef<KeyValueRef>::size() * sizeof(KeyValueRef);
 	}
 
@@ -872,6 +932,12 @@ struct MappedRangeResultRef : VectorRef<MappedKeyValueRef> {
 	bool readToBegin;
 	bool readThroughEnd;
 
+	void setReadThrough(KeyRef key) {
+		ASSERT(more);
+		ASSERT(!readThrough.present());
+		readThrough = key;
+	}
+
 	MappedRangeResultRef() : more(false), readToBegin(false), readThroughEnd(false) {}
 	MappedRangeResultRef(Arena& p, const MappedRangeResultRef& toCopy)
 	  : VectorRef<MappedKeyValueRef>(p, toCopy), more(toCopy.more),
@@ -910,6 +976,7 @@ struct KeyValueStoreType {
 		MEMORY_RADIXTREE = 4,
 		SSD_ROCKSDB_V1 = 5,
 		SSD_SHARDED_ROCKSDB = 6,
+		NONE = 7,
 		END
 	};
 
@@ -934,6 +1001,9 @@ struct KeyValueStoreType {
 	// This is a many-to-one mapping as there are aliases for some storage engines
 	static KeyValueStoreType fromString(const std::string& str);
 	std::string toString() const { return getStoreTypeStr((StoreType)type); }
+
+	// Whether the storage type is a valid storage type.
+	bool isValid() const { return type != NONE && type != END; }
 
 private:
 	uint32_t type;
@@ -961,10 +1031,10 @@ struct TLogVersion {
 		V5 = 5, // 6.3
 		V6 = 6, // 7.0
 		V7 = 7, // 7.2
-		MIN_SUPPORTED = V2,
+		MIN_SUPPORTED = V5,
 		MAX_SUPPORTED = V7,
 		MIN_RECRUITABLE = V6,
-		DEFAULT = V6,
+		DEFAULT = V7,
 	} version;
 
 	TLogVersion() : version(UNSET) {}
@@ -1261,16 +1331,19 @@ struct HealthMetrics {
 
 struct DDMetricsRef {
 	int64_t shardBytes;
+	int64_t shardBytesPerKSecond;
 	KeyRef beginKey;
 
-	DDMetricsRef() : shardBytes(0) {}
-	DDMetricsRef(int64_t bytes, KeyRef begin) : shardBytes(bytes), beginKey(begin) {}
+	DDMetricsRef() : shardBytes(0), shardBytesPerKSecond(0) {}
+	DDMetricsRef(int64_t bytes, int64_t bytesPerKSecond, KeyRef begin)
+	  : shardBytes(bytes), shardBytesPerKSecond(bytesPerKSecond), beginKey(begin) {}
 	DDMetricsRef(Arena& a, const DDMetricsRef& copyFrom)
-	  : shardBytes(copyFrom.shardBytes), beginKey(a, copyFrom.beginKey) {}
+	  : shardBytes(copyFrom.shardBytes), shardBytesPerKSecond(copyFrom.shardBytesPerKSecond),
+	    beginKey(a, copyFrom.beginKey) {}
 
 	template <class Ar>
 	void serialize(Ar& ar) {
-		serializer(ar, shardBytes, beginKey);
+		serializer(ar, shardBytes, beginKey, shardBytesPerKSecond);
 	}
 };
 
@@ -1542,11 +1615,22 @@ struct DatabaseSharedState {
 	  : protocolVersion(currentProtocolVersion()), mutexLock(Mutex()), grvCacheSpace(GRVCacheSpace()), refCount(0) {}
 };
 
+const static std::regex wiggleLocalityValidation("([\\w_]+:[\\w\\-_\\.0-9]+)(;[\\w_]+:[\\w\\-_\\.0-9]+)*");
 inline bool isValidPerpetualStorageWiggleLocality(std::string locality) {
-	int pos = locality.find(':');
-	// locality should be either 0 or in the format '<non_empty_string>:<non_empty_string>'
-	return ((pos > 0 && pos < locality.size() - 1) || locality == "0");
+	if (locality == "0") {
+		return true;
+	}
+	return std::regex_match(locality, wiggleLocalityValidation);
 }
+
+// Parses `perpetual_storage_wiggle_locality` database option.
+std::vector<std::pair<Optional<Value>, Optional<Value>>> ParsePerpetualStorageWiggleLocality(
+    const std::string& localityKeyValues);
+
+// Whether the locality matches any locality filter in `localityKeyValues` (which is supposed to be parsed from
+// ParsePerpetualStorageWiggleLocality).
+bool localityMatchInList(const std::vector<std::pair<Optional<Value>, Optional<Value>>>& localityKeyValues,
+                         const LocalityData& locality);
 
 // matches what's in fdb_c.h
 struct ReadBlobGranuleContext {
@@ -1639,7 +1723,7 @@ struct StorageWiggleValue {
 
 enum class ReadType { EAGER = 0, FETCH = 1, LOW = 2, NORMAL = 3, HIGH = 4, MIN = EAGER, MAX = HIGH };
 
-FDB_DECLARE_BOOLEAN_PARAM(CacheResult);
+FDB_BOOLEAN_PARAM(CacheResult);
 
 // store options for storage engine read
 // ReadType describes the usage and priority of the read
@@ -1658,7 +1742,7 @@ struct ReadOptions {
 	            ReadType type = ReadType::NORMAL,
 	            CacheResult cache = CacheResult::True,
 	            Optional<Version> version = Optional<Version>())
-	  : type(type), cacheResult(cache), debugID(debugID), consistencyCheckStartVersion(version){};
+	  : type(type), cacheResult(cache), debugID(debugID), consistencyCheckStartVersion(version) {}
 
 	ReadOptions(ReadType type, CacheResult cache = CacheResult::True) : ReadOptions({}, type, cache) {}
 
@@ -1677,6 +1761,9 @@ template <typename T>
 struct transaction_creator_traits<T, std::void_t<typename T::TransactionT>> : std::true_type {};
 
 template <typename T>
+struct transaction_creator_traits<Reference<T>> : transaction_creator_traits<T> {};
+
+template <typename T>
 constexpr bool is_transaction_creator = transaction_creator_traits<T>::value;
 
 struct Versionstamp {
@@ -1691,6 +1778,16 @@ struct Versionstamp {
 	bool operator>(const Versionstamp& r) const { return r < *this; }
 	bool operator<=(const Versionstamp& r) const { return !(*this > r); }
 	bool operator>=(const Versionstamp& r) const { return !(*this < r); }
+
+	Versionstamp() {}
+	Versionstamp(Version version, uint16_t batchNumber) : version(version), batchNumber(batchNumber) {}
+	Versionstamp(Standalone<StringRef> str) {
+		ASSERT(str.size() == sizeof(Version) + sizeof(batchNumber));
+		version = bigEndian64(*reinterpret_cast<const Version*>(str.begin()));
+		batchNumber = bigEndian16(*reinterpret_cast<const uint16_t*>(str.begin() + sizeof(Version)));
+	}
+
+	std::string toString() const { return fmt::format("{}.{}", version, batchNumber); }
 
 	template <class Ar>
 	void serialize(Ar& ar) {
@@ -1720,5 +1817,10 @@ template <class Ar>
 inline void load(Ar& ar, Versionstamp& value) {
 	value.serialize(ar);
 }
+
+template <>
+struct Traceable<Versionstamp> : std::true_type {
+	static std::string toString(const Versionstamp& v) { return v.toString(); }
+};
 
 #endif

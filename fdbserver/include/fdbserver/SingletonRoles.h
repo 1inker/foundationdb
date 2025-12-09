@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,6 +20,7 @@
 
 #pragma once
 
+#include "fdbserver/ClusterController.actor.h"
 #include "fdbserver/RatekeeperInterface.h"
 #include "fdbserver/DataDistributorInterface.h"
 
@@ -56,7 +57,7 @@ struct RatekeeperSingleton : Singleton<RatekeeperInterface> {
 		}
 	}
 	void halt(ClusterControllerData& cc, Optional<Standalone<StringRef>> pid) const {
-		if (interface.present() && cc.id_worker.count(pid)) {
+		if (interface.present() && cc.id_worker.contains(pid)) {
 			cc.id_worker[pid].haltRatekeeper =
 			    brokenPromiseToNever(interface.get().haltRatekeeper.getReply(HaltRatekeeperRequest(cc.id)));
 		}
@@ -81,7 +82,7 @@ struct DataDistributorSingleton : Singleton<DataDistributorInterface> {
 		}
 	}
 	void halt(ClusterControllerData& cc, Optional<Standalone<StringRef>> pid) const {
-		if (interface.present() && cc.id_worker.count(pid)) {
+		if (interface.present() && cc.id_worker.contains(pid)) {
 			cc.id_worker[pid].haltDistributor =
 			    brokenPromiseToNever(interface.get().haltDataDistributor.getReply(HaltDataDistributorRequest(cc.id)));
 		}
@@ -131,7 +132,7 @@ struct BlobManagerSingleton : Singleton<BlobManagerInterface> {
 		}
 	}
 	void halt(ClusterControllerData& cc, Optional<Standalone<StringRef>> pid) const {
-		if (interface.present() && cc.id_worker.count(pid)) {
+		if (interface.present() && cc.id_worker.contains(pid)) {
 			cc.id_worker[pid].haltBlobManager =
 			    brokenPromiseToNever(interface.get().haltBlobManager.getReply(HaltBlobManagerRequest(cc.id)));
 		}
@@ -189,7 +190,7 @@ struct EncryptKeyProxySingleton : Singleton<EncryptKeyProxyInterface> {
 		}
 	}
 	void halt(ClusterControllerData& cc, Optional<Standalone<StringRef>> pid) const {
-		if (interface.present() && cc.id_worker.count(pid)) {
+		if (interface.present() && cc.id_worker.contains(pid)) {
 			cc.id_worker[pid].haltEncryptKeyProxy =
 			    brokenPromiseToNever(interface.get().haltEncryptKeyProxy.getReply(HaltEncryptKeyProxyRequest(cc.id)));
 		}

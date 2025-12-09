@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -43,7 +43,6 @@ enum TesterOptionId {
 	OPT_TRACE_DIR,
 	OPT_LOGGROUP,
 	OPT_TRACE_FORMAT,
-	OPT_KNOB,
 	OPT_EXTERNAL_CLIENT_LIBRARY,
 	OPT_EXTERNAL_CLIENT_DIRECTORY,
 	OPT_FUTURE_VERSION_CLIENT_LIBRARY,
@@ -71,7 +70,6 @@ CSimpleOpt::SOption TesterOptionDefs[] = //
 	  { OPT_HELP, "-h", SO_NONE },
 	  { OPT_HELP, "--help", SO_NONE },
 	  { OPT_TRACE_FORMAT, "--trace-format", SO_REQ_SEP },
-	  { OPT_KNOB, "--knob-", SO_REQ_SEP },
 	  { OPT_EXTERNAL_CLIENT_LIBRARY, "--external-client-library", SO_REQ_SEP },
 	  { OPT_EXTERNAL_CLIENT_DIRECTORY, "--external-client-dir", SO_REQ_SEP },
 	  { OPT_FUTURE_VERSION_CLIENT_LIBRARY, "--future-version-client-library", SO_REQ_SEP },
@@ -99,7 +97,7 @@ void printProgramUsage(const char* execName) {
 	       "                 The path of a file containing the connection string for the\n"
 	       "                 FoundationDB cluster. The default is `fdb.cluster'\n"
 	       "  --log          Enables trace file logging for the CLI session.\n"
-	       "  --log-dir PATH Specifes the output directory for trace files. If\n"
+	       "  --log-dir PATH Specifies the output directory for trace files. If\n"
 	       "                 unspecified, defaults to the current directory. Has\n"
 	       "                 no effect unless --log is specified.\n"
 	       "  --log-group LOG_GROUP\n"
@@ -108,8 +106,6 @@ void printProgramUsage(const char* execName) {
 	       "  --trace-format FORMAT\n"
 	       "                 Select the format of the log files. xml (the default) and json\n"
 	       "                 are supported. Has no effect unless --log is specified.\n"
-	       "  --knob-KNOBNAME KNOBVALUE\n"
-	       "                 Changes a knob option. KNOBNAME should be lowercase.\n"
 	       "  --external-client-library FILE\n"
 	       "                 Path to the external client library.\n"
 	       "  --external-client-dir DIR\n"
@@ -127,7 +123,7 @@ void printProgramUsage(const char* execName) {
 	       "  --api-version VERSION\n"
 	       "                 Required FDB API version (default %d).\n"
 	       "  --transaction-retry-limit NUMBER\n"
-	       "				 Maximum number of retries per tranaction (default: 0 - unlimited)\n"
+	       "				 Maximum number of retries per transaction (default: 0 - unlimited)\n"
 	       "  --blob-granule-local-file-path PATH\n"
 	       "				 Path to blob granule files on local filesystem\n"
 	       "  -f, --test-file FILE\n"
@@ -146,19 +142,6 @@ void printProgramUsage(const char* execName) {
 	       FDB_API_VERSION);
 }
 
-// Extracts the key for command line arguments that are specified with a prefix (e.g. --knob-).
-// This function converts any hyphens in the extracted key to underscores.
-bool extractPrefixedArgument(std::string prefix, const std::string& arg, std::string& res) {
-	if (arg.size() <= prefix.size() || arg.find(prefix) != 0 ||
-	    (arg[prefix.size()] != '-' && arg[prefix.size()] != '_')) {
-		return false;
-	}
-
-	res = arg.substr(prefix.size() + 1);
-	std::transform(res.begin(), res.end(), res.begin(), [](int c) { return c == '-' ? '_' : c; });
-	return true;
-}
-
 bool validateTraceFormat(std::string_view format) {
 	return format == "xml" || format == "json";
 }
@@ -172,7 +155,8 @@ void processIntOption(const std::string& optionName, const std::string& value, i
 		throw TesterError(fmt::format("Invalid value {} for {}", value, optionName));
 	}
 	if (res < minValue || res > maxValue) {
-		throw TesterError(fmt::format("Value for {} must be between {} and {}", optionName, minValue, maxValue));
+		throw TesterError(fmt::format(
+		    "Value for {} must be between {} and {}. Input value {}.", optionName, minValue, maxValue, res));
 	}
 }
 
@@ -197,15 +181,6 @@ bool processArg(TesterOptions& options, const CSimpleOpt& args) {
 		}
 		options.traceFormat = args.OptionArg();
 		break;
-	case OPT_KNOB: {
-		std::string knobName;
-		if (!extractPrefixedArgument("--knob", args.OptionSyntax(), knobName)) {
-			fmt::print(stderr, "ERROR: unable to parse knob option '{}'\n", args.OptionSyntax());
-			return false;
-		}
-		options.knobs.emplace_back(knobName, args.OptionArg());
-		break;
-	}
 	case OPT_EXTERNAL_CLIENT_LIBRARY:
 		options.externalClientLibrary = args.OptionArg();
 		break;
@@ -331,15 +306,14 @@ void applyNetworkOptions(TesterOptions& options) {
 		fdb::network::setOption(FDBNetworkOption::FDB_NET_OPTION_DISABLE_CLIENT_BYPASS);
 	}
 
+	if (options.testSpec.runLoopProfiler) {
+		fdb::network::setOption(FDBNetworkOption::FDB_NET_OPTION_ENABLE_RUN_LOOP_PROFILING);
+	}
+
 	if (options.trace) {
 		fdb::network::setOption(FDBNetworkOption::FDB_NET_OPTION_TRACE_ENABLE, options.traceDir);
 		fdb::network::setOption(FDBNetworkOption::FDB_NET_OPTION_TRACE_FORMAT, options.traceFormat);
 		fdb::network::setOption(FDBNetworkOption::FDB_NET_OPTION_TRACE_LOG_GROUP, options.logGroup);
-	}
-
-	for (auto knob : options.knobs) {
-		fdb::network::setOption(FDBNetworkOption::FDB_NET_OPTION_KNOB,
-		                        fmt::format("{}={}", knob.first.c_str(), knob.second.c_str()));
 	}
 
 	if (!options.tlsCertFile.empty()) {
@@ -356,6 +330,12 @@ void applyNetworkOptions(TesterOptions& options) {
 
 	if (options.retainClientLibCopies) {
 		fdb::network::setOption(FDBNetworkOption::FDB_NET_OPTION_RETAIN_CLIENT_LIBRARY_COPIES);
+	}
+
+	for (auto knob : options.testSpec.knobs) {
+		fmt::print(stderr, "Setting knob {}={}\n", knob.first.c_str(), knob.second.c_str());
+		fdb::network::setOption(FDBNetworkOption::FDB_NET_OPTION_KNOB,
+		                        fmt::format("{}={}", knob.first.c_str(), knob.second.c_str()));
 	}
 }
 

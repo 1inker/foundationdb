@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -162,6 +162,41 @@ ACTOR Future<Void> lowPriorityDelay(double waitTime) {
 		loopCount++;
 	}
 	return Void();
+}
+
+ACTOR Future<Void> delayAfterCleared(Reference<AsyncVar<bool>> condition, double time, TaskPriority taskID) {
+	state Future<Void> timer = condition->get() ? Never() : delay(time, taskID);
+	state bool previousState = condition->get();
+	loop choose {
+		when(wait(timer)) {
+			return Void();
+		}
+		when(wait(condition->onChange())) {
+			bool currentState = condition->get();
+			if (currentState != previousState) {
+				timer = currentState ? Never() : delay(time, taskID);
+				previousState = currentState;
+			}
+		}
+	}
+}
+
+// Same as delayAfterCleared, but use lowPriorityDelay.
+ACTOR Future<Void> lowPriorityDelayAfterCleared(Reference<AsyncVar<bool>> condition, double time) {
+	state Future<Void> timer = condition->get() ? Never() : lowPriorityDelay(time);
+	state bool previousState = condition->get();
+	loop choose {
+		when(wait(timer)) {
+			return Void();
+		}
+		when(wait(condition->onChange())) {
+			bool currentState = condition->get();
+			if (currentState != previousState) {
+				timer = currentState ? Never() : lowPriorityDelay(time);
+				previousState = currentState;
+			}
+		}
+	}
 }
 
 namespace {

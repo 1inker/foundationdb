@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -513,12 +513,12 @@ struct AuthzSecurityWorkload : TestWorkload {
 	ACTOR static Future<Void> testKeyLocationLeakDisallowed(AuthzSecurityWorkload* self, Database cx) {
 		state Key key = self->randomString();
 		state Value value = self->randomString();
-		state Version v1 =
-		    wait(setAndCommitKeyValueAndGetVersion(self, cx, self->tenant, self->signedToken, key, value));
+
+		wait(success(setAndCommitKeyValueAndGetVersion(self, cx, self->tenant, self->signedToken, key, value)));
 		state Version v2 = wait(setAndCommitKeyValueAndGetVersion(
 		    self, cx, self->anotherTenant, self->signedTokenAnotherTenant, key, value));
 
-		{
+		try {
 			GetKeyServerLocationsReply rep =
 			    wait(basicLoadBalance(cx->getCommitProxies(UseProvisionalProxies::False),
 			                          &CommitProxyInterface::getKeyServersLocations,
@@ -542,8 +542,13 @@ struct AuthzSecurityWorkload : TestWorkload {
 					    .detail("LeakingRangeEnd", range.end.printable());
 				}
 			}
+		} catch (Error& e) {
+			if (e.code() == error_code_operation_cancelled) {
+				throw e;
+			}
+			ASSERT(e.code() == error_code_commit_proxy_memory_limit_exceeded);
 		}
-		{
+		try {
 			GetKeyServerLocationsReply rep = wait(basicLoadBalance(
 			    cx->getCommitProxies(UseProvisionalProxies::False),
 			    &CommitProxyInterface::getKeyServersLocations,
@@ -567,6 +572,11 @@ struct AuthzSecurityWorkload : TestWorkload {
 					    .detail("LeakingRangeEnd", range.end.printable());
 				}
 			}
+		} catch (Error& e) {
+			if (e.code() == error_code_operation_cancelled) {
+				throw e;
+			}
+			ASSERT(e.code() == error_code_commit_proxy_memory_limit_exceeded);
 		}
 		++self->keyLocationLeakNegative;
 

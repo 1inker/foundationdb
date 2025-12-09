@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -48,6 +48,8 @@
 #include "flow/SystemMonitor.h"
 
 #include "flow/actorcompiler.h" // This must be the last #include.
+
+class ClusterControllerData;
 
 typedef enum {
 	CLUSTER_RECOVERY_STATE_EVENT_NAME,
@@ -131,8 +133,16 @@ private:
 		}
 
 		try {
-			wait(self->cstate.setExclusive(
-			    BinaryWriter::toValue(newState, IncludeVersion(ProtocolVersion::withEncryptionAtRest()))));
+			// Use RECORD_RECOVER_AT_IN_CSTATE to make sure that when turning on recording recover at in CSTATE, we will
+			// never go back to a version < 7.3. We can remove the branch writing withEncryptionAtRest in 7.4 once
+			// RECORD_RECOVER_AT_IN_CSTATE is turned on everywhere.
+			if (SERVER_KNOBS->RECORD_RECOVER_AT_IN_CSTATE) {
+				wait(self->cstate.setExclusive(
+				    BinaryWriter::toValue(newState, IncludeVersion(ProtocolVersion::withGcTxnGenerations()))));
+			} else {
+				wait(self->cstate.setExclusive(
+				    BinaryWriter::toValue(newState, IncludeVersion(ProtocolVersion::withEncryptionAtRest()))));
+			}
 		} catch (Error& e) {
 			CODE_PROBE(true, "Master displaced during writeMasterState");
 			throw;
@@ -195,6 +205,8 @@ struct ClusterRecoveryData : NonCopyable, ReferenceCounted<ClusterRecoveryData> 
 	int64_t memoryLimit;
 	std::map<Optional<Value>, int8_t> dcId_locality;
 	std::vector<Tag> allTags;
+
+	RecruitFromConfigurationReply primaryRecruitment;
 
 	int8_t getNextLocality() {
 		int8_t maxLocality = -1;

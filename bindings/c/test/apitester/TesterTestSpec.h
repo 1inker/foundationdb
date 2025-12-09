@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -38,7 +38,7 @@ struct WorkloadSpec {
 	std::unordered_map<std::string, std::string> options;
 };
 
-// Test speficification loaded from a *.toml file
+// Test specification loaded from a *.toml file
 struct TestSpec {
 	// Title of the test
 	std::string title;
@@ -55,6 +55,9 @@ struct TestSpec {
 	// Execute future callbacks on the threads of the external FDB library
 	// rather than on the main thread of the local FDB client library
 	bool fdbCallbacksOnExternalThreads = false;
+
+	// Enable Flow loop profiling (for slow tasks & thread saturation)
+	bool runLoopProfiler = false;
 
 	// Execute each transaction in a separate database instance
 	bool databasePerTransaction = false;
@@ -86,11 +89,15 @@ struct TestSpec {
 	int minTenants = 0;
 	int maxTenants = 0;
 
+	// Overridden knob values
+	using KnobKeyValues = std::vector<std::pair<std::string, std::string>>;
+	KnobKeyValues knobs;
+
 	// List of workloads with their options
 	std::vector<WorkloadSpec> workloads;
 };
 
-// Read the test specfication from a *.toml file
+// Read the test specification from a *.toml file
 TestSpec readTomlTestSpec(std::string fileName);
 
 } // namespace FdbApiTester

@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -82,17 +82,15 @@ RESTClientKnobs::RESTClientKnobs() {
 }
 
 void RESTClientKnobs::set(const std::unordered_map<std::string, int>& knobSettings) {
-	TraceEvent trace = TraceEvent("RESTClientSetKnobs");
 
 	for (const auto& itr : knobSettings) {
 		const auto& kItr = RESTClientKnobs::knobMap.find(itr.first);
 		if (kItr == RESTClientKnobs::knobMap.end()) {
-			trace.detail("RESTClientInvalidKnobName", itr.first);
+			TraceEvent("RESTClientInvalidKnobName").detail("KnobName", itr.first);
 			throw rest_invalid_rest_client_knob();
 		}
 		ASSERT_EQ(itr.first.compare(kItr->first), 0);
 		*(kItr->second) = itr.second;
-		trace.detail(itr.first.c_str(), itr.second);
 	}
 }
 
@@ -263,6 +261,10 @@ void RESTUrl::parseUrl(const std::string& fullUrl) {
 	}
 }
 
+double continuousTimeDecay(double initialValue, double decayRate, double time) {
+	return initialValue * exp(-decayRate * time);
+}
+
 // Only used to link unit tests
 void forceLinkRESTUtilsTests() {}
 
@@ -318,7 +320,7 @@ TEST_CASE("/RESTUtils/ValidURIWithExtraForwardSlash") {
 	ASSERT_EQ(r.connType.secure, RESTConnectionType::SECURE_CONNECTION);
 	ASSERT_EQ(r.host.compare("host"), 0);
 	ASSERT(r.service.empty());
-	ASSERT_EQ(r.resource.compare("/foo/bar"), 0);
+	ASSERT_EQ(r.resource.compare("//foo/bar"), 0);
 	return Void();
 }
 

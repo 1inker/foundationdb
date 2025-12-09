@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -36,13 +36,14 @@ standard API and some knowledge of the contents of the system key space.
 #include <map>
 #include "fdbclient/GenericManagementAPI.actor.h"
 #include "fdbclient/NativeAPI.actor.h"
+#include "fdbclient/RangeLock.h"
 #include "fdbclient/ReadYourWrites.h"
 #include "fdbclient/DatabaseConfiguration.h"
 #include "fdbclient/MonitorLeader.h"
 #include "flow/actorcompiler.h" // has to be last include
 
-ACTOR Future<DatabaseConfiguration> getDatabaseConfiguration(Transaction* tr);
-ACTOR Future<DatabaseConfiguration> getDatabaseConfiguration(Database cx);
+ACTOR Future<DatabaseConfiguration> getDatabaseConfiguration(Transaction* tr, bool useSystemPriority = false);
+ACTOR Future<DatabaseConfiguration> getDatabaseConfiguration(Database cx, bool useSystemPriority = false);
 ACTOR Future<Void> waitForFullReplication(Database cx);
 
 struct IQuorumChange : ReferenceCounted<IQuorumChange> {
@@ -67,12 +68,12 @@ Reference<IQuorumChange> nameQuorumChange(std::string const& name, Reference<IQu
 // necessarily waiting for the servers to be evacuated.  A NetworkAddress with a port of 0 means all servers on the
 // given IP.
 ACTOR Future<Void> excludeServers(Database cx, std::vector<AddressExclusion> servers, bool failed = false);
-void excludeServers(Transaction& tr, std::vector<AddressExclusion>& servers, bool failed = false);
+ACTOR Future<Void> excludeServers(Transaction* tr, std::vector<AddressExclusion> servers, bool failed = false);
 
 // Exclude the servers matching the given set of localities from use as state servers.  Returns as soon as the change
 // is durable, without necessarily waiting for the servers to be evacuated.
 ACTOR Future<Void> excludeLocalities(Database cx, std::unordered_set<std::string> localities, bool failed = false);
-void excludeLocalities(Transaction& tr, std::unordered_set<std::string> localities, bool failed = false);
+ACTOR Future<Void> excludeLocalities(Transaction* tr, std::unordered_set<std::string> localities, bool failed = false);
 
 // Remove the given servers from the exclusion list.  A NetworkAddress with a port of 0 means all servers on the given
 // IP.  A NetworkAddress() means all servers (don't exclude anything)
@@ -88,19 +89,37 @@ ACTOR Future<Void> includeLocalities(Database cx,
 // the given IP.
 ACTOR Future<Void> setClass(Database cx, AddressExclusion server, ProcessClass processClass);
 
-// Get the current list of excluded servers
-ACTOR Future<std::vector<AddressExclusion>> getExcludedServers(Database cx);
-ACTOR Future<std::vector<AddressExclusion>> getExcludedServers(Transaction* tr);
+// Get the current list of excluded servers including both "exclude" and "failed".
+ACTOR Future<std::vector<AddressExclusion>> getAllExcludedServers(Database cx);
+ACTOR Future<std::vector<AddressExclusion>> getAllExcludedServers(Transaction* tr);
+
+// Get the current list of excluded servers.
+ACTOR Future<std::vector<AddressExclusion>> getExcludedServerList(Transaction* tr);
+
+// Get the current list of failed servers.
+ACTOR Future<std::vector<AddressExclusion>> getExcludedFailedServerList(Transaction* tr);
 
 // Get the current list of excluded localities
-ACTOR Future<std::vector<std::string>> getExcludedLocalities(Database cx);
-ACTOR Future<std::vector<std::string>> getExcludedLocalities(Transaction* tr);
+ACTOR Future<std::vector<std::string>> getAllExcludedLocalities(Database cx);
+ACTOR Future<std::vector<std::string>> getAllExcludedLocalities(Transaction* tr);
 
+// Get the current list of excluded localities.
+ACTOR Future<std::vector<std::string>> getExcludedLocalityList(Transaction* tr);
+
+// Get the current list of failed localities.
+ACTOR Future<std::vector<std::string>> getExcludedFailedLocalityList(Transaction* tr);
+
+// Decodes the locality string to a pair of locality prefix and its value.
+// The prefix could be dcid, processid, machineid, processid.
+std::pair<std::string, std::string> decodeLocality(const std::string& locality);
+std::set<AddressExclusion> getServerAddressesByLocality(
+    const std::map<std::string, StorageServerInterface> server_interfaces,
+    const std::string& locality);
 std::set<AddressExclusion> getAddressesByLocality(const std::vector<ProcessData>& workers, const std::string& locality);
 
-// Check for the given, previously excluded servers to be evacuated (no longer used for state).  If waitForExclusion is
-// true, this actor returns once it is safe to shut down all such machines without impacting fault tolerance, until and
-// unless any of them are explicitly included with includeServers()
+// Check for the given, previously excluded servers to be evacuated (no longer used for state).  If waitForExclusion
+// is true, this actor returns once it is safe to shut down all such machines without impacting fault tolerance,
+// until and unless any of them are explicitly included with includeServers()
 ACTOR Future<std::set<NetworkAddress>> checkForExcludingServers(Database cx,
                                                                 std::vector<AddressExclusion> servers,
                                                                 bool waitForAllExcluded);
@@ -142,7 +161,61 @@ ACTOR Future<Void> forceRecovery(Reference<IClusterConnectionRecord> clusterFile
 ACTOR Future<UID> auditStorage(Reference<IClusterConnectionRecord> clusterFile,
                                KeyRange range,
                                AuditType type,
-                               bool async = false);
+                               KeyValueStoreType engineType,
+                               double timeoutSeconds);
+// Cancel an audit given type and id
+ACTOR Future<UID> cancelAuditStorage(Reference<IClusterConnectionRecord> clusterFile,
+                                     AuditType type,
+                                     UID auditId,
+                                     double timeoutSeconds);
+
+// Set bulk load mode
+ACTOR Future<int> setBulkLoadMode(Database cx, int mode);
+
+// Get valid bulk load task state within the input range
+ACTOR Future<std::vector<BulkLoadState>> getValidBulkLoadTasksWithinRange(Database cx,
+                                                                          KeyRange rangeToRead,
+                                                                          size_t limit,
+                                                                          Optional<BulkLoadPhase> phase);
+
+// Submit a bulk load task
+ACTOR Future<Void> submitBulkLoadTask(Database cx, BulkLoadState bulkLoadTask);
+
+// Acknowledge a bulk load task if it has been completed
+ACTOR Future<Void> acknowledgeBulkLoadTask(Database cx, KeyRange range, UID taskId);
+
+// Get bulk load task for the input range and taskId
+ACTOR Future<BulkLoadState> getBulkLoadTask(Transaction* tr,
+                                            KeyRange range,
+                                            UID taskId,
+                                            std::vector<BulkLoadPhase> phases);
+
+// Persist a rangeLock owner to database metadata
+// A range can only be locked by a registered owner
+ACTOR Future<Void> registerRangeLockOwner(Database cx, std::string uniqueId, std::string description);
+
+// Remove an owner form the database metadata
+ACTOR Future<Void> removeRangeLockOwner(Database cx, std::string uniqueId);
+
+// Get all registered rangeLock owner
+ACTOR Future<std::vector<RangeLockOwner>> getAllRangeLockOwners(Database cx);
+
+ACTOR Future<Optional<RangeLockOwner>> getRangeLockOwner(Database cx, std::string uniqueId);
+
+// Turn off user traffic for bulk load based on range lock
+ACTOR Future<Void> turnOffUserWriteTrafficForBulkLoad(Transaction* tr, KeyRange range);
+
+// Turn on user traffic for bulk load based on range lock
+ACTOR Future<Void> turnOnUserWriteTrafficForBulkLoad(Transaction* tr, KeyRange range);
+
+// Lock a user range (the input range must be within normalKeys)
+ACTOR Future<Void> takeReadLockOnRange(Database cx, KeyRange range, std::string ownerUniqueID);
+
+// Unlock a user range (the input range must be within normalKeys)
+ACTOR Future<Void> releaseReadLockOnRange(Database cx, KeyRange range, std::string ownerUniqueID);
+
+// Get locked ranges within the input range (the input range must be within normalKeys)
+ACTOR Future<std::vector<KeyRange>> getReadLockOnRange(Database cx, KeyRange range);
 
 ACTOR Future<Void> printHealthyZone(Database cx);
 ACTOR Future<bool> clearHealthyZone(Database cx, bool printWarning = false, bool clearSSFailureZoneString = false);

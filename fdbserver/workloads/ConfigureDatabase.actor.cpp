@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,6 +18,8 @@
  * limitations under the License.
  */
 
+#include <algorithm>
+
 #include "fdbclient/FDBTypes.h"
 #include "fdbclient/NativeAPI.actor.h"
 #include "fdbserver/TesterInterface.actor.h"
@@ -27,6 +29,7 @@
 #include "fdbserver/workloads/workloads.actor.h"
 #include "fdbrpc/simulator.h"
 #include "fdbserver/QuietDatabase.h"
+#include "fdbserver/SimulatedCluster.h"
 #include "flow/IRandom.h"
 #include "flow/actorcompiler.h" // This must be the last #include.
 
@@ -282,7 +285,14 @@ struct ConfigureDatabaseWorkload : TestWorkload {
 		TraceEvent("ConfigureDatabase_Config").detail("Config", config.toString());
 		if (config.encryptionAtRestMode.isEncryptionEnabled()) {
 			TraceEvent("ConfigureDatabase_EncryptionEnabled");
-			self->storageEngineExcludeTypes = { 0, 1, 2, 4, 5 };
+			self->storageEngineExcludeTypes = { (int)SimulationStorageEngine::SSD,
+				                                (int)SimulationStorageEngine::MEMORY,
+				                                (int)SimulationStorageEngine::RADIX_TREE,
+				                                (int)SimulationStorageEngine::ROCKSDB,
+				                                (int)SimulationStorageEngine::SHARDED_ROCKSDB };
+		}
+		if (!SERVER_KNOBS->SHARD_ENCODE_LOCATION_METADATA) {
+			self->storageEngineExcludeTypes.push_back((int)SimulationStorageEngine::SHARDED_ROCKSDB);
 		}
 		if (self->clientId == 0) {
 			self->clients.push_back(timeout(self->singleDB(self, cx), self->testDuration, Void()));
@@ -305,14 +315,9 @@ struct ConfigureDatabaseWorkload : TestWorkload {
 				state DatabaseConfiguration conf = wait(getDatabaseConfiguration(cx));
 
 				state std::string wiggleLocalityKeyValue = conf.perpetualStorageWiggleLocality;
-				state std::string wiggleLocalityKey;
-				state std::string wiggleLocalityValue;
+				state std::vector<std::pair<Optional<Value>, Optional<Value>>> wiggleLocalityKeyValues =
+				    ParsePerpetualStorageWiggleLocality(wiggleLocalityKeyValue);
 				state int i;
-				if (wiggleLocalityKeyValue != "0") {
-					int split = wiggleLocalityKeyValue.find(':');
-					wiggleLocalityKey = wiggleLocalityKeyValue.substr(0, split);
-					wiggleLocalityValue = wiggleLocalityKeyValue.substr(split + 1);
-				}
 
 				state bool pass = true;
 				state std::vector<StorageServerInterface> storageServers = wait(getStorageServers(cx));
@@ -321,8 +326,7 @@ struct ConfigureDatabaseWorkload : TestWorkload {
 					// Check that each storage server has the correct key value store type
 					if (!storageServers[i].isTss() &&
 					    (wiggleLocalityKeyValue == "0" ||
-					     (storageServers[i].locality.get(wiggleLocalityKey).present() &&
-					      storageServers[i].locality.get(wiggleLocalityKey).get().toString() == wiggleLocalityValue))) {
+					     localityMatchInList(wiggleLocalityKeyValues, storageServers[i].locality))) {
 						ReplyPromise<KeyValueStoreType> typeReply;
 						ErrorOr<KeyValueStoreType> keyValueStoreType =
 						    wait(storageServers[i].getKeyValueStoreType.getReplyUnlessFailedFor(typeReply, 2, 0));
@@ -427,10 +431,10 @@ struct ConfigureDatabaseWorkload : TestWorkload {
 			} else if (randomChoice == 5) {
 				int storeType = 0;
 				while (true) {
-					storeType = deterministicRandom()->randomInt(0, 4);
-					if (std::count(self->storageEngineExcludeTypes.begin(),
-					               self->storageEngineExcludeTypes.end(),
-					               storeType) == 0) {
+					storeType = deterministicRandom()->randomInt(0, 6);
+					if (std::find(self->storageEngineExcludeTypes.begin(),
+					              self->storageEngineExcludeTypes.end(),
+					              storeType) == self->storageEngineExcludeTypes.end()) {
 						break;
 					}
 				}
@@ -445,11 +449,16 @@ struct ConfigureDatabaseWorkload : TestWorkload {
 					storeTypeStr = memoryTypes[deterministicRandom()->randomInt(0, 3)];
 					break;
 				case 2:
-					storeTypeStr = "memory-radixtree-beta";
+					storeTypeStr = "memory-radixtree";
 					break;
 				case 3:
-					// Experimental suffix is still supported so test it
-					storeTypeStr = BUGGIFY ? "ssd-redwood-1" : "ssd-redwood-1-experimental";
+					storeTypeStr = "ssd-redwood-1";
+					break;
+				case 4:
+					storeTypeStr = "ssd-rocksdb-v1";
+					break;
+				case 5:
+					storeTypeStr = "ssd-sharded-rocksdb";
 					break;
 				default:
 					ASSERT(false);
@@ -478,19 +487,31 @@ struct ConfigureDatabaseWorkload : TestWorkload {
 					state std::string randomPerpetualWiggleLocality;
 					if (deterministicRandom()->random01() < 0.25) {
 						state std::vector<StorageServerInterface> storageServers = wait(getStorageServers(cx));
-						StorageServerInterface randomSS =
-						    storageServers[deterministicRandom()->randomInt(0, storageServers.size())];
+						std::string localityFilter;
+						int selectSSCount =
+						    deterministicRandom()->randomInt(1, std::min(4, (int)(storageServers.size())));
 						std::vector<StringRef> localityKeys = { LocalityData::keyDcId,
 							                                    LocalityData::keyDataHallId,
 							                                    LocalityData::keyZoneId,
 							                                    LocalityData::keyMachineId,
 							                                    LocalityData::keyProcessId };
-						StringRef randomLocalityKey =
-						    localityKeys[deterministicRandom()->randomInt(0, localityKeys.size())];
-						if (randomSS.locality.isPresent(randomLocalityKey)) {
-							randomPerpetualWiggleLocality =
-							    " perpetual_storage_wiggle_locality=" + randomLocalityKey.toString() + ":" +
-							    randomSS.locality.get(randomLocalityKey).get().toString();
+						for (int i = 0; i < selectSSCount; ++i) {
+							StorageServerInterface randomSS =
+							    storageServers[deterministicRandom()->randomInt(0, storageServers.size())];
+							StringRef randomLocalityKey =
+							    localityKeys[deterministicRandom()->randomInt(0, localityKeys.size())];
+							if (randomSS.locality.isPresent(randomLocalityKey)) {
+								if (localityFilter.size() > 0) {
+									localityFilter += ";";
+								}
+								localityFilter += randomLocalityKey.toString() + ":" +
+								                  randomSS.locality.get(randomLocalityKey).get().toString();
+							}
+						}
+
+						if (localityFilter.size() > 0) {
+							TraceEvent("ConfigureTestSettingWiggleLocality").detail("LocalityFilter", localityFilter);
+							randomPerpetualWiggleLocality = " perpetual_storage_wiggle_locality=" + localityFilter;
 						}
 					}
 

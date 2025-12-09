@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2021 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -34,7 +34,7 @@ import org.junit.jupiter.api.Assertions;
 
 /**
  * Setup: Generating a cycle 0 -> 1 -> 2 -> 3 -> 0, its length is 4
- * Process: randomly choose an element, reverse 2nd and 4rd element, considering the chosen one as the 1st element.
+ * Process: randomly choose an element, reverse 2nd and 4th element, considering the chosen one as the 1st element.
  * Check: verify no element is lost or added, and they are still a cycle.
  * 
  * This test is to verify the atomicity of transactions. 

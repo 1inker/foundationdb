@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -64,5 +64,8 @@ Future<std::pair<std::vector<WorkerInterface>, int>>
 getStorageWorkers(Database const& cx, Reference<AsyncVar<ServerDBInfo> const> const& dbInfo, bool const& localOnly);
 Future<std::vector<WorkerInterface>> getCoordWorkers(Database const& cx,
                                                      Reference<AsyncVar<ServerDBInfo> const> const& dbInfo);
+
+Future<Void> enableConsistencyScanInSim(Database const& db);
+Future<Void> disableConsistencyScanInSim(Database const& db, bool const& waitForCompletion);
 
 #endif

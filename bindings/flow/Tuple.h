@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -114,6 +114,8 @@ private:
 	static const uint8_t FALSE_CODE;
 	static const uint8_t TRUE_CODE;
 	static const uint8_t UUID_CODE;
+	// Java Tuple layer VERSIONSTAMP has 96 bits(12 bytes).
+	// It has additional 2 bytes user code than the internal VERSIONTAMP of size 10 bytes
 	static const uint8_t VERSIONSTAMP_96_CODE;
 
 	Tuple(const StringRef& data);

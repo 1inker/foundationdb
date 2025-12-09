@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -87,7 +87,7 @@ public:
 	//   - latency: the measured client-side latency of the request.
 	//   - penalty: the server side penalty sent along with the response from
 	//              the storage server. Requires >= 1.
-	//   - delta: Update server `id`'s queue model by substract this amount.
+	//   - delta: Update server `id`'s queue model by subtracting this amount.
 	//            This value should be the value returned by `addRequest` below.
 	//   - clean: indicates whether the there was an error or not.
 	// 	 - futureVersion: indicates whether there was "future version" error or

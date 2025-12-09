@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -60,9 +60,9 @@ struct Hostname {
 
 	// The resolve functions below use DNS cache.
 	Future<Optional<NetworkAddress>> resolve();
-	Future<NetworkAddress> resolveWithRetry();
-	Optional<NetworkAddress> resolveBlocking(); // This one should only be used when resolving asynchronously is
-	                                            // impossible. For all other cases, resolve() should be preferred.
+	Future<NetworkAddress> resolveWithRetry() const;
+	Optional<NetworkAddress> resolveBlocking() const; // This one should only be used when resolving asynchronously is
+	                                                  // impossible. For all other cases, resolve() should be preferred.
 
 	template <class Ar>
 	void serialize(Ar& ar) {

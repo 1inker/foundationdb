@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -23,12 +23,16 @@
 #pragma once
 
 #include "flow/Arena.h"
+#include "flow/xxhash.h"
 
 #include <cstdint>
 #include <limits>
+#include <openssl/evp.h>
 #include <string>
 #include <string_view>
 #include <unordered_set>
+
+#define DEBUG_ENCRYPT_KEY_CIPHER false
 
 constexpr const int AUTH_TOKEN_HMAC_SHA_SIZE = 32;
 constexpr const int AUTH_TOKEN_AES_CMAC_SIZE = 16;
@@ -37,6 +41,11 @@ constexpr const int AUTH_TOKEN_MAX_SIZE = AUTH_TOKEN_HMAC_SHA_SIZE;
 using EncryptCipherDomainId = int64_t;
 using EncryptCipherBaseKeyId = uint64_t;
 using EncryptCipherRandomSalt = uint64_t;
+using EncryptCipherKeyCheckValue = uint32_t;
+
+using EncryptCipherDomainIdVec = std::vector<EncryptCipherDomainId>;
+
+constexpr const int MAX_BASE_CIPHER_LEN = EVP_MAX_KEY_LENGTH - sizeof(EncryptCipherRandomSalt);
 
 constexpr const EncryptCipherDomainId INVALID_ENCRYPT_DOMAIN_ID = -1;
 constexpr const EncryptCipherDomainId SYSTEM_KEYSPACE_ENCRYPT_DOMAIN_ID = -2;

@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2018 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -94,6 +94,10 @@ public class LocalityUtil {
 	 * Returns a list of public network addresses as strings, one for each of
 	 * the storage servers responsible for storing {@code key} and its associated
 	 * value.
+	 *
+	 * The storage server network ports are not included to the list unless
+	 * tr.options().{@link com.apple.foundationdb.TransactionOptions#setIncludePortInAddress() setIncludePortInAddress()}
+	 * has been called.
 	 *
 	 * If locality information is not available, the returned future will carry a
 	 *  {@link FDBException} locality_information_unavailable.

@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -608,7 +608,7 @@ int ISRebalance(Node*& root) {
 	// we know the value of balance(X), but not height(X).
 	//
 	// We will assume that balance(F) < 0 (so we will be rotating right).
-	// Trees that rotate to the left will perform analagous operations.
+	// Trees that rotate to the left will perform analogous operations.
 	//
 	//         F
 	//       /   \

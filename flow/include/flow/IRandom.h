@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -93,8 +93,8 @@ public:
 	static UID fromStringThrowsOnFailure(std::string const&);
 
 	template <class Ar>
-	void serialize_unversioned(
-	    Ar& ar) { // Changing this serialization format will affect key definitions, so can't simply be versioned!
+	void serialize_unversioned(Ar& ar) {
+		// Changing this serialization format will affect key definitions, so can't simply be versioned!
 		serializer(ar, part[0], part[1]);
 	}
 };
@@ -164,14 +164,13 @@ public:
 
 	template <class C>
 	void randomShuffle(C& container) {
-		randomShuffle(container, container.size());
+		randomShuffle(container, 0, container.size());
 	}
 
 	template <class C>
-	void randomShuffle(C& container, size_t shuffleLen) {
-		int s = shuffleLen > container.size() ? container.size() : shuffleLen;
-		for (int i = 0; i < s; i++) {
-			int j = randomInt(i, s);
+	void randomShuffle(C& container, size_t start, size_t end) {
+		for (int i = start; i < end; i++) {
+			int j = randomInt(i, end);
 			if (i != j) {
 				std::swap(container[i], container[j]);
 			}
@@ -214,5 +213,10 @@ Reference<IRandom> nondeterministicRandom();
 // determinism of the simulator. This is useful for things like generating random UIDs for debug transactions.
 // WARNING: This is not thread safe and must not be called from any other thread than the network thread!
 Reference<IRandom> debugRandom();
+
+// Workaround for https://github.com/apple/swift/issues/62354
+inline int64_t swift_get_randomInt64(Reference<IRandom> random, int64_t min, int64_t maxPlusOne) {
+	return random->randomInt64(min, maxPlusOne);
+}
 
 #endif

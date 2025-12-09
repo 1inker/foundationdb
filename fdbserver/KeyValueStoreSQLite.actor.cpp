@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -153,17 +153,28 @@ struct PageChecksumCodec {
 		if (!silent) {
 			auto severity = SevError;
 			if (g_network->isSimulated()) {
-				auto firstBlock = pageNumber == 1 ? 0 : ((pageNumber - 1) * pageLen) / 4096,
-				     lastBlock = (pageNumber * pageLen) / 4096;
-				auto iter = g_simulator->corruptedBlocks.lower_bound(std::make_pair(filename, firstBlock));
-				if (iter != g_simulator->corruptedBlocks.end() && iter->first == filename && iter->second < lastBlock) {
+				// Calculate file offsets for the read/write operation space
+				// Operation starts at a 1-based pageNumber and is of size pageLen
+				int64_t fileOffsetStart = (pageNumber - 1) * pageLen;
+				// End refers to the offset after the operation, not the last byte.
+				int64_t fileOffsetEnd = fileOffsetStart + pageLen;
+
+				// Convert the file offsets to potentially corrupt block numbers
+				// Corrupt block numbers are 0-based and 4096 bytes in length.
+				int64_t corruptBlockStart = fileOffsetStart / 4096;
+				// corrupt block end is the block number AFTER the operation
+				int64_t corruptBlockEnd = (fileOffsetEnd + 4095) / 4096;
+
+				auto iter = g_simulator->corruptedBlocks.lower_bound(std::make_pair(filename, corruptBlockStart));
+				if (iter != g_simulator->corruptedBlocks.end() && iter->first == filename &&
+				    iter->second < corruptBlockEnd) {
 					severity = SevWarnAlways;
 				}
 				TraceEvent("CheckCorruption")
 				    .detail("Filename", filename)
 				    .detail("NextFile", iter->first)
-				    .detail("FirstBlock", firstBlock)
-				    .detail("LastBlock", lastBlock)
+				    .detail("BlockStart", corruptBlockStart)
+				    .detail("BlockEnd", corruptBlockEnd)
 				    .detail("NextBlock", iter->second);
 			}
 			TraceEvent trEvent(severity, "SQLitePageChecksumFailure");
@@ -831,7 +842,7 @@ struct RawCursor {
 			int valuePerFragment = kv.value.size();
 
 			// Figure out if we would benefit from fragmenting this kv pair.  The key size must be less than
-			// primary page usable size, and the value and key size together must exceeed the primary page usable size.
+			// primary page usable size, and the value and key size together must exceed the primary page usable size.
 			if ((kv.key.size() + kv.value.size()) > primaryPageUsable && kv.key.size() < primaryPageUsable) {
 
 				// Just the part of the value that would be in a partially-filled overflow page
@@ -1250,10 +1261,6 @@ struct RawCursor {
 			}
 		}
 		result.more = rowLimit == 0 || accumulatedBytes >= byteLimit;
-		if (result.more) {
-			ASSERT(result.size() > 0);
-			result.readThrough = result[result.size() - 1].key;
-		}
 		// AccumulatedBytes includes KeyValueRef overhead so subtract it
 		kvBytesRead += (accumulatedBytes - result.size() * sizeof(KeyValueRef));
 		return result;
@@ -1613,12 +1620,10 @@ public:
 	StorageBytes getStorageBytes() const override;
 
 	void set(KeyValueRef keyValue, const Arena* arena = nullptr) override;
-	void clear(KeyRangeRef range,
-	           const StorageServerMetrics* storageMetrics = nullptr,
-	           const Arena* arena = nullptr) override;
+	void clear(KeyRangeRef range, const Arena* arena = nullptr) override;
 	Future<Void> commit(bool sequential = false) override;
 
-	Future<Optional<Value>> readValue(KeyRef key, Optional<ReadOptions> optionss) override;
+	Future<Optional<Value>> readValue(KeyRef key, Optional<ReadOptions> options) override;
 	Future<Optional<Value>> readValuePrefix(KeyRef key, int maxLength, Optional<ReadOptions> options) override;
 	Future<RangeResult> readRange(KeyRangeRef keys,
 	                              int rowLimit,
@@ -2235,7 +2240,7 @@ void KeyValueStoreSQLite::set(KeyValueRef keyValue, const Arena* arena) {
 	++writesRequested;
 	writeThread->post(new Writer::SetAction(keyValue));
 }
-void KeyValueStoreSQLite::clear(KeyRangeRef range, const StorageServerMetrics* storageMetrics, const Arena* arena) {
+void KeyValueStoreSQLite::clear(KeyRangeRef range, const Arena* arena) {
 	++writesRequested;
 	writeThread->post(new Writer::ClearAction(range));
 }

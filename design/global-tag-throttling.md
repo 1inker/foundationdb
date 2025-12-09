@@ -80,7 +80,7 @@ The ratekeeper must also track the rate of transactions performed with each tag.
 ### Average Cost Calculation
 Quotas are expressed in terms of cost, but because throttling is enforced at the beginning of transactions, budgets need to be calculated in terms of transactions per second. To make this conversion, it is necessary to track the average cost of transactions (per-tag, and per-tag on a particular storage server).
 
-Both cost and transaction counters are smoothed using the `Smoother` class to provide stability over time. The "smoothing interval" can be modified through `SERVER_KNOBS->GLOBAL_TAG_THROTTLING_FOLDING_TIME`.
+Both cost and transaction counters are exponentially smoothed over time, with knob-configurable smoothing intervals.
 
 ### Reserved Rate Calculation
 The global tag throttler periodically reads reserved quotas from the system keyspace. Using these reserved quotas and the average cost of transactions with the given tag, a reserved TPS rate is computed. Read and write rates are aggregated as follows:
@@ -111,10 +111,10 @@ limitingTps(tag) = min{limitingTps(tag, storage) : all storage servers}
 
 If the throttling ratio is empty for all storage servers affected by a tag, then the per-tag, per-storage limiting TPS rate is also empty. In this case the target rate for this tag is simply the desired rate.
 
-If an individual zone is unhealthy, it may cause the throttling ratio for storage servers in that zone to shoot up. This should not be misinterpretted as a workload issue that requires active throttling. Therefore, the zone with the worst throttling ratios is ignored when computing the limiting transaction rate for a tag (similar to the calculation of the global transaction limit in `Ratekeeper::updateRate`).
+If an individual zone is unhealthy, it may cause the throttling ratio for storage servers in that zone to shoot up. This should not be misinterpreted as a workload issue that requires active throttling. Therefore, the zone with the worst throttling ratios is ignored when computing the limiting transaction rate for a tag (similar to the calculation of the global transaction limit in `Ratekeeper::updateRate`).
 
 ### Client Rate Calculation
-The smoothed per-client rate for each tag is tracked within `GlobalTagThrottlerImpl::PerTagStatistics`. Once a target rate has been computed, this is passed to `GlobalTagThrotterImpl::PerTagStatistics::updateAndGetPerClientRate` which adjusts the per-client rate. The per-client rate is meant to limit the busiest clients, so that at equilibrium, the per-client rate will remain constant and the sum of throughput from all clients will match the target rate.
+The smoothed per-client rate for each tag is tracked within `GlobalTagThrottlerImpl::PerTagStatistics`. Once a target rate has been computed, this is passed to `GlobalTagThrottlerImpl::PerTagStatistics::updateAndGetPerClientRate` which adjusts the per-client rate. The per-client rate is meant to limit the busiest clients, so that at equilibrium, the per-client rate will remain constant and the sum of throughput from all clients will match the target rate.
 
 ## Simulation Testing
 The `ThroughputQuota.toml` test provides a simple end-to-end test using the global tag throttler. Quotas are set using the internal tag quota API in the `ThroughputQuota` workload. This is run with the `Cycle` workload, which randomly tags transactions. 

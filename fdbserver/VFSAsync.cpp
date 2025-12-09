@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -685,7 +685,7 @@ static int asyncFullPathname(sqlite3_vfs* pVfs, /* VFS */
 ** and false otherwise.
 */
 bool vfsAsyncIsOpen(std::string filename) {
-	return SharedMemoryInfo::table.count(abspath(filename)) > 0;
+	return SharedMemoryInfo::table.contains(abspath(filename));
 }
 
 /*

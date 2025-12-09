@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -162,7 +162,7 @@ CommandFactory versionEpochFactory(
                 "Read or write the version epoch",
                 "If no arguments are specified, reports the offset between the expected version "
                 "and the actual version. Otherwise, enables, disables, or commits the version epoch. "
-                "Setting the version epoch can be irreversible since it can cause a large verison jump. "
+                "Setting the version epoch can be irreversible since it can cause a large version jump. "
                 "Thus, the version epoch must first by enabled with the enable or set command. This "
                 "causes a recovery. Once the version epoch has been set, versions may be given out at "
                 "a faster or slower rate to attempt to match the actual version to the expected version, "

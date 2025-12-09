@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -24,17 +24,12 @@
 #include "md5/md5.h"
 #include "libb64/encode.h"
 #include "fdbclient/sha1/SHA1.h"
+#include <climits>
 #include <time.h>
 #include <iomanip>
-#if defined(HAVE_WOLFSSL)
-#include <wolfssl/options.h>
-#endif
 #include <openssl/sha.h>
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
-#if defined(HAVE_WOLFSSL)
-#undef SHA1 // wolfSSL will will shadow FDB SHA1.h
-#endif
 #include <boost/algorithm/string/split.hpp>
 #include <boost/algorithm/string/classification.hpp>
 #include <boost/algorithm/string.hpp>
@@ -100,6 +95,8 @@ S3BlobStoreEndpoint::BlobKnobs::BlobKnobs() {
 	read_cache_blocks_per_file = CLIENT_KNOBS->BLOBSTORE_READ_CACHE_BLOCKS_PER_FILE;
 	max_send_bytes_per_second = CLIENT_KNOBS->BLOBSTORE_MAX_SEND_BYTES_PER_SECOND;
 	max_recv_bytes_per_second = CLIENT_KNOBS->BLOBSTORE_MAX_RECV_BYTES_PER_SECOND;
+	max_delay_retryable_error = CLIENT_KNOBS->BLOBSTORE_MAX_DELAY_RETRYABLE_ERROR;
+	max_delay_connection_failed = CLIENT_KNOBS->BLOBSTORE_MAX_DELAY_CONNECTION_FAILED;
 	sdk_auth = false;
 	global_connection_pool = CLIENT_KNOBS->BLOBSTORE_GLOBAL_CONNECTION_POOL;
 }
@@ -139,6 +136,8 @@ bool S3BlobStoreEndpoint::BlobKnobs::set(StringRef name, int value) {
 	TRY_PARAM(read_cache_blocks_per_file, rcb);
 	TRY_PARAM(max_send_bytes_per_second, sbps);
 	TRY_PARAM(max_recv_bytes_per_second, rbps);
+	TRY_PARAM(max_delay_retryable_error, dre);
+	TRY_PARAM(max_delay_connection_failed, dcf);
 	TRY_PARAM(sdk_auth, sa);
 	TRY_PARAM(global_connection_pool, gcp);
 #undef TRY_PARAM
@@ -180,6 +179,8 @@ std::string S3BlobStoreEndpoint::BlobKnobs::getURLParameters() const {
 	_CHECK_PARAM(max_recv_bytes_per_second, rbps);
 	_CHECK_PARAM(sdk_auth, sa);
 	_CHECK_PARAM(global_connection_pool, gcp);
+	_CHECK_PARAM(max_delay_retryable_error, dre);
+	_CHECK_PARAM(max_delay_connection_failed, dcf);
 #undef _CHECK_PARAM
 	return r;
 }
@@ -192,13 +193,12 @@ std::string guessRegionFromDomain(std::string domain) {
 		const char* service = knownServices[i];
 
 		std::size_t p = domain.find(service);
-
 		if (p == std::string::npos || (p >= 1 && domain[p - 1] != '.')) {
 			// eg. 127.0.0.1, example.com, s3-service.example.com, mys3.example.com
 			continue;
 		}
 
-		StringRef h(domain.c_str() + p);
+		StringRef h = StringRef(domain).substr(p);
 
 		if (!h.startsWith("oss-"_sr)) {
 			h.eat(service); // ignore s3 service
@@ -317,10 +317,12 @@ Reference<S3BlobStoreEndpoint> S3BlobStoreEndpoint::fromString(const std::string
 			}
 
 			// The parameter is known to S3BlobStoreEndpoint so it must be numeric and valid.
-			char* valueEnd;
-			int ivalue = strtol(value.toString().c_str(), &valueEnd, 10);
-			if (*valueEnd || (ivalue == 0 && value.toString() != "0"))
-				throw format("%s is not a valid value for %s", value.toString().c_str(), name.toString().c_str());
+			char* valueEnd = nullptr;
+			std::string s = value.toString();
+			long int ivalue = strtol(s.c_str(), &valueEnd, 10);
+			if (*valueEnd || (ivalue == 0 && s != "0") ||
+			    (((ivalue == LONG_MAX) || (ivalue == LONG_MIN)) && errno == ERANGE))
+				throw format("%s is not a valid value for %s", s.c_str(), name.toString().c_str());
 
 			// It should not be possible for this set to fail now since the dummy set above had to have worked.
 			ASSERT(knobs.set(name, ivalue));
@@ -433,7 +435,7 @@ ACTOR Future<bool> bucketExists_impl(Reference<S3BlobStoreEndpoint> b, std::stri
 	std::string resource = constructResourcePath(b, bucket, "");
 	HTTP::Headers headers;
 
-	Reference<HTTP::Response> r = wait(b->doRequest("HEAD", resource, headers, nullptr, 0, { 200, 404 }));
+	Reference<HTTP::IncomingResponse> r = wait(b->doRequest("HEAD", resource, headers, nullptr, 0, { 200, 404 }));
 	return r->code == 200;
 }
 
@@ -447,7 +449,7 @@ ACTOR Future<bool> objectExists_impl(Reference<S3BlobStoreEndpoint> b, std::stri
 	std::string resource = constructResourcePath(b, bucket, object);
 	HTTP::Headers headers;
 
-	Reference<HTTP::Response> r = wait(b->doRequest("HEAD", resource, headers, nullptr, 0, { 200, 404 }));
+	Reference<HTTP::IncomingResponse> r = wait(b->doRequest("HEAD", resource, headers, nullptr, 0, { 200, 404 }));
 	return r->code == 200;
 }
 
@@ -462,7 +464,8 @@ ACTOR Future<Void> deleteObject_impl(Reference<S3BlobStoreEndpoint> b, std::stri
 	HTTP::Headers headers;
 	// 200 or 204 means object successfully deleted, 404 means it already doesn't exist, so any of those are considered
 	// successful
-	Reference<HTTP::Response> r = wait(b->doRequest("DELETE", resource, headers, nullptr, 0, { 200, 204, 404 }));
+	Reference<HTTP::IncomingResponse> r =
+	    wait(b->doRequest("DELETE", resource, headers, nullptr, 0, { 200, 204, 404 }));
 
 	// But if the object already did not exist then the 'delete' is assumed to be successful but a warning is logged.
 	if (r->code == 404) {
@@ -555,7 +558,8 @@ ACTOR Future<Void> createBucket_impl(Reference<S3BlobStoreEndpoint> b, std::stri
 
 		std::string region = b->getRegion();
 		if (region.empty()) {
-			Reference<HTTP::Response> r = wait(b->doRequest("PUT", resource, headers, nullptr, 0, { 200, 409 }));
+			Reference<HTTP::IncomingResponse> r =
+			    wait(b->doRequest("PUT", resource, headers, nullptr, 0, { 200, 409 }));
 		} else {
 			UnsentPacketQueue packets;
 			StringRef body(format("<CreateBucketConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">"
@@ -565,7 +569,7 @@ ACTOR Future<Void> createBucket_impl(Reference<S3BlobStoreEndpoint> b, std::stri
 			PacketWriter pw(packets.getWriteBuffer(), nullptr, Unversioned());
 			pw.serializeBytes(body);
 
-			Reference<HTTP::Response> r =
+			Reference<HTTP::IncomingResponse> r =
 			    wait(b->doRequest("PUT", resource, headers, &packets, body.size(), { 200, 409 }));
 		}
 	}
@@ -582,10 +586,10 @@ ACTOR Future<int64_t> objectSize_impl(Reference<S3BlobStoreEndpoint> b, std::str
 	std::string resource = constructResourcePath(b, bucket, object);
 	HTTP::Headers headers;
 
-	Reference<HTTP::Response> r = wait(b->doRequest("HEAD", resource, headers, nullptr, 0, { 200, 404 }));
+	Reference<HTTP::IncomingResponse> r = wait(b->doRequest("HEAD", resource, headers, nullptr, 0, { 200, 404 }));
 	if (r->code == 404)
 		throw file_not_found();
-	return r->contentLen;
+	return r->data.contentLen;
 }
 
 Future<int64_t> S3BlobStoreEndpoint::objectSize(std::string const& bucket, std::string const& object) {
@@ -741,13 +745,20 @@ ACTOR Future<S3BlobStoreEndpoint::ReusableConnection> connect_impl(Reference<S3B
 			TraceEvent("S3BlobStoreEndpointReusingConnected")
 			    .suppressFor(60)
 			    .detail("RemoteEndpoint", rconn.conn->getPeerAddress())
-			    .detail("ExpiresIn", rconn.expirationTime - now());
+			    .detail("ExpiresIn", rconn.expirationTime - now())
+			    .detail("Proxy", b->proxyHost.orDefault(""));
 			return rconn;
 		}
 		++b->blobStats->expiredConnections;
 	}
 	++b->blobStats->newConnections;
 	std::string host = b->host, service = b->service;
+	TraceEvent(SevDebug, "S3BlobStoreEndpointBuildingNewConnection")
+	    .detail("UseProxy", b->useProxy)
+	    .detail("TLS", b->knobs.secure_connection == 1)
+	    .detail("Host", host)
+	    .detail("Service", service)
+	    .log();
 	if (service.empty()) {
 		if (b->useProxy) {
 			fprintf(stderr, "ERROR: Port can't be empty when using HTTP proxy.\n");
@@ -773,10 +784,11 @@ ACTOR Future<S3BlobStoreEndpoint::ReusableConnection> connect_impl(Reference<S3B
 	}
 	wait(conn->connectHandshake());
 
-	TraceEvent("S3BlobStoreEndpointNewConnection")
+	TraceEvent("S3BlobStoreEndpointNewConnectionSuccess")
 	    .suppressFor(60)
 	    .detail("RemoteEndpoint", conn->getPeerAddress())
-	    .detail("ExpiresIn", b->knobs.max_connection_life);
+	    .detail("ExpiresIn", b->knobs.max_connection_life)
+	    .detail("Proxy", b->proxyHost.orDefault(""));
 
 	if (b->lookupKey || b->lookupSecret || b->knobs.sdk_auth)
 		wait(b->updateSecret());
@@ -834,25 +846,132 @@ std::string awsCanonicalURI(const std::string& resource, std::vector<std::string
 	return canonicalURI;
 }
 
+// ref: https://docs.aws.amazon.com/AmazonS3/latest/API/ErrorResponses.html
+std::string parseErrorCodeFromS3(std::string xmlResponse) {
+	// Copy XML string to a modifiable buffer
+	try {
+		std::vector<char> xmlBuffer(xmlResponse.begin(), xmlResponse.end());
+		xmlBuffer.push_back('\0'); // Ensure null-terminated string
+		// Parse the XML
+		xml_document<> doc;
+		doc.parse<0>(&xmlBuffer[0]);
+		// Find the root node
+		xml_node<>* root = doc.first_node("Error");
+		if (!root) {
+			TraceEvent(SevWarn, "ParseS3XMLResponseNoError").detail("Response", xmlResponse).log();
+			return "";
+		}
+		// Find the <Code> node
+		xml_node<>* codeNode = root->first_node("Code");
+		if (!codeNode) {
+			TraceEvent(SevWarn, "ParseS3XMLResponseNoErrorCode").detail("Response", xmlResponse).log();
+			return "";
+		}
+		return std::string(codeNode->value());
+	} catch (Error e) {
+		TraceEvent("BackupParseS3ErrorCodeFailure").errorUnsuppressed(e);
+		throw backup_parse_s3_response_failure();
+	} catch (...) {
+		throw backup_parse_s3_response_failure();
+	}
+}
+
+bool isS3TokenError(const std::string& s3Error) {
+	return s3Error == "InvalidToken" || s3Error == "ExpiredToken";
+}
+
+void setHeaders(Reference<S3BlobStoreEndpoint> bstore, Reference<HTTP::OutgoingRequest> req) {
+	// Finish/update the request headers (which includes Date header)
+	// This must be done AFTER the connection is ready because if credentials are coming from disk they are
+	// refreshed when a new connection is established and setAuthHeaders() would need the updated secret.
+	if (bstore->credentials.present() && !bstore->credentials.get().securityToken.empty())
+		req->data.headers["x-amz-security-token"] = bstore->credentials.get().securityToken;
+	if (CLIENT_KNOBS->HTTP_REQUEST_AWS_V4_HEADER) {
+		bstore->setV4AuthHeaders(req->verb, req->resource, req->data.headers);
+	} else {
+		bstore->setAuthHeaders(req->verb, req->resource, req->data.headers);
+	}
+}
+
+std::string getCanonicalURI(Reference<S3BlobStoreEndpoint> bstore, Reference<HTTP::OutgoingRequest> req) {
+	std::vector<std::string> queryParameters;
+	std::string canonicalURI =
+	    awsCanonicalURI(req->resource, queryParameters, CLIENT_KNOBS->HTTP_REQUEST_AWS_V4_HEADER);
+	if (!queryParameters.empty()) {
+		canonicalURI += "?";
+		canonicalURI += boost::algorithm::join(queryParameters, "&");
+	}
+
+	if (bstore->useProxy && bstore->knobs.secure_connection == 0) {
+		// Has to be in absolute-form.
+		canonicalURI = "http://" + bstore->host + ":" + bstore->service + canonicalURI;
+	}
+	return canonicalURI;
+}
+
+void populateDryrunRequest(Reference<HTTP::OutgoingRequest> dryrunRequest,
+                           Reference<S3BlobStoreEndpoint> bstore,
+                           std::string bucket) {
+	// dryrun with a check bucket exist request, to avoid sending duplicate data
+	HTTP::Headers headers;
+	dryrunRequest->verb = "GET";
+	dryrunRequest->data.contentLen = 0;
+	dryrunRequest->data.headers = headers;
+	dryrunRequest->data.headers["Host"] = bstore->host;
+	dryrunRequest->data.headers["Accept"] = "application/xml";
+
+	dryrunRequest->resource = constructResourcePath(bstore, bucket, "");
+}
+
+bool isWriteRequest(std::string verb) {
+	return verb == "POST" || verb == "PUT";
+}
+
+std::string parseBucketFromURI(std::string uri) {
+	if (uri.size() <= 1 || uri[0] != '/') {
+		// there is no bucket in the uri
+		return "";
+	}
+	uri = uri.substr(1);
+	size_t secondSlash = uri.find('/');
+	if (secondSlash == std::string::npos) {
+		return uri;
+	}
+	return uri.substr(0, secondSlash);
+}
+
 // Do a request, get a Response.
 // Request content is provided as UnsentPacketQueue *pContent which will be depleted as bytes are sent but the queue
 // itself must live for the life of this actor and be destroyed by the caller
-ACTOR Future<Reference<HTTP::Response>> doRequest_impl(Reference<S3BlobStoreEndpoint> bstore,
-                                                       std::string verb,
-                                                       std::string resource,
-                                                       HTTP::Headers headers,
-                                                       UnsentPacketQueue* pContent,
-                                                       int contentLen,
-                                                       std::set<unsigned int> successCodes) {
+ACTOR Future<Reference<HTTP::IncomingResponse>> doRequest_impl(Reference<S3BlobStoreEndpoint> bstore,
+                                                               std::string verb,
+                                                               std::string resource,
+                                                               HTTP::Headers headers,
+                                                               UnsentPacketQueue* pContent,
+                                                               int contentLen,
+                                                               std::set<unsigned int> successCodes) {
 	state UnsentPacketQueue contentCopy;
+	state UnsentPacketQueue dryrunContentCopy; // NonCopyable state var so must be declared at top of actor
+	state Reference<HTTP::OutgoingRequest> req = makeReference<HTTP::OutgoingRequest>();
+	state Reference<HTTP::OutgoingRequest> dryrunRequest = makeReference<HTTP::OutgoingRequest>();
+	req->verb = verb;
+	req->data.content = &contentCopy;
+	req->data.contentLen = contentLen;
 
-	headers["Content-Length"] = format("%d", contentLen);
-	headers["Host"] = bstore->host;
-	headers["Accept"] = "application/xml";
+	req->data.headers = headers;
+	req->data.headers["Host"] = bstore->host;
+	req->data.headers["Accept"] = "application/xml";
+
+	// Avoid to send request with an empty resource.
+	if (resource.empty()) {
+		resource = "/";
+	}
+
+	req->resource = resource;
 
 	// Merge extraHeaders into headers
 	for (const auto& [k, v] : bstore->extraHeaders) {
-		std::string& fieldValue = headers[k];
+		std::string& fieldValue = req->data.headers[k];
 		if (!fieldValue.empty()) {
 			fieldValue.append(",");
 		}
@@ -870,19 +989,23 @@ ACTOR Future<Reference<HTTP::Response>> doRequest_impl(Reference<S3BlobStoreEndp
 
 	state int maxTries = std::min(bstore->knobs.request_tries, bstore->knobs.connect_tries);
 	state int thisTry = 1;
+	state int badRequestCode = 400;
+	state bool s3TokenError = false;
 	state double nextRetryDelay = 2.0;
 
 	loop {
 		state Optional<Error> err;
 		state Optional<NetworkAddress> remoteAddress;
 		state bool connectionEstablished = false;
-		state Reference<HTTP::Response> r;
+		state Reference<HTTP::IncomingResponse> r;
+		state Reference<HTTP::IncomingResponse> dryrunR;
 		state std::string canonicalURI = resource;
 		state UID connID = UID();
 		state double reqStartTimer;
 		state double connectStartTimer = g_network->timer();
 		state bool reusingConn = false;
 		state bool fastRetry = false;
+		state bool simulateS3TokenError = false;
 
 		try {
 			// Start connecting
@@ -890,7 +1013,7 @@ ACTOR Future<Reference<HTTP::Response>> doRequest_impl(Reference<S3BlobStoreEndp
 
 			// Make a shallow copy of the queue by calling addref() on each buffer in the chain and then prepending that
 			// chain to contentCopy
-			contentCopy.discardAll();
+			req->data.content->discardAll();
 			if (pContent != nullptr) {
 				PacketBuffer* pFirst = pContent->getUnsent();
 				PacketBuffer* pLast = nullptr;
@@ -900,7 +1023,7 @@ ACTOR Future<Reference<HTTP::Response>> doRequest_impl(Reference<S3BlobStoreEndp
 					p->bytes_sent = 0;
 					pLast = p;
 				}
-				contentCopy.prependWriteBuffer(pFirst, pLast);
+				req->data.content->prependWriteBuffer(pFirst, pLast);
 			}
 
 			// Finish connecting, do request
@@ -910,54 +1033,91 @@ ACTOR Future<Reference<HTTP::Response>> doRequest_impl(Reference<S3BlobStoreEndp
 			connID = rconn.conn->getDebugID();
 			reqStartTimer = g_network->timer();
 
-			// Finish/update the request headers (which includes Date header)
-			// This must be done AFTER the connection is ready because if credentials are coming from disk they are
-			// refreshed when a new connection is established and setAuthHeaders() would need the updated secret.
-			if (bstore->credentials.present() && !bstore->credentials.get().securityToken.empty())
-				headers["x-amz-security-token"] = bstore->credentials.get().securityToken;
-			if (CLIENT_KNOBS->HTTP_REQUEST_AWS_V4_HEADER) {
-				bstore->setV4AuthHeaders(verb, resource, headers);
-			} else {
-				bstore->setAuthHeaders(verb, resource, headers);
+			try {
+				if (s3TokenError && isWriteRequest(req->verb) && CLIENT_KNOBS->BACKUP_ALLOW_DRYRUN) {
+					// if it is a write request with s3TokenError, retry with a HEAD dryrun request
+					// to avoid sending duplicate data indefinitly to save network bandwidth
+					// because it might due to expired or invalid S3 token from the disk
+					state std::string bucket = parseBucketFromURI(resource);
+					if (bucket.empty()) {
+						TraceEvent(SevError, "EmptyBucketRequest")
+						    .detail("S3TokenError", s3TokenError)
+						    .detail("Verb", req->verb)
+						    .detail("Resource", resource)
+						    .log();
+						throw bucket_not_in_url();
+					}
+					dryrunRequest->data.content = &dryrunContentCopy;
+					dryrunRequest->data.content->discardAll(); // this should always be empty
+					populateDryrunRequest(dryrunRequest, bstore, bucket);
+					setHeaders(bstore, dryrunRequest);
+					dryrunRequest->resource = getCanonicalURI(bstore, dryrunRequest);
+					TraceEvent("RetryS3RequestDueToTokenIssue")
+					    .detail("S3TokenError", s3TokenError)
+					    .detail("OriginalResource", resource)
+					    .detail("DryrunResource", dryrunRequest->resource)
+					    .detail("Bucket", bucket)
+					    .detail("V4", CLIENT_KNOBS->HTTP_REQUEST_AWS_V4_HEADER)
+					    .log();
+					wait(bstore->requestRate->getAllowance(1));
+					Future<Reference<HTTP::IncomingResponse>> dryrunResponse = HTTP::doRequest(
+					    rconn.conn, dryrunRequest, bstore->sendRate, &bstore->s_stats.bytes_sent, bstore->recvRate);
+					Reference<HTTP::IncomingResponse> _dryrunR = wait(timeoutError(dryrunResponse, requestTimeout));
+					dryrunR = _dryrunR;
+					std::string s3Error = parseErrorCodeFromS3(dryrunR->data.content);
+					if (dryrunR->code == badRequestCode && isS3TokenError(s3Error)) {
+						// authentication fails and s3 token error persists, retry in the hope token is corrected
+						wait(delay(bstore->knobs.max_delay_retryable_error));
+					} else if (dryrunR->code == 200 || dryrunR->code == 404) {
+						// authentication has passed, and bucket existence has been verified(200 or 404)
+						// it might work now(or it might be another error) thus reset s3TokenError.
+						TraceEvent("S3TokenIssueResolved")
+						    .detail("HttpCode", dryrunR->code)
+						    .detail("HttpResponseContent", dryrunR->data.content)
+						    .detail("S3Error", s3Error)
+						    .detail("URI", dryrunRequest->resource)
+						    .log();
+						s3TokenError = false;
+					} else {
+						TraceEvent(SevError, "S3UnexpectedError")
+						    .detail("HttpCode", dryrunR->code)
+						    .detail("HttpResponseContent", dryrunR->data.content)
+						    .detail("S3Error", s3Error)
+						    .detail("URI", dryrunRequest->resource)
+						    .log();
+						throw http_bad_response();
+					}
+					continue;
+				}
+			} catch (Error& e) {
+				// retry with GET failed, but continue to do original request anyway
+				TraceEvent(SevError, "ErrorDuringRetryS3TokenIssue").errorUnsuppressed(e);
 			}
-
-			std::vector<std::string> queryParameters;
-			canonicalURI = awsCanonicalURI(resource, queryParameters, CLIENT_KNOBS->HTTP_REQUEST_AWS_V4_HEADER);
-			if (!queryParameters.empty()) {
-				canonicalURI += "?";
-				canonicalURI += boost::algorithm::join(queryParameters, "&");
-			}
-
-			if (bstore->useProxy && bstore->knobs.secure_connection == 0) {
-				// Has to be in absolute-form.
-				canonicalURI = "http://" + bstore->host + ":" + bstore->service + canonicalURI;
-			}
+			setHeaders(bstore, req);
+			req->resource = getCanonicalURI(bstore, req);
 
 			remoteAddress = rconn.conn->getPeerAddress();
 			wait(bstore->requestRate->getAllowance(1));
 
-			Future<Reference<HTTP::Response>> reqF = HTTP::doRequest(rconn.conn,
-			                                                         verb,
-			                                                         canonicalURI,
-			                                                         headers,
-			                                                         &contentCopy,
-			                                                         contentLen,
-			                                                         bstore->sendRate,
-			                                                         &bstore->s_stats.bytes_sent,
-			                                                         bstore->recvRate);
-
+			Future<Reference<HTTP::IncomingResponse>> reqF =
+			    HTTP::doRequest(rconn.conn, req, bstore->sendRate, &bstore->s_stats.bytes_sent, bstore->recvRate);
 			// if we reused a connection from the pool, and immediately got an error, retry immediately discarding the
 			// connection
 			if (reqF.isReady() && reusingConn) {
 				fastRetry = true;
 			}
 
-			Reference<HTTP::Response> _r = wait(timeoutError(reqF, requestTimeout));
+			Reference<HTTP::IncomingResponse> _r = wait(timeoutError(reqF, requestTimeout));
+			if (g_network->isSimulated() && deterministicRandom()->random01() < 0.1) {
+				// simulate an error from s3
+				_r->code = badRequestCode;
+				simulateS3TokenError = true;
+			}
 			r = _r;
 
 			// Since the response was parsed successfully (which is why we are here) reuse the connection unless we
 			// received the "Connection: close" header.
-			if (r->headers["Connection"] != "close") {
+			if (r->data.headers["Connection"] != "close") {
 				bstore->returnConnection(rconn);
 			} else {
 				++bstore->blobStats->expiredConnections;
@@ -965,6 +1125,7 @@ ACTOR Future<Reference<HTTP::Response>> doRequest_impl(Reference<S3BlobStoreEndp
 			rconn.conn.clear();
 
 		} catch (Error& e) {
+			TraceEvent("S3BlobStoreDoRequestError").errorUnsuppressed(e);
 			if (e.code() == error_code_actor_cancelled)
 				throw;
 			// TODO: should this also do rconn.conn.clear()? (would need to extend lifetime outside of try block)
@@ -990,7 +1151,6 @@ ACTOR Future<Reference<HTTP::Response>> doRequest_impl(Reference<S3BlobStoreEndp
 
 		// All errors in err are potentially retryable as well as certain HTTP response codes...
 		bool retryable = err.present() || r->code == 500 || r->code == 502 || r->code == 503 || r->code == 429;
-
 		// But only if our previous attempt was not the last allowable try.
 		retryable = retryable && (thisTry < maxTries);
 
@@ -1003,13 +1163,30 @@ ACTOR Future<Reference<HTTP::Response>> doRequest_impl(Reference<S3BlobStoreEndp
 		                                        : "S3BlobStoreEndpointRequestFailedRetryable")
 		                           : "S3BlobStoreEndpointRequestFailed");
 
+		bool connectionFailed = false;
 		// Attach err to trace event if present, otherwise extract some stuff from the response
 		if (err.present()) {
 			event.errorUnsuppressed(err.get());
+			if (err.get().code() == error_code_connection_failed) {
+				connectionFailed = true;
+			}
 		}
 		event.suppressFor(60);
+
 		if (!err.present()) {
 			event.detail("ResponseCode", r->code);
+			std::string s3Error = parseErrorCodeFromS3(r->data.content);
+			event.detail("S3ErrorCode", s3Error);
+			if (r->code == badRequestCode) {
+				if (isS3TokenError(s3Error) || simulateS3TokenError) {
+					s3TokenError = true;
+				}
+				TraceEvent(SevWarnAlways, "S3BlobStoreBadRequest")
+				    .detail("HttpCode", r->code)
+				    .detail("HttpResponseContent", r->data.content)
+				    .detail("S3Error", s3Error)
+				    .log();
+			}
 		}
 
 		event.detail("ConnectionEstablished", connectionEstablished);
@@ -1025,7 +1202,11 @@ ACTOR Future<Reference<HTTP::Response>> doRequest_impl(Reference<S3BlobStoreEndp
 		else
 			event.detail("RemoteHost", bstore->host);
 
-		event.detail("Verb", verb).detail("Resource", resource).detail("ThisTry", thisTry);
+		event.detail("Verb", verb)
+		    .detail("Resource", resource)
+		    .detail("ThisTry", thisTry)
+		    .detail("URI", canonicalURI)
+		    .detail("Proxy", bstore->proxyHost.orDefault(""));
 
 		// If r is not valid or not code 429 then increment the try count.  429's will not count against the attempt
 		// limit. Also skip incrementing the retry count for fast retries
@@ -1035,16 +1216,19 @@ ACTOR Future<Reference<HTTP::Response>> doRequest_impl(Reference<S3BlobStoreEndp
 		if (fastRetry) {
 			++bstore->blobStats->fastRetries;
 			wait(delay(0));
-		} else if (retryable) {
+		} else if (retryable || s3TokenError) {
 			// We will wait delay seconds before the next retry, start with nextRetryDelay.
 			double delay = nextRetryDelay;
+			// conenctionFailed is treated specially as we know proxy to AWS can only serve 1 request per connection
+			// so there is no point of waiting too long, instead retry more aggressively
+			double limit =
+			    connectionFailed ? bstore->knobs.max_delay_connection_failed : bstore->knobs.max_delay_retryable_error;
 			// Double but limit the *next* nextRetryDelay.
-			nextRetryDelay = std::min(nextRetryDelay * 2, 60.0);
-
+			nextRetryDelay = std::min(nextRetryDelay * 2, limit);
 			// If r is valid then obey the Retry-After response header if present.
 			if (r) {
-				auto iRetryAfter = r->headers.find("Retry-After");
-				if (iRetryAfter != r->headers.end()) {
+				auto iRetryAfter = r->data.headers.find("Retry-After");
+				if (iRetryAfter != r->data.headers.end()) {
 					event.detail("RetryAfterHeader", iRetryAfter->second);
 					char* pEnd;
 					double retryAfter = strtod(iRetryAfter->second.c_str(), &pEnd);
@@ -1055,7 +1239,6 @@ ACTOR Future<Reference<HTTP::Response>> doRequest_impl(Reference<S3BlobStoreEndp
 					delay = std::max(delay, retryAfter);
 				}
 			}
-
 			// Log the delay then wait.
 
 			event.detail("RetryDelay", delay);
@@ -1096,12 +1279,12 @@ ACTOR Future<Reference<HTTP::Response>> doRequest_impl(Reference<S3BlobStoreEndp
 	}
 }
 
-Future<Reference<HTTP::Response>> S3BlobStoreEndpoint::doRequest(std::string const& verb,
-                                                                 std::string const& resource,
-                                                                 const HTTP::Headers& headers,
-                                                                 UnsentPacketQueue* pContent,
-                                                                 int contentLen,
-                                                                 std::set<unsigned int> successCodes) {
+Future<Reference<HTTP::IncomingResponse>> S3BlobStoreEndpoint::doRequest(std::string const& verb,
+                                                                         std::string const& resource,
+                                                                         const HTTP::Headers& headers,
+                                                                         UnsentPacketQueue* pContent,
+                                                                         int contentLen,
+                                                                         std::set<unsigned int> successCodes) {
 	return doRequest_impl(
 	    Reference<S3BlobStoreEndpoint>::addRef(this), verb, resource, headers, pContent, contentLen, successCodes);
 }
@@ -1134,7 +1317,8 @@ ACTOR Future<Void> listObjectsStream_impl(Reference<S3BlobStoreEndpoint> bstore,
 		HTTP::Headers headers;
 		state std::string fullResource = resource + lastFile;
 		lastFile.clear();
-		Reference<HTTP::Response> r = wait(bstore->doRequest("GET", fullResource, headers, nullptr, 0, { 200 }));
+		Reference<HTTP::IncomingResponse> r =
+		    wait(bstore->doRequest("GET", fullResource, headers, nullptr, 0, { 200 }));
 		listReleaser.release();
 
 		try {
@@ -1142,7 +1326,7 @@ ACTOR Future<Void> listObjectsStream_impl(Reference<S3BlobStoreEndpoint> bstore,
 			xml_document<> doc;
 
 			// Copy content because rapidxml will modify it during parse
-			std::string content = r->content;
+			std::string content = r->data.content;
 			doc.parse<0>((char*)content.c_str());
 
 			// There should be exactly one node
@@ -1313,14 +1497,15 @@ ACTOR Future<std::vector<std::string>> listBuckets_impl(Reference<S3BlobStoreEnd
 
 		HTTP::Headers headers;
 		state std::string fullResource = resource + lastName;
-		Reference<HTTP::Response> r = wait(bstore->doRequest("GET", fullResource, headers, nullptr, 0, { 200 }));
+		Reference<HTTP::IncomingResponse> r =
+		    wait(bstore->doRequest("GET", fullResource, headers, nullptr, 0, { 200 }));
 		listReleaser.release();
 
 		try {
 			xml_document<> doc;
 
 			// Copy content because rapidxml will modify it during parse
-			std::string content = r->content;
+			std::string content = r->data.content;
 			doc.parse<0>((char*)content.c_str());
 
 			// There should be exactly one node
@@ -1593,10 +1778,10 @@ ACTOR Future<std::string> readEntireFile_impl(Reference<S3BlobStoreEndpoint> bst
 
 	std::string resource = constructResourcePath(bstore, bucket, object);
 	HTTP::Headers headers;
-	Reference<HTTP::Response> r = wait(bstore->doRequest("GET", resource, headers, nullptr, 0, { 200, 404 }));
+	Reference<HTTP::IncomingResponse> r = wait(bstore->doRequest("GET", resource, headers, nullptr, 0, { 200, 404 }));
 	if (r->code == 404)
 		throw file_not_found();
-	return r->content;
+	return r->data.content;
 }
 
 Future<std::string> S3BlobStoreEndpoint::readEntireFile(std::string const& bucket, std::string const& object) {
@@ -1622,11 +1807,11 @@ ACTOR Future<Void> writeEntireFileFromBuffer_impl(Reference<S3BlobStoreEndpoint>
 	headers["Content-MD5"] = contentMD5;
 	if (!CLIENT_KNOBS->BLOBSTORE_ENCRYPTION_TYPE.empty())
 		headers["x-amz-server-side-encryption"] = CLIENT_KNOBS->BLOBSTORE_ENCRYPTION_TYPE;
-	state Reference<HTTP::Response> r =
+	state Reference<HTTP::IncomingResponse> r =
 	    wait(bstore->doRequest("PUT", resource, headers, pContent, contentLen, { 200 }));
 
 	// For uploads, Blobstore returns an MD5 sum of uploaded content so check it.
-	if (!r->verifyMD5(false, contentMD5))
+	if (!HTTP::verifyMD5(&r->data, false, contentMD5))
 		throw checksum_failed();
 
 	return Void();
@@ -1690,15 +1875,16 @@ ACTOR Future<int> readObject_impl(Reference<S3BlobStoreEndpoint> bstore,
 	std::string resource = constructResourcePath(bstore, bucket, object);
 	HTTP::Headers headers;
 	headers["Range"] = format("bytes=%lld-%lld", offset, offset + length - 1);
-	Reference<HTTP::Response> r = wait(bstore->doRequest("GET", resource, headers, nullptr, 0, { 200, 206, 404 }));
+	Reference<HTTP::IncomingResponse> r =
+	    wait(bstore->doRequest("GET", resource, headers, nullptr, 0, { 200, 206, 404 }));
 	if (r->code == 404)
 		throw file_not_found();
-	if (r->contentLen !=
-	    r->content.size()) // Double check that this wasn't a header-only response, probably unnecessary
+	if (r->data.contentLen !=
+	    r->data.content.size()) // Double check that this wasn't a header-only response, probably unnecessary
 		throw io_error();
 	// Copy the output bytes, server could have sent more or less bytes than requested so copy at most length bytes
-	memcpy(data, r->content.data(), std::min<int64_t>(r->contentLen, length));
-	return r->contentLen;
+	memcpy(data, r->data.content.data(), std::min<int64_t>(r->data.contentLen, length));
+	return r->data.contentLen;
 }
 
 Future<int> S3BlobStoreEndpoint::readObject(std::string const& bucket,
@@ -1719,12 +1905,12 @@ ACTOR static Future<std::string> beginMultiPartUpload_impl(Reference<S3BlobStore
 	HTTP::Headers headers;
 	if (!CLIENT_KNOBS->BLOBSTORE_ENCRYPTION_TYPE.empty())
 		headers["x-amz-server-side-encryption"] = CLIENT_KNOBS->BLOBSTORE_ENCRYPTION_TYPE;
-	Reference<HTTP::Response> r = wait(bstore->doRequest("POST", resource, headers, nullptr, 0, { 200 }));
+	Reference<HTTP::IncomingResponse> r = wait(bstore->doRequest("POST", resource, headers, nullptr, 0, { 200 }));
 
 	try {
 		xml_document<> doc;
 		// Copy content because rapidxml will modify it during parse
-		std::string content = r->content;
+		std::string content = r->data.content;
 
 		doc.parse<0>((char*)content.c_str());
 
@@ -1762,18 +1948,18 @@ ACTOR Future<std::string> uploadPart_impl(Reference<S3BlobStoreEndpoint> bstore,
 	HTTP::Headers headers;
 	// Send MD5 sum for content so blobstore can verify it
 	headers["Content-MD5"] = contentMD5;
-	state Reference<HTTP::Response> r =
+	state Reference<HTTP::IncomingResponse> r =
 	    wait(bstore->doRequest("PUT", resource, headers, pContent, contentLen, { 200 }));
 	// TODO:  In the event that the client times out just before the request completes (so the client is unaware) then
 	// the next retry will see error 400.  That could be detected and handled gracefully by retrieving the etag for the
 	// successful request.
 
 	// For uploads, Blobstore returns an MD5 sum of uploaded content so check it.
-	if (!r->verifyMD5(false, contentMD5))
+	if (!HTTP::verifyMD5(&r->data, false, contentMD5))
 		throw checksum_failed();
 
 	// No etag -> bad response.
-	std::string etag = r->headers["ETag"];
+	std::string etag = r->data.headers["ETag"];
 	if (etag.empty())
 		throw http_bad_response();
 
@@ -1815,7 +2001,7 @@ ACTOR Future<Void> finishMultiPartUpload_impl(Reference<S3BlobStoreEndpoint> bst
 	HTTP::Headers headers;
 	PacketWriter pw(part_list.getWriteBuffer(manifest.size()), nullptr, Unversioned());
 	pw.serializeBytes(manifest);
-	Reference<HTTP::Response> r =
+	Reference<HTTP::IncomingResponse> r =
 	    wait(bstore->doRequest("POST", resource, headers, &part_list, manifest.size(), { 200 }));
 	// TODO:  In the event that the client times out just before the request completes (so the client is unaware) then
 	// the next retry will see error 400.  That could be detected and handled gracefully by HEAD'ing the object before
@@ -1881,5 +2067,25 @@ TEST_CASE("/backup/s3/v4headers") {
 		ASSERT(headers["Content-Type"] == "Application/x-amz-json-1.0");
 	}
 
+	return Void();
+}
+
+TEST_CASE("/backup/s3/guess_region") {
+	std::string url = "blobstore://s3.us-west-2.amazonaws.com/resource_name?bucket=bucket_name&sa=1";
+
+	std::string resource;
+	std::string error;
+	S3BlobStoreEndpoint::ParametersT parameters;
+	Reference<S3BlobStoreEndpoint> s3 = S3BlobStoreEndpoint::fromString(url, {}, &resource, &error, &parameters);
+	ASSERT(s3->getRegion() == "us-west-2");
+
+	url = "blobstore://s3.us-west-2.amazonaws.com/resource_name?bucket=bucket_name&sc=922337203685477580700";
+	try {
+		s3 = S3BlobStoreEndpoint::fromString(url, {}, &resource, &error, &parameters);
+		ASSERT(false); // not reached
+	} catch (Error& e) {
+		// conversion of 922337203685477580700 to long int will overflow
+		ASSERT_EQ(e.code(), error_code_backup_invalid_url);
+	}
 	return Void();
 }

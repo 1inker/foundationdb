@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -50,13 +50,8 @@ struct Event {
 
 	template <typename Ar>
 	Ar& serialize(Ar& ar) {
-		if (ar.protocolVersion().hasTenants()) {
-			return serializer(ar, type, startTs, dcId, tenant);
-		} else if (ar.protocolVersion().version() >= (uint64_t)0x0FDB00B063010001LL) {
-			return serializer(ar, type, startTs, dcId);
-		} else {
-			return serializer(ar, type, startTs);
-		}
+		ASSERT_WE_THINK(ar.protocolVersion().hasTenants());
+		return serializer(ar, type, startTs, dcId, tenant);
 	}
 
 	EventType type{ EventType::UNSET };

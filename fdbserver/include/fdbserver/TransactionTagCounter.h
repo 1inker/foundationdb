@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -28,7 +28,7 @@ class TransactionTagCounter {
 	PImpl<class TransactionTagCounterImpl> impl;
 
 public:
-	TransactionTagCounter(UID thisServerID);
+	TransactionTagCounter(UID thisServerID, int maxTagsTracked, double minRateTracked);
 	~TransactionTagCounter();
 
 	// Update counters tracking the busyness of each tag in the current interval
@@ -38,5 +38,5 @@ public:
 	void startNewInterval();
 
 	// Returns the set of busiest tags as of the end of the last interval
-	std::vector<StorageQueuingMetricsReply::TagInfo> const& getBusiestTags() const;
+	std::vector<BusyTagInfo> const& getBusiestTags() const;
 };

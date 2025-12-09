@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2023 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -25,7 +25,7 @@
 #include "flow/Trace.h"
 #include "flow/IPAddress.h"
 
-FDB_DECLARE_BOOLEAN_PARAM(NetworkAddressFromHostname);
+FDB_BOOLEAN_PARAM(NetworkAddressFromHostname);
 
 struct NetworkAddress {
 	constexpr static FileIdentifier file_identifier = 14155727;
@@ -189,7 +189,7 @@ struct AddressExclusion {
 		return ip == addr.ip && port == addr.port;
 	}
 
-	// This is for debugging and IS NOT to be used for serialization to persistant state
+	// This is for debugging and IS NOT to be used for serialization to persistent state
 	std::string toString() const {
 		if (!isWholeMachine())
 			return formatIpPort(ip, port);

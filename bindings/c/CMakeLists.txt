@@ -212,7 +212,7 @@ if(NOT WIN32)
 
   target_include_directories(fdb_c_api_tester_impl PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR}/foundationdb/ ${CMAKE_SOURCE_DIR}/flow/include ${CMAKE_BINARY_DIR}/flow/include)
   target_link_libraries(fdb_c_api_tester_impl PRIVATE fdb_cpp toml11_target Threads::Threads fmt::fmt boost_target)
-  if(NOT APPLE)
+  if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
     target_link_libraries(fdb_c_api_tester_impl PRIVATE stdc++fs)
   endif()
   target_link_libraries(fdb_c_api_tester_impl PRIVATE SimpleOpt)
@@ -333,22 +333,6 @@ if(NOT WIN32)
         --client-config-tester-bin $<TARGET_FILE:fdb_c_client_config_tester>
         )
 
-      add_python_venv_test(NAME fdb_c_upgrade_from_prev3_gradual
-        COMMAND python ${CMAKE_SOURCE_DIR}/tests/TestRunner/upgrade_test.py
-        --build-dir ${CMAKE_BINARY_DIR}
-        --test-file ${CMAKE_SOURCE_DIR}/bindings/c/test/apitester/tests/upgrade/MixedApiWorkloadMultiThr.toml
-        --upgrade-path "${FDB_PREV3_RELEASE_VERSION}" "${FDB_PREV2_RELEASE_VERSION}" "${FDB_PREV_RELEASE_VERSION}" "${FDB_CURRENT_VERSION}" "${FDB_PREV_RELEASE_VERSION}"
-        --process-number 3
-        )
-
-      add_python_venv_test(NAME fdb_c_upgrade_from_prev3_direct
-        COMMAND python ${CMAKE_SOURCE_DIR}/tests/TestRunner/upgrade_test.py
-        --build-dir ${CMAKE_BINARY_DIR}
-        --test-file ${CMAKE_SOURCE_DIR}/bindings/c/test/apitester/tests/upgrade/MixedApiWorkloadMultiThr.toml
-        --upgrade-path "${FDB_PREV3_RELEASE_VERSION}" "${FDB_CURRENT_VERSION}" "${FDB_PREV_RELEASE_VERSION}"
-        --process-number 3
-        )
-
       add_python_venv_test(NAME fdb_c_upgrade_from_prev2_gradual
         COMMAND python ${CMAKE_SOURCE_DIR}/tests/TestRunner/upgrade_test.py
         --build-dir ${CMAKE_BINARY_DIR}
@@ -439,17 +423,24 @@ elseif(NOT WIN32 AND NOT APPLE) # Linux Only
     ${SHIM_LIB_OUTPUT_DIR}/libfdb_c.so.tramp.S)
 
   set(IMPLIBSO_SRC_DIR ${CMAKE_SOURCE_DIR}/contrib/Implib.so)
+
+  if(CMAKE_SYSTEM_PROCESSOR STREQUAL "amd64")
+    set(IMPLIBSO_ARCH "x86_64")
+  else()
+    set(IMPLIBSO_ARCH ${CMAKE_SYSTEM_PROCESSOR})
+  endif()
+
   set(IMPLIBSO_SRC
     ${IMPLIBSO_SRC_DIR}/implib-gen.py
     ${IMPLIBSO_SRC_DIR}/arch/common/init.cpp.tpl
-    ${IMPLIBSO_SRC_DIR}/arch/${CMAKE_SYSTEM_PROCESSOR}/config.ini
-    ${IMPLIBSO_SRC_DIR}/arch/${CMAKE_SYSTEM_PROCESSOR}/table.S.tpl
-    ${IMPLIBSO_SRC_DIR}/arch/${CMAKE_SYSTEM_PROCESSOR}/trampoline.S.tpl
+    ${IMPLIBSO_SRC_DIR}/arch/${IMPLIBSO_ARCH}/config.ini
+    ${IMPLIBSO_SRC_DIR}/arch/${IMPLIBSO_ARCH}/table.S.tpl
+    ${IMPLIBSO_SRC_DIR}/arch/${IMPLIBSO_ARCH}/trampoline.S.tpl
     )
 
   add_custom_command(OUTPUT ${SHIM_LIB_GEN_SRC}
     COMMAND $<TARGET_FILE:Python3::Interpreter> ${IMPLIBSO_SRC_DIR}/implib-gen.py
-    --target ${CMAKE_SYSTEM_PROCESSOR}
+    --target ${IMPLIBSO_ARCH}
     --outdir ${SHIM_LIB_OUTPUT_DIR}
     --dlopen-callback=fdb_shim_dlopen_callback
     --symbol-filter='^fdb_.*$$'

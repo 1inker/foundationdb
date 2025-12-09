@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -37,6 +37,11 @@ struct ConflictRangeWorkload : TestWorkload {
 
 	std::vector<Future<Void>> clients;
 	PerfIntCounter withConflicts, withoutConflicts, retries;
+
+	// This workload is not compatible with RandomRangeLock workload because RangeLock transaction triggers conflicts
+	void disableFailureInjectionWorkloads(std::set<std::string>& out) const override {
+		out.insert({ "RandomRangeLock" });
+	}
 
 	ConflictRangeWorkload(WorkloadContext const& wcx)
 	  : TestWorkload(wcx), withConflicts("WithConflicts"), withoutConflicts("withoutConflicts"), retries("Retries") {
@@ -197,7 +202,7 @@ struct ConflictRangeWorkload : TestWorkload {
 					if (randomSets) {
 						for (int j = 0; j < 5; j++) {
 							int proposedKey = deterministicRandom()->randomInt(0, self->maxKeySpace);
-							if (!insertedSet.count(proposedKey)) {
+							if (!insertedSet.contains(proposedKey)) {
 								TraceEvent("ConflictRangeSet").detail("Key", proposedKey);
 								insertedSet.insert(proposedKey);
 								tr2.set(StringRef(format("%010d", proposedKey)),
@@ -208,7 +213,7 @@ struct ConflictRangeWorkload : TestWorkload {
 					} else {
 						for (int j = 0; j < 5; j++) {
 							int proposedKey = deterministicRandom()->randomInt(0, self->maxKeySpace);
-							if (insertedSet.count(proposedKey)) {
+							if (insertedSet.contains(proposedKey)) {
 								TraceEvent("ConflictRangeClear").detail("Key", proposedKey);
 								insertedSet.erase(proposedKey);
 								tr2.clear(StringRef(format("%010d", proposedKey)));

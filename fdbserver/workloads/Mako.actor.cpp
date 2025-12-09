@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -141,7 +141,7 @@ struct MakoWorkload : TestWorkload {
 		//  parse the sequence and extract operations to be executed
 		parseOperationsSpec();
 		for (int i = 0; i < MAX_OP; ++i) {
-			// initilize per-operation latency record
+			// initialize per-operation latency record
 			opLatencies.push_back(DDSketch<double>());
 			// initialize per-operation counter
 			opCounters.push_back(PerfIntCounter(opNames[i]));

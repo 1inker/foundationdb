@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -32,7 +32,7 @@
 #include "flow/Hostname.h"
 #include "flow/actorcompiler.h" // This must be the last #include.
 
-// To avoid diretly access INetworkConnection::net()->removeCachedDNS(), which will require heavy include budget, put
+// To avoid directly access INetworkConnection::net()->removeCachedDNS(), which will require heavy include budget, put
 // the call to FlowTransport.actor.cpp as a external function.
 extern void removeCachedDNS(const std::string& host, const std::string& service);
 

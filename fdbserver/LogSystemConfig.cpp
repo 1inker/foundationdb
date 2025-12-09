@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -87,8 +87,8 @@ bool TLogSet::isEqualIds(TLogSet const& r) const {
 
 bool OldTLogConf::operator==(const OldTLogConf& rhs) const {
 	return tLogs == rhs.tLogs && epochBegin == rhs.epochBegin && epochEnd == rhs.epochEnd &&
-	       logRouterTags == rhs.logRouterTags && txsTags == rhs.txsTags && pseudoLocalities == rhs.pseudoLocalities &&
-	       epoch == rhs.epoch;
+	       recoverAt == rhs.recoverAt && logRouterTags == rhs.logRouterTags && txsTags == rhs.txsTags &&
+	       pseudoLocalities == rhs.pseudoLocalities && epoch == rhs.epoch;
 }
 
 bool OldTLogConf::isEqualIds(OldTLogConf const& r) const {
@@ -287,13 +287,13 @@ bool LogSystemConfig::isNextGenerationOf(LogSystemConfig const& r) const {
 
 bool LogSystemConfig::hasTLog(UID tid) const {
 	for (const auto& log : tLogs) {
-		if (std::count(log.tLogs.begin(), log.tLogs.end(), tid) > 0) {
+		if (std::find(log.tLogs.begin(), log.tLogs.end(), tid) != log.tLogs.end()) {
 			return true;
 		}
 	}
 	for (const auto& old : oldTLogs) {
 		for (const auto& log : old.tLogs) {
-			if (std::count(log.tLogs.begin(), log.tLogs.end(), tid) > 0) {
+			if (std::find(log.tLogs.begin(), log.tLogs.end(), tid) != log.tLogs.end()) {
 				return true;
 			}
 		}
@@ -303,13 +303,13 @@ bool LogSystemConfig::hasTLog(UID tid) const {
 
 bool LogSystemConfig::hasLogRouter(UID rid) const {
 	for (const auto& log : tLogs) {
-		if (std::count(log.logRouters.begin(), log.logRouters.end(), rid) > 0) {
+		if (std::find(log.logRouters.begin(), log.logRouters.end(), rid) != log.logRouters.end()) {
 			return true;
 		}
 	}
 	for (const auto& old : oldTLogs) {
 		for (const auto& log : old.tLogs) {
-			if (std::count(log.logRouters.begin(), log.logRouters.end(), rid) > 0) {
+			if (std::find(log.logRouters.begin(), log.logRouters.end(), rid) != log.logRouters.end()) {
 				return true;
 			}
 		}
@@ -319,7 +319,7 @@ bool LogSystemConfig::hasLogRouter(UID rid) const {
 
 bool LogSystemConfig::hasBackupWorker(UID bid) const {
 	for (const auto& log : tLogs) {
-		if (std::count(log.backupWorkers.begin(), log.backupWorkers.end(), bid) > 0) {
+		if (std::find(log.backupWorkers.begin(), log.backupWorkers.end(), bid) != log.backupWorkers.end()) {
 			return true;
 		}
 	}

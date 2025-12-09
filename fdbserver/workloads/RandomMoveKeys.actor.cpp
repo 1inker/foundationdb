@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -115,7 +115,7 @@ struct MoveKeysWorkload : FailureInjectionWorkload {
 		while (t.size() < teamSize && storageServers.size()) {
 			auto s = storageServers.back();
 			storageServers.pop_back();
-			if (!machines.count(s.locality.zoneId())) {
+			if (!machines.contains(s.locality.zoneId())) {
 				machines.insert(s.locality.zoneId());
 				t.insert(s);
 			}
@@ -158,7 +158,12 @@ struct MoveKeysWorkload : FailureInjectionWorkload {
 			state DDEnabledState ddEnabledState;
 			std::unique_ptr<MoveKeysParams> params;
 			if (SERVER_KNOBS->SHARD_ENCODE_LOCATION_METADATA) {
-				params = std::make_unique<MoveKeysParams>(deterministicRandom()->randomUniqueID(),
+				UID dataMoveId = newDataMoveId(deterministicRandom()->randomUInt64(),
+				                               AssignEmptyRange(false),
+				                               DataMoveType::PHYSICAL,
+				                               DataMovementReason::TEAM_HEALTHY,
+				                               UnassignShard(false));
+				params = std::make_unique<MoveKeysParams>(dataMoveId,
 				                                          std::vector<KeyRange>{ keys },
 				                                          destinationTeamIDs,
 				                                          destinationTeamIDs,
@@ -169,9 +174,15 @@ struct MoveKeysWorkload : FailureInjectionWorkload {
 				                                          false,
 				                                          relocateShardInterval.pairID,
 				                                          &ddEnabledState,
-				                                          CancelConflictingDataMoves::True);
+				                                          CancelConflictingDataMoves::True,
+				                                          Optional<BulkLoadState>());
 			} else {
-				params = std::make_unique<MoveKeysParams>(deterministicRandom()->randomUniqueID(),
+				UID dataMoveId = newDataMoveId(deterministicRandom()->randomUInt64(),
+				                               AssignEmptyRange(false),
+				                               DataMoveType::LOGICAL,
+				                               DataMovementReason::TEAM_HEALTHY,
+				                               UnassignShard(false));
+				params = std::make_unique<MoveKeysParams>(dataMoveId,
 				                                          keys,
 				                                          destinationTeamIDs,
 				                                          destinationTeamIDs,
@@ -182,7 +193,8 @@ struct MoveKeysWorkload : FailureInjectionWorkload {
 				                                          false,
 				                                          relocateShardInterval.pairID,
 				                                          &ddEnabledState,
-				                                          CancelConflictingDataMoves::True);
+				                                          CancelConflictingDataMoves::True,
+				                                          Optional<BulkLoadState>());
 			}
 			wait(moveKeys(cx, *params));
 			TraceEvent(relocateShardInterval.end()).detail("Result", "Success");

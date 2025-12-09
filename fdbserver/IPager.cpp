@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,6 +19,8 @@
  */
 #include "fdbserver/IPager.h"
 
+#include "fdbclient/BlobCipher.h"
+#include "flow/EncryptUtils.h"
 #include "flow/IRandom.h"
 #include "flow/UnitTest.h"
 #include <limits>
@@ -26,20 +28,23 @@
 TEST_CASE("/fdbserver/IPager/ArenaPage/PageContentChecksum") {
 	auto& g_knobs = IKnobCollection::getMutableGlobalKnobCollection();
 	for (uint8_t et = 0; et < EncodingType::MAX_ENCODING_TYPE; et++) {
-		constexpr int PAGE_SIZE = 8 * 1024;
+		constexpr int _PAGE_SIZE = 8 * 1024;
 		EncodingType encodingType = (EncodingType)et;
-		Reference<ArenaPage> page = makeReference<ArenaPage>(PAGE_SIZE, PAGE_SIZE);
+		Reference<ArenaPage> page = makeReference<ArenaPage>(_PAGE_SIZE, _PAGE_SIZE);
 		page->init(encodingType, PageType::BTreeNode, 1);
 		deterministicRandom()->randomBytes(page->mutateData(), page->dataSize());
 		PhysicalPageID pageID = deterministicRandom()->randomUInt32();
 		if (encodingType == AESEncryption || encodingType == AESEncryptionWithAuth) {
-			uint8_t cipherKeyBytes[AES_256_KEY_LENGTH];
-			deterministicRandom()->randomBytes(cipherKeyBytes, AES_256_KEY_LENGTH);
+			const int cipherBytesLen = deterministicRandom()->randomInt(4, MAX_BASE_CIPHER_LEN + 1);
+			uint8_t cipherKeyBytes[cipherBytesLen];
+			deterministicRandom()->randomBytes(cipherKeyBytes, cipherBytesLen);
+			const EncryptCipherKeyCheckValue cipherKCV = Sha256KCV().computeKCV(cipherKeyBytes, cipherBytesLen);
 			Reference<BlobCipherKey> cipherKey =
 			    makeReference<BlobCipherKey>(0 /*domainId*/,
 			                                 1 /*baseCipherId*/,
-			                                 cipherKeyBytes,
-			                                 AES_256_KEY_LENGTH,
+			                                 &cipherKeyBytes[0],
+			                                 cipherBytesLen,
+			                                 cipherKCV,
 			                                 std::numeric_limits<int64_t>::max() /*refreshAt*/,
 			                                 std::numeric_limits<int64_t>::max() /*expireAt*/
 			    );

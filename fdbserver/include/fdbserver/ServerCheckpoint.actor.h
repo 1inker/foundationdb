@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -31,7 +31,7 @@
 
 #include "flow/actorcompiler.h" // has to be last include
 
-FDB_DECLARE_BOOLEAN_PARAM(CheckpointAsKeyValues);
+FDB_BOOLEAN_PARAM(CheckpointAsKeyValues);
 
 class ICheckpointIterator {
 public:
@@ -71,7 +71,7 @@ ICheckpointReader* newCheckpointReader(const CheckpointMetaData& checkpoint,
 // Delete a checkpoint.
 ACTOR Future<Void> deleteCheckpoint(CheckpointMetaData checkpoint);
 
-// Fetchs checkpoint to a local `dir`, `initialState` provides the checkpoint formats, location, restart point, etc.
+// Fetches checkpoint to a local `dir`, `initialState` provides the checkpoint formats, location, restart point, etc.
 // If cFun is provided, the progress can be checkpointed.
 // Returns a CheckpointMetaData, which could contain KVS-specific results, e.g., the list of fetched checkpoint files.
 ACTOR Future<CheckpointMetaData> fetchCheckpoint(Database cx,
@@ -87,6 +87,8 @@ ACTOR Future<CheckpointMetaData> fetchCheckpointRanges(
     std::vector<KeyRange> ranges,
     std::function<Future<Void>(const CheckpointMetaData&)> cFun = nullptr);
 
+std::string serverCheckpointDir(const std::string& baseDir, const UID& checkpointId);
+std::string fetchedCheckpointDir(const std::string& baseDir, const UID& checkpointId);
 #include "flow/unactorcompiler.h"
 
 #endif

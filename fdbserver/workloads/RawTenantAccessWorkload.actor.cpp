@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2023 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -140,7 +140,7 @@ struct RawTenantAccessWorkload : TestWorkload {
 					Key key = self->specialKeysTenantMapPrefix.withSuffix(self->indexToTenantName(*it));
 					Optional<Value> value = wait(tr->get(key));
 					// the commit proxies should have the same view of tenant map
-					ASSERT_EQ(value.present(), lastCommitted || (self->idx2Tid.count(*it) > 0));
+					ASSERT_EQ(value.present(), lastCommitted || (self->idx2Tid.contains(*it)));
 
 					if (value.present()) {
 						auto id = self->extractTenantId(value.get());
@@ -182,7 +182,7 @@ struct RawTenantAccessWorkload : TestWorkload {
 		ASSERT(hasNonexistentTenant());
 		int tenantIdx = deterministicRandom()->randomInt(0, tenantCount);
 		// find the nearest nonexistent tenant
-		while (idx2Tid.count(tenantIdx) || lastCreatedTenants.count(tenantIdx)) {
+		while (idx2Tid.contains(tenantIdx) || lastCreatedTenants.contains(tenantIdx)) {
 			tenantIdx++;
 			if (tenantIdx == tenantCount) {
 				tenantIdx = 0;
@@ -201,7 +201,7 @@ struct RawTenantAccessWorkload : TestWorkload {
 		int tenantIdx = deterministicRandom()->randomInt(0, tenantCount);
 		// find the nearest existing tenant
 		while (true) {
-			if (idx2Tid.count(tenantIdx) && !lastDeletedTenants.count(tenantIdx)) {
+			if (idx2Tid.contains(tenantIdx) && !lastDeletedTenants.contains(tenantIdx)) {
 				break;
 			}
 			tenantIdx++;
@@ -241,7 +241,7 @@ struct RawTenantAccessWorkload : TestWorkload {
 			// randomly generate a tenant id
 			do {
 				tenantId = deterministicRandom()->randomInt64(0, std::numeric_limits<int64_t>::max());
-			} while (tid2Idx.count(tenantId));
+			} while (tid2Idx.contains(tenantId));
 		}
 		ASSERT_GE(tenantId, 0);
 

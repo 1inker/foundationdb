@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -147,8 +147,6 @@ bool IPAddress::isValid() const {
 	}
 	return std::get<uint32_t>(addr) != 0;
 }
-
-FDB_DEFINE_BOOLEAN_PARAM(NetworkAddressFromHostname);
 
 NetworkAddress NetworkAddress::parse(std::string const& s) {
 	if (s.empty()) {
@@ -443,9 +441,13 @@ TEST_CASE("/flow/network/ipV6Preferred") {
 		addresses.push_back(NetworkAddress::parse(s));
 	}
 	// Confirm IPv6 is always preferred.
-	ASSERT(INetworkConnections::pickOneAddress(addresses).toString() == ipv6);
+	ASSERT((INetworkConnections::pickOneAddress(addresses).toString() == ipv6) ==
+	       !FLOW_KNOBS->RESOLVE_PREFER_IPV4_ADDR);
 
 	return Void();
 }
 
 NetworkInfo::NetworkInfo() : handshakeLock(new FlowLock(FLOW_KNOBS->TLS_HANDSHAKE_LIMIT)) {}
+NetworkInfo::~NetworkInfo() {
+	delete handshakeLock;
+}

@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -123,7 +123,7 @@ struct DiskDurabilityTest : TestWorkload {
 			state std::vector<int64_t> targetPages;
 			for (int i = deterministicRandom()->randomInt(1, 100); i > 0 && targetPages.size() < size / 4096; i--) {
 				auto p = deterministicRandom()->randomInt(0, size / 4096);
-				if (!std::count(targetPages.begin(), targetPages.end(), p))
+				if (std::find(targetPages.begin(), targetPages.end(), p) == targetPages.end())
 					targetPages.push_back(p);
 			}
 			for (int i = deterministicRandom()->randomInt(1, 4); i > 0; i--) {

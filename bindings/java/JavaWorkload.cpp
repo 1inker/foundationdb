@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,7 +18,7 @@
  * limitations under the License.
  */
 
-#include <foundationdb/ClientWorkload.h>
+#include <foundationdb/CppWorkload.h>
 #define FDB_USE_LATEST_BINDINGS_API_VERSION
 #include <foundationdb/fdb_c.h>
 
@@ -539,7 +539,7 @@ struct JavaWorkload final : FDBWorkload {
 		}
 	}
 
-	std::string description() const override { return name; }
+	// std::string description() const override { return name; }
 	bool init(FDBWorkloadContext* context) override {
 		this->context = context;
 		try {

@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -59,7 +59,7 @@ public:
 	RESTConnectionPool(const int maxConnsPerKey) : maxConnPerConnectKey(maxConnsPerKey) {}
 
 	// Routine is responsible to provide an usable TCP connection object; it reuses an active connection from
-	// connection-pool if availalbe, otherwise, establish a new TCP connection
+	// connection-pool if available, otherwise, establish a new TCP connection
 	Future<ReusableConnection> connect(RESTConnectionPoolKey connectKey, const bool isSecure, const int maxConnLife);
 	void returnConnection(RESTConnectionPoolKey connectKey, ReusableConnection& conn, const int maxConnections);
 
@@ -87,7 +87,12 @@ struct RESTConnectionType {
 
 // Util interface facilitating management and update for RESTClient knob parameters
 struct RESTClientKnobs {
-	int connection_pool_size, connect_timeout, connect_tries, max_connection_life, request_tries, request_timeout_secs;
+	int connection_pool_size;
+	int connect_timeout;
+	int connect_tries;
+	int max_connection_life; // Note: this knob is not implemented yet in RESTClient
+	int request_tries;
+	int request_timeout_secs;
 
 	RESTClientKnobs();
 
@@ -135,5 +140,7 @@ public:
 private:
 	void parseUrl(const std::string& fullUrl);
 };
+
+double continuousTimeDecay(double initialValue, double decayRate, double time);
 
 #endif

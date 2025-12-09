@@ -37,6 +37,51 @@
                "finished_wiggle": 1
             }
        },
+      "consistency_scan" : {
+         "configuration" : {
+            "enabled" : true,
+            "max_rate_bytes_per_second" : 50000000,
+            "min_interval_seconds" : 2592000,
+            "min_start_version" : 0,
+            "round_history_days" : 90,
+            "target_interval_seconds" : 2592000
+         },
+         "current_round" : {
+            "complete" : false,
+            "end_datetime" : "1970-01-01 00:00:00.000 +0000",
+            "end_timestamp" : 0,
+            "end_version" : 0,
+            "errors" : 0,
+            "last_end_key" : "",
+            "logical_bytes_scanned" : 0,
+            "replicated_bytes_scanned" : 0,
+            "skippedRanges" : 0,
+            "start_datetime" : "1970-01-01 00:00:00.000 +0000",
+            "start_timestamp" : 0,
+            "start_version" : 0
+         },
+         "lifetime_stats" : {
+            "errors" : 0,
+            "logical_bytes_scanned" : 0,
+            "replicated_bytes_scanned" : 0
+         },
+         "previous_rounds" : [
+            {
+               "complete" : false,
+               "end_datetime" : "1970-01-01 00:00:00.000 +0000",
+               "end_timestamp" : 0,
+               "end_version" : 0,
+               "errors" : 0,
+               "last_end_key" : "",
+               "logical_bytes_scanned" : 0,
+               "replicated_bytes_scanned" : 0,
+               "skippedRanges" : 0,
+               "start_datetime" : "1970-01-01 00:00:00.000 +0000",
+               "start_timestamp" : 0,
+               "start_version" : 0
+            }
+         ]
+      },
       "layers":{
          "_valid":true,
          "_error":"some error description"
@@ -111,6 +156,36 @@
                         "router",
                         "coordinator"
                      ]
+                  },
+                  "tss":false,
+                  "storage_metadata":{
+                     "created_time_datetime":"1970-01-01 00:00:00.000 +0000",
+                     "created_time_timestamp": 0,
+                     "storage_engine":{
+                     "$enum":[
+                     "ssd",
+                     "ssd-1",
+                     "ssd-2",
+                     "ssd-redwood-1",
+                     "ssd-rocksdb-v1",
+                     "ssd-sharded-rocksdb",
+                     "memory",
+                     "memory-1",
+                     "memory-2",
+                     "memory-radixtree",
+                     "unknown"
+                     ]}
+                  },
+                  "rocksdb_metrics":{
+                     "block_cache_hits":12341234,
+                     "block_cache_misses":12341234,
+                     "pending_compaction_bytes":12341234,
+                     "memtable_bytes":12341234,
+                     "sst_reader_bytes":12341234,
+                     "block_cache_usage":12341234,
+                     "block_cache_limit":12341234,
+                     "throttled_commits":12341234,
+                     "write_stall_microseconds":12341234
                   },
                   "data_version":12341234,
                   "durable_version":12341234,
@@ -449,6 +524,14 @@
          "seconds":1.0,
          "versions":1000000
       },
+      "logserver_lag":{
+         "seconds":1.0,
+         "versions":1000000
+      },
+      "storageserver_lag":{
+         "seconds":1.0,
+         "versions":1000000
+      },
       "active_tss_count":0,
       "degraded_processes":0,
       "database_available":true,
@@ -457,6 +540,10 @@
          "lock_uid":"00000000000000000000000000000000" // Only present when database is locked
       },
       "generation":2,
+      "gray_failure" : { // Displays subset of gray failure in-memory state. Currently, shows excluded server network address (ip + port) as well as time when the server was last excluded. Based on these exclusions, recovery is triggered.
+         "excluded_servers" : [
+         ]
+      },    
       "latency_probe":{ // all measurements are based on running sample transactions
          "read_seconds":7, // time to perform a single read
          "immediate_priority_transaction_start_seconds":0.0, // time to start a sample transaction at system immediate priority
@@ -529,7 +616,8 @@
                   "primary_dc_missing",
                   "fetch_primary_dc_timeout",
                   "fetch_storage_wiggler_stats_timeout",
-                  "fetch_consistency_scan_info_timeout"
+                  "fetch_consistency_scan_status_timeout",
+                  "metacluster_metrics_missing"
                ]
             },
             "issues":[
@@ -745,7 +833,7 @@
              "memory",
              "memory-1",
              "memory-2",
-             "memory-radixtree-beta"
+             "memory-radixtree"
          ]},
          "log_spill":1,
          "storage_engine":{
@@ -759,7 +847,7 @@
              "memory",
              "memory-1",
              "memory-2",
-             "memory-radixtree-beta"
+             "memory-radixtree"
          ]},
          "tss_count":1,
          "tss_storage_engine":{
@@ -773,7 +861,7 @@
              "memory",
              "memory-1",
              "memory-2",
-             "memory-radixtree-beta"
+             "memory-radixtree"
          ]},
          "coordinators_count":1,
          "excluded_servers":[
@@ -792,6 +880,20 @@
          "backup_worker_enabled":1,
          "perpetual_storage_wiggle": 0,
          "perpetual_storage_wiggle_locality":"0",
+         "perpetual_storage_wiggle_engine":{
+         "$enum":[
+             "ssd",
+             "ssd-1",
+             "ssd-2",
+             "ssd-redwood-1",
+             "ssd-rocksdb-v1",
+             "ssd-sharded-rocksdb",
+             "memory",
+             "memory-1",
+             "memory-2",
+             "memory-radixtree-beta",
+             "none"
+         ]},
          "storage_migration_type":{
          "$enum":[
              "disabled",

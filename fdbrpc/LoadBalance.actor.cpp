@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -21,9 +21,6 @@
 #include "fdbrpc/LoadBalance.actor.h"
 #include "flow/flow.h"
 #include "flow/actorcompiler.h" // This must be the last #include.
-
-FDB_DEFINE_BOOLEAN_PARAM(AtMostOnce);
-FDB_DEFINE_BOOLEAN_PARAM(TriedAllOptions);
 
 // Throwing all_alternatives_failed will cause the client to issue a GetKeyLocationRequest to the proxy, so this actor
 // attempts to limit the number of these errors thrown by a single client to prevent it from saturating the proxies with

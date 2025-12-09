@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -29,11 +29,11 @@
 #include "flow/ObjectSerializer.h"
 #include "flow/serialize.h"
 #include "fdbclient/SystemData.h"
-#include "fdbclient/KeyBackedTypes.h"
+#include "fdbclient/KeyBackedTypes.actor.h"
 #include "fdbclient/RunTransaction.actor.h"
 #include "flow/actorcompiler.h"
 
-FDB_DECLARE_BOOLEAN_PARAM(PrimaryRegion);
+FDB_BOOLEAN_PARAM(PrimaryRegion);
 
 struct StorageWiggleMetrics {
 	constexpr static FileIdentifier file_identifier = 4728961;
@@ -158,11 +158,11 @@ protected:
 	Key prefix;
 
 public:
-	struct DataForDc : public KeyBackedStruct {
-		DataForDc(StringRef prefix) : KeyBackedStruct(prefix) {}
+	struct DataForDc : public KeyBackedClass {
+		DataForDc(StringRef prefix) : KeyBackedClass(prefix) {}
 
 		auto storageWiggleDelay() const {
-			auto key = rootSpace.pack("storageWiggleDelay"_sr);
+			auto key = subspace.pack("storageWiggleDelay"_sr);
 			return KeyBackedObjectProperty<StorageWiggleDelay, decltype(IncludeVersion())>(key, IncludeVersion());
 		}
 	};

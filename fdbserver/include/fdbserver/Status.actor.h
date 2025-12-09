@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -30,7 +30,9 @@
 #include "fdbserver/WorkerInterface.actor.h"
 #include "fdbserver/MasterInterface.h"
 #include "fdbclient/ClusterInterface.h"
-#include "fdbclient/Metacluster.h"
+#include "fdbclient/MetaclusterRegistration.h"
+
+#include "metacluster/MetaclusterMetrics.h"
 
 #include "flow/actorcompiler.h" // has to be last include
 
@@ -46,18 +48,27 @@ Future<StatusReply> clusterGetStatus(
     Database const& cx,
     std::vector<WorkerDetails> const& workers,
     std::vector<ProcessIssues> const& workerIssues,
+    std::vector<StorageServerMetaInfo> const& storageMetadatas,
     std::map<NetworkAddress, std::pair<double, OpenDatabaseRequest>>* const& clientStatus,
     ServerCoordinators const& coordinators,
     std::vector<NetworkAddress> const& incompatibleConnections,
     Version const& datacenterVersionDifference,
+    Version const& dcLogServerVersionDifference,
+    Version const& dcStorageServerVersionDifference,
     ConfigBroadcaster const* const& conifgBroadcaster,
-    Optional<MetaclusterRegistrationEntry> const& metaclusterRegistration,
-    MetaclusterMetrics const& metaclusterMetrics);
+    Optional<UnversionedMetaclusterRegistrationEntry> const& metaclusterRegistration,
+    metacluster::MetaclusterMetrics const& metaclusterMetrics,
+    std::unordered_map<NetworkAddress, double /* latest time at which address was excluded */> const&
+        excludedDegradedServers);
+
+StatusReply clusterGetFaultToleranceStatus(const std::string& statusString);
 
 struct WorkerEvents : std::map<NetworkAddress, TraceEventFields> {};
 ACTOR Future<Optional<std::pair<WorkerEvents, std::set<std::string>>>> latestEventOnWorkers(
     std::vector<WorkerDetails> workers,
     std::string eventName);
+
+ACTOR Future<KMSHealthStatus> getKMSHealthStatus(Reference<const AsyncVar<ServerDBInfo>> db);
 
 #include "flow/unactorcompiler.h"
 #endif

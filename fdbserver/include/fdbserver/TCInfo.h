@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -24,7 +24,7 @@
 #include "fdbclient/Tenant.h"
 #include "fdbrpc/ReplicationTypes.h"
 #include "fdbserver/DataDistributionTeam.h"
-
+#include "fdbserver/DDTxnProcessor.h"
 #include "flow/Arena.h"
 #include "flow/FastRef.h"
 
@@ -53,10 +53,18 @@ class TCServerInfo : public ReferenceCounted<TCServerInfo> {
 	KeyValueStoreType storeType; // Storage engine type
 
 	int64_t dataInFlightToServer = 0, readInFlightToServer = 0;
-	std::vector<Reference<TCTeamInfo>> teams;
+	std::vector<Reference<TCTeamInfo>> teams{};
 	ErrorOr<GetStorageMetricsReply> metrics;
+	Optional<HealthMetrics::StorageStats> storageStats;
+	Optional<double> storageQueueTooLongStartTime; // When a storage queue becomes long
+
+	// Last time when server notified teamTracker that the queue is long
+	// We do not want repeatedly notify teamTracker in present of long
+	// queue lastTimeNotifyLongStorageQueue is used to support this
+	Optional<double> lastTimeNotifyLongStorageQueue;
 
 	void setMetrics(GetStorageMetricsReply serverMetrics) { this->metrics = serverMetrics; }
+	void setStorageStats(HealthMetrics::StorageStats stats) { storageStats = stats; }
 	void markTeamUnhealthy(int teamIndex);
 
 public:
@@ -72,6 +80,7 @@ public:
 	Promise<Void> updated;
 	AsyncVar<bool> wrongStoreTypeToRemove;
 	AsyncVar<bool> ssVersionTooFarBehind;
+	AsyncVar<int64_t> longStorageQueue; // set when the storage queue remains too long for a while
 
 	TCServerInfo(StorageServerInterface ssi,
 	             DDTeamCollection* collection,
@@ -81,6 +90,7 @@ public:
 	             Version addedVersion = 0);
 
 	GetStorageMetricsReply const& getMetrics() const { return metrics.get(); }
+	Optional<HealthMetrics::StorageStats> const& getStorageStats() const { return storageStats; }
 
 	UID const& getId() const { return id; }
 	bool isInDesiredDC() const { return inDesiredDC; }
@@ -92,6 +102,7 @@ public:
 	Future<Void> updateStoreType();
 	KeyValueStoreType getStoreType() const { return storeType; }
 	int64_t getDataInFlightToServer() const { return dataInFlightToServer; }
+	int64_t getStorageQueueSize() const;
 	// expect read traffic to server after data movement
 	int64_t getReadInFlightToServer() const { return readInFlightToServer; }
 	void incrementDataInFlightToServer(int64_t bytes) { dataInFlightToServer += bytes; }
@@ -116,8 +127,8 @@ public:
 
 	Future<Void> updateServerMetrics();
 	static Future<Void> updateServerMetrics(Reference<TCServerInfo> server);
-	Future<Void> serverMetricsPolling();
-
+	Future<Void> serverMetricsPolling(Reference<IDDTxnProcessor> txnProcessor);
+	bool updateAndGetStorageQueueTooLong(int64_t currentBytes);
 	~TCServerInfo();
 };
 
@@ -160,7 +171,7 @@ public:
 	bool matches(std::vector<Standalone<StringRef>> const& sortedMachineIDs);
 	std::string getMachineIDsStr() const;
 	bool containsMachine(Standalone<StringRef> machineID) const {
-		return std::count(machineIDs.begin(), machineIDs.end(), machineID);
+		return std::find(machineIDs.begin(), machineIDs.end(), machineID) != machineIDs.end();
 	}
 
 	// Returns true iff team is found
@@ -179,6 +190,8 @@ class TCTeamInfo final : public ReferenceCounted<TCTeamInfo>, public IDataDistri
 	bool wrongConfiguration; // True if any of the servers in the team have the wrong configuration
 	int priority;
 	UID id;
+
+	data_distribution::EligibilityCounter eligibilityCounter;
 
 public:
 	Reference<TCMachineTeamInfo> machineTeam;
@@ -211,9 +224,17 @@ public:
 
 	int64_t getDataInFlightToTeam() const override;
 
+	Optional<int64_t> getLongestStorageQueueSize() const override;
+
 	int64_t getLoadBytes(bool includeInFlight = true, double inflightPenalty = 1.0) const override;
 
-	double getLoadReadBandwidth(bool includeInFlight = true, double inflightPenalty = 1.0) const override;
+	double getReadLoad(bool includeInFlight = true, double inflightPenalty = 1.0) const override;
+
+	double getAverageCPU() const override;
+
+	bool hasLowerCpu(double cpuThreshold) const override {
+		return getAverageCPU() <= std::min(cpuThreshold, SERVER_KNOBS->MAX_DEST_CPU_PERCENT);
+	}
 
 	int64_t getReadInFlightToTeam() const override;
 
@@ -222,6 +243,10 @@ public:
 	double getMinAvailableSpaceRatio(bool includeInFlight = true) const override;
 
 	bool hasHealthyAvailableSpace(double minRatio) const override;
+
+	unsigned getEligibilityCount(int combinedType) { return eligibilityCounter.getCount(combinedType); }
+	void increaseEligibilityCount(data_distribution::EligibilityCounter::Type t) { eligibilityCounter.increase(t); }
+	void resetEligibilityCount(data_distribution::EligibilityCounter::Type t) { eligibilityCounter.reset(t); }
 
 	Future<Void> updateStorageMetrics() override;
 

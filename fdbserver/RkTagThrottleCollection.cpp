@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -70,8 +70,8 @@ RkTagThrottleCollection& RkTagThrottleCollection::RkTagThrottleCollection::opera
 double RkTagThrottleCollection::computeTargetTpsRate(double currentBusyness,
                                                      double targetBusyness,
                                                      double requestRate) {
-	ASSERT_GT(currentBusyness, 0);
-
+	ASSERT_GT(currentBusyness, 0.0);
+	ASSERT_LE(currentBusyness, 1.0);
 	if (targetBusyness < 1) {
 		double targetFraction = targetBusyness * (1 - currentBusyness) / ((1 - targetBusyness) * currentBusyness);
 		return requestRate * targetFraction;
@@ -135,7 +135,8 @@ Optional<double> RkTagThrottleCollection::autoThrottleTag(UID id,
 		expiration = now() + SERVER_KNOBS->AUTO_TAG_THROTTLE_DURATION;
 	}
 
-	ASSERT(tpsRate.present() && tpsRate.get() >= 0);
+	ASSERT(tpsRate.present());
+	ASSERT_GE(tpsRate.get(), 0);
 
 	throttle.limits.tpsRate = tpsRate.get();
 	throttle.limits.expiration = expiration.get();
@@ -232,7 +233,7 @@ PrioritizedTransactionTagMap<ClientTagThrottleLimits> RkTagThrottleCollection::g
 							manualClientRate = ClientTagThrottleLimits(priorityClientRate.get(),
 							                                           priorityItr->second.limits.expiration);
 						} else {
-							CODE_PROBE(true, "Manual throttle overriden by higher priority");
+							CODE_PROBE(true, "Manual throttle overridden by higher priority");
 						}
 
 						++priorityItr;
@@ -280,7 +281,7 @@ PrioritizedTransactionTagMap<ClientTagThrottleLimits> RkTagThrottleCollection::g
 					if (!result.second && result.first->second.tpsRate > adjustedRate) {
 						result.first->second = ClientTagThrottleLimits(adjustedRate, autoItr->second.limits.expiration);
 					} else {
-						CODE_PROBE(true, "Auto throttle overriden by manual throttle");
+						CODE_PROBE(true, "Auto throttle overridden by manual throttle");
 					}
 					clientRates[TransactionPriority::BATCH][tagItr->first] =
 					    ClientTagThrottleLimits(0, autoItr->second.limits.expiration);

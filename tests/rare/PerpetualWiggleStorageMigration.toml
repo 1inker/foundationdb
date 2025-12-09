@@ -1,0 +1,20 @@
+# High priority number decreases the chance to run this test.
+# Priority 1.0 is the default in TestHarness2
+testPriority = '20'
+
+[configuration]
+config = 'triple'
+storageEngineType = 0
+processesPerMachine = 2
+coordinators = 3
+machineCount = 45
+asanMachineCount = 20
+encryptModes=['disabled']
+tenantModes=['disabled']
+
+[[test]]
+testTitle = 'PerpetualWiggleStorageMigration'
+useDB = true
+
+    [[test.workload]]
+    testName = 'PerpetualWiggleStorageMigrationWorkload'

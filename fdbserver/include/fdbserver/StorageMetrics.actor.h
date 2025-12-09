@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -36,6 +36,7 @@ const StringRef STORAGESERVER_HISTOGRAM_GROUP = "StorageServer"_sr;
 const StringRef FETCH_KEYS_LATENCY_HISTOGRAM = "FetchKeysLatency"_sr;
 const StringRef FETCH_KEYS_BYTES_HISTOGRAM = "FetchKeysSize"_sr;
 const StringRef FETCH_KEYS_BYTES_PER_SECOND_HISTOGRAM = "FetchKeysBandwidth"_sr;
+const StringRef FETCH_KEYS_BYTES_PER_COMMIT_HISTOGRAM = "FetchKeysBytesPerCommit"_sr;
 const StringRef TLOG_CURSOR_READS_LATENCY_HISTOGRAM = "TLogCursorReadsLatency"_sr;
 const StringRef SS_VERSION_LOCK_LATENCY_HISTOGRAM = "SSVersionLockLatency"_sr;
 const StringRef EAGER_READS_LATENCY_HISTOGRAM = "EagerReadsLatency"_sr;
@@ -92,7 +93,7 @@ struct StorageServerMetrics {
 	  : byteSample(0), iopsSample(SERVER_KNOBS->IOPS_UNITS_PER_SAMPLE),
 	    bytesWriteSample(SERVER_KNOBS->BYTES_WRITTEN_UNITS_PER_SAMPLE),
 	    bytesReadSample(SERVER_KNOBS->BYTES_READ_UNITS_PER_SAMPLE),
-	    opsReadSample(SERVER_KNOBS->OPS_READ_UNITES_PER_SAMPLE) {}
+	    opsReadSample(SERVER_KNOBS->OPS_READ_UNITS_PER_SAMPLE) {}
 
 	StorageMetrics getMetrics(KeyRangeRef const& keys) const;
 
@@ -129,13 +130,17 @@ struct StorageServerMetrics {
 	                       StorageBytes sb,
 	                       double bytesInputRate,
 	                       int64_t versionLag,
-	                       double lastUpdate) const;
+	                       double lastUpdate,
+	                       int64_t bytesDurable,
+	                       int64_t bytesInput) const;
 
 	Future<Void> waitMetrics(WaitMetricsRequest req, Future<Void> delay);
 
 	std::vector<ReadHotRangeWithMetrics> getReadHotRanges(KeyRangeRef shard, int chunkCount, uint8_t splitType) const;
 
 	void getReadHotRanges(ReadHotSubRangeRequest req) const;
+
+	int64_t getHotShards(const KeyRange& range) const;
 
 	std::vector<KeyRef> getSplitPoints(KeyRangeRef range, int64_t chunkSize, Optional<KeyRef> prefixToRemove) const;
 
@@ -152,15 +157,24 @@ private:
 	static void add(KeyRangeMap<int>& map, KeyRangeRef const& keys, int delta);
 };
 
-// Contains information about whether or not a key-value pair should be included in a byte sample
-// Also contains size information about the byte sample
+// Contains information about whether or not a key-value pair should be included in a byte sample.
+//
+// The invariant holds:
+//    probability * sampledSize == size
 struct ByteSampleInfo {
+	// True if we've decided to sample this key-value pair.
 	bool inSample;
 
-	// Actual size of the key value pair
+	// Actual size of the key value pair.
 	int64_t size;
 
-	// The recorded size of the sample (max of bytesPerSample, size)
+	// Probability that the key-value pair will be sampled.
+	// This is a function of key and value sizes.
+	// The goal is to sample ~1/BYTE_SAMPLING_FACTOR of the key-value space,
+	// which by default is 1/250th.
+	double probability;
+
+	// The recorded size of the sample (max of bytesPerSample, size).
 	int64_t sampledSize;
 };
 
@@ -170,6 +184,33 @@ ByteSampleInfo isKeyValueInSample(KeyRef key, int64_t totalKvSize);
 inline ByteSampleInfo isKeyValueInSample(KeyValueRef keyValue) {
 	return isKeyValueInSample(keyValue.key, keyValue.key.size() + keyValue.value.size());
 }
+
+struct CommonStorageCounters {
+	CounterCollection cc;
+	// read ops
+	Counter finishedQueries, bytesQueried;
+
+	// write ops
+	// Bytes of the mutations that have been added to the memory of the storage server. When the data is durable
+	// and cleared from the memory, we do not subtract it but add it to bytesDurable.
+	Counter bytesInput;
+	// Like bytesInput but without MVCC accounting. The size is counted as how much it takes when serialized. It
+	// is basically the size of both parameters of the mutation and a 12 bytes overhead that keeps mutation type
+	// and the lengths of both parameters.
+	Counter mutationBytes;
+	Counter mutations, setMutations, clearRangeMutations;
+
+	// Bytes fetched by fetchKeys() for data movements. The size is counted as a collection of KeyValueRef.
+	Counter bytesFetched;
+	// The number of key-value pairs fetched by fetchKeys()
+	Counter kvFetched;
+
+	// name and id are the inputs to CounterCollection initialization. If metrics provided, the caller should guarantee
+	// the lifetime of metrics is longer than this counter
+	CommonStorageCounters(const std::string& name,
+	                      const std::string& id,
+	                      const StorageServerMetrics* metrics = nullptr);
+};
 
 class IStorageMetricsService {
 public:
@@ -187,6 +228,12 @@ public:
 	virtual Future<Void> waitMetricsTenantAware(const WaitMetricsRequest& req) = 0;
 
 	virtual void getStorageMetrics(const GetStorageMetricsRequest& req) = 0;
+
+	virtual void getSplitMetrics(const SplitMetricsRequest& req) = 0;
+
+	virtual void getHotRangeMetrics(const ReadHotSubRangeRequest& req) = 0;
+
+	virtual int64_t getHotShardsMetrics(const KeyRange& range) = 0;
 
 	// NOTE: also need to have this function but template can't be a virtual so...
 	// template <class Reply>
@@ -211,17 +258,19 @@ Future<Void> serveStorageMetricsRequests(ServiceType* self, StorageServerInterfa
 					CODE_PROBE(true, "splitMetrics immediate wrong_shard_server()");
 					self->sendErrorWithPenalty(req.reply, wrong_shard_server(), self->getPenalty());
 				} else {
-					self->metrics.splitMetrics(req);
+					self->getSplitMetrics(req);
 				}
 			}
 			when(GetStorageMetricsRequest req = waitNext(ssi.getStorageMetrics.getFuture())) {
 				self->getStorageMetrics(req);
 			}
 			when(ReadHotSubRangeRequest req = waitNext(ssi.getReadHotRanges.getFuture())) {
-				self->metrics.getReadHotRanges(req);
+				self->getHotRangeMetrics(req);
 			}
 			when(SplitRangeRequest req = waitNext(ssi.getRangeSplitPoints.getFuture())) {
-				if (!self->isReadable(req.keys)) {
+				if ((!req.tenantInfo.hasTenant() && !self->isReadable(req.keys)) ||
+				    (req.tenantInfo.hasTenant() &&
+				     !self->isReadable(req.keys.withPrefix(req.tenantInfo.prefix.get())))) {
 					CODE_PROBE(true, "getSplitPoints immediate wrong_shard_server()");
 					self->sendErrorWithPenalty(req.reply, wrong_shard_server(), self->getPenalty());
 				} else {

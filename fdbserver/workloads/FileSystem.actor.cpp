@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -300,14 +300,14 @@ struct FileSystemWorkload : TestWorkload {
 		state Key keyEnd(base + "0");
 		state KeySelectorRef begin = firstGreaterThan(keyBegin);
 		state KeySelectorRef end = firstGreaterOrEqual(keyEnd);
-		state int transfered = 1000;
+		state int transferred = 1000;
 		state int transferSize = 1000;
 		state uint64_t deletedFiles = 0;
-		while (transfered == transferSize) {
+		while (transferred == transferSize) {
 			RangeResult val = wait(tr->getRange(begin, end, transferSize));
-			transfered = val.size();
-			deletedFiles += transfered;
-			begin = begin + transfered;
+			transferred = val.size();
+			deletedFiles += transferred;
+			begin = begin + transferred;
 		}
 		if (self->loggingQueries) {
 			TraceEvent("DeletionQueryResults")

@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -158,7 +158,13 @@ ACTOR Future<Void> tryBecomeLeaderInternal(ServerCoordinators coordinators,
 				// These coordinators are forwarded to another set.  But before we change our own cluster file, we need
 				// to make sure that a majority of coordinators know that. SOMEDAY: Wait briefly to see if other
 				// coordinators will tell us they already know, to save communication?
-				wait(changeLeaderCoordinators(coordinators, leader.get().first.serializedInfo));
+				// NOTE: If a majority of coordinators (in the current connection string) have failed then we can
+				// end up waiting here indefinitely. Try to make progress in that scenario by proceeding with the
+				// connection string that we have received. Not a great solution, but can help in certain scenarios.
+				choose {
+					when(wait(changeLeaderCoordinators(coordinators, leader.get().first.serializedInfo))) {}
+					when(wait(delay(20))) {}
+				}
 
 				if (!hasConnected) {
 					TraceEvent(SevWarnAlways, "IncorrectClusterFileContentsAtConnection")
@@ -197,7 +203,8 @@ ACTOR Future<Void> tryBecomeLeaderInternal(ServerCoordinators coordinators,
 			// If more than 2*SERVER_KNOBS->POLLING_FREQUENCY elapses while we are nominated by some coordinator but
 			// there is no leader, we might be breaking the leader election process for someone with better
 			// communications but lower ID, so change IDs.
-			if ((!leader.present() || !leader.get().second) && std::count(nominees.begin(), nominees.end(), myInfo)) {
+			if ((!leader.present() || !leader.get().second) &&
+			    std::find(nominees.begin(), nominees.end(), myInfo) != nominees.end()) {
 				if (!badCandidateTimeout.isValid())
 					badCandidateTimeout = delay(SERVER_KNOBS->POLLING_FREQUENCY * 2, TaskPriority::CoordinationReply);
 			} else

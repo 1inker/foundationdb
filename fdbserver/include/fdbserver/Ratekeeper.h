@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -72,7 +72,7 @@ public:
 	StorageQueuingMetricsReply lastReply;
 	bool acceptingRequests;
 	limitReason_t limitReason;
-	std::vector<StorageQueuingMetricsReply::TagInfo> busiestReadTags, busiestWriteTags;
+	std::vector<BusyTagInfo> busiestReadTags, busiestWriteTags;
 
 	StorageQueueInfo(const UID& id, const LocalityData& locality);
 	StorageQueueInfo(const UID& rateKeeperID, const UID& id, const LocalityData& locality);
@@ -89,6 +89,8 @@ public:
 	double getSmoothDurableBytes() const { return smoothDurableBytes.smoothTotal(); }
 	double getSmoothInputBytesRate() const { return smoothInputBytes.smoothRate(); }
 	double getVerySmoothDurableBytesRate() const { return verySmoothDurableBytes.smoothRate(); }
+
+	Version getLatestVersion() const { return lastReply.version; }
 
 	// Determine the ratio (limit / current throughput) for throttling based on write queue size
 	Optional<double> getTagThrottlingRatio(int64_t storageTargetBytes, int64_t storageSpringBytes) const;
@@ -208,6 +210,7 @@ class Ratekeeper {
 	Deque<std::pair<double, Version>> blobWorkerVersionHistory;
 	bool anyBlobRanges;
 	Optional<Key> remoteDC;
+	Optional<UID> ssHighWriteQueue;
 
 	double getRecoveryDuration(Version ver) const {
 		auto it = version_recovery.lower_bound(ver);
@@ -239,6 +242,9 @@ class Ratekeeper {
 	void tryAutoThrottleTag(StorageQueueInfo&, int64_t storageQueue, int64_t storageDurabilityLag);
 	Future<Void> monitorThrottlingChanges();
 	Future<Void> monitorBlobWorkers(Reference<AsyncVar<ServerDBInfo> const> dbInfo);
+	Future<Void> monitorHotShards(Reference<AsyncVar<ServerDBInfo> const> dbInfo);
+
+	void getSSVersionLag(Version& maxSSPrimaryVersion, Version& maxSSRemoteVersion);
 
 public:
 	static Future<Void> run(RatekeeperInterface rkInterf, Reference<AsyncVar<ServerDBInfo> const> dbInfo);

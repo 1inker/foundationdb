@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -31,11 +31,23 @@
 
 #define SHOULD_INJECT_FAULT(context) (should_inject_fault && should_inject_fault(context, __FILE__, __LINE__, 0))
 
+#define INJECT_BLOB_FAULT(error_type, context)                                                                         \
+	do {                                                                                                               \
+		if (should_inject_blob_fault &&                                                                                \
+		    should_inject_blob_fault(context, __FILE__, __LINE__, error_code_##error_type))                            \
+			throw error_type().asInjectedFault();                                                                      \
+	} while (0)
+
+#define SHOULD_INJECT_BLOB_FAULT(context)                                                                              \
+	(should_inject_blob_fault && should_inject_blob_fault(context, __FILE__, __LINE__, 0))
+
 extern bool (*should_inject_fault)(const char* context, const char* file, int line, int error_code);
+extern bool (*should_inject_blob_fault)(const char* context, const char* file, int line, int error_code);
 extern bool faultInjectionActivated;
 extern void enableFaultInjection(bool enabled); // Enable fault injection called from fdbserver actor main function
 #else
 #define INJECT_FAULT(error_type, context)
+#define INJECT_BLOB_FAULT(error_type, context)
 #endif
 
 #endif

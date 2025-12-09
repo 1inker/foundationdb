@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -37,6 +37,15 @@ bool ShardsAffectedByTeamFailure::hasShards(Team team) const {
 int ShardsAffectedByTeamFailure::getNumberOfShards(UID ssID) const {
 	auto it = storageServerShards.find(ssID);
 	return it == storageServerShards.end() ? 0 : it->second;
+}
+
+int ShardsAffectedByTeamFailure::getNumberOfShards(Team team) const {
+	int shardCount = 0;
+	for (auto it = team_shards.lower_bound(std::pair<Team, KeyRange>(team, KeyRangeRef()));
+	     it != team_shards.end() && it->first == team;
+	     ++it)
+		shardCount++;
+	return shardCount;
 }
 
 std::pair<std::vector<ShardsAffectedByTeamFailure::Team>, std::vector<ShardsAffectedByTeamFailure::Team>>
@@ -193,14 +202,15 @@ void ShardsAffectedByTeamFailure::check() const {
 	if (EXPENSIVE_VALIDATION || checkMode == CheckMode::ForceCheck) {
 		for (auto t = team_shards.begin(); t != team_shards.end(); ++t) {
 			auto i = shard_teams.rangeContaining(t->second.begin);
-			if (i->range() != t->second || !std::count(i->value().first.begin(), i->value().first.end(), t->first)) {
+			if (i->range() != t->second ||
+			    std::find(i->value().first.begin(), i->value().first.end(), t->first) == i->value().first.end()) {
 				ASSERT(false);
 			}
 		}
 		auto rs = shard_teams.ranges();
 		for (auto i = rs.begin(); i != rs.end(); ++i) {
 			for (auto t = i->value().first.begin(); t != i->value().first.end(); ++t) {
-				if (!team_shards.count(std::make_pair(*t, i->range()))) {
+				if (!team_shards.contains(std::make_pair(*t, i->range()))) {
 					std::string teamDesc, shards;
 					for (int k = 0; k < t->servers.size(); k++)
 						teamDesc += format("%llx ", t->servers[k].first());

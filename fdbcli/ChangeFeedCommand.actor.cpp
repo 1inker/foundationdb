@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -41,11 +41,12 @@ ACTOR Future<Void> changeFeedList(Database db) {
 		try {
 			tr.setOption(FDBTransactionOptions::ACCESS_SYSTEM_KEYS);
 			tr.setOption(FDBTransactionOptions::PRIORITY_SYSTEM_IMMEDIATE);
+			tr.setOption(FDBTransactionOptions::RAW_ACCESS);
 
 			RangeResult result = wait(tr.getRange(changeFeedKeys, CLIENT_KNOBS->TOO_MANY));
 			// shouldn't have many quarantined TSSes
 			ASSERT(!result.more);
-			printf("Found %d range feeds%s\n", result.size(), result.size() == 0 ? "." : ":");
+			printf("Found %d change feeds%s\n", result.size(), result.size() == 0 ? "." : ":");
 			for (auto& it : result) {
 				auto range = std::get<0>(decodeChangeFeedValue(it.value));
 				printf("  %s: `%s' - `%s'\n",
@@ -68,6 +69,7 @@ ACTOR Future<Void> requestVersionUpdate(Database localDb, Reference<ChangeFeedDa
 	loop {
 		wait(delay(5.0));
 		Transaction tr(localDb);
+		tr.setOption(FDBTransactionOptions::RAW_ACCESS);
 		state Version ver = wait(tr.getReadVersion());
 		fmt::print("Requesting version {}\n", ver);
 		wait(feedData->whenAtLeast(ver));

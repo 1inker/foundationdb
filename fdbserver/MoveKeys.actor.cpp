@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,20 +19,31 @@
  */
 
 #include <vector>
+#include <limits.h>
 
+#include "fdbclient/BlobRestoreCommon.h"
 #include "fdbclient/FDBOptions.g.h"
+#include "flow/Error.h"
+#include "flow/Trace.h"
 #include "flow/Util.h"
 #include "fdbrpc/FailureMonitor.h"
-#include "fdbclient/KeyBackedTypes.h"
+#include "fdbclient/KeyBackedTypes.actor.h"
+#include "fdbclient/ManagementAPI.actor.h"
 #include "fdbclient/SystemData.h"
+#include "fdbserver/BulkLoadUtil.actor.h"
 #include "fdbserver/MoveKeys.actor.h"
 #include "fdbserver/Knobs.h"
 #include "fdbclient/ReadYourWrites.h"
+#include "fdbserver/BlobMigratorInterface.h"
 #include "fdbserver/TSSMappingUtil.actor.h"
 
 #include "flow/actorcompiler.h" // This must be the last #include.
 
-FDB_DEFINE_BOOLEAN_PARAM(CancelConflictingDataMoves);
+template <typename... T>
+static inline void dprint(fmt::format_string<T...> fmt, T&&... args) {
+	if (g_network->isSimulated())
+		fmt::print(fmt, std::forward<T>(args)...);
+}
 
 namespace {
 struct Shard {
@@ -42,6 +53,14 @@ struct Shard {
 	KeyRange range;
 	UID id;
 };
+
+bool shouldCreateCheckpoint(const UID& dataMoveId) {
+	bool assigned, emptyRange;
+	DataMoveType type;
+	DataMovementReason reason;
+	decodeDataMoveId(dataMoveId, assigned, emptyRange, type, reason);
+	return type == DataMoveType::PHYSICAL || type == DataMoveType::PHYSICAL_EXP;
+}
 
 // Unassigns keyrange `range` from server `ssId`, except ranges in `shards`.
 // Note: krmSetRangeCoalescing() doesn't work in this case since each shard is assigned an ID.
@@ -155,33 +174,84 @@ ACTOR Future<Void> unassignServerKeys(Transaction* tr, UID ssId, KeyRange range,
 	return Void();
 }
 
+ACTOR Future<Void> deleteCheckpoints(Transaction* tr, std::set<UID> checkpointIds, UID dataMoveId) {
+	if (!shouldCreateCheckpoint(dataMoveId)) {
+		return Void();
+	}
+	TraceEvent(SevDebug, "DataMoveDeleteCheckpoints", dataMoveId).detail("Checkpoints", describe(checkpointIds));
+	std::vector<Future<Optional<Value>>> checkpointEntries;
+	for (const UID& id : checkpointIds) {
+		checkpointEntries.push_back(tr->get(checkpointKeyFor(id)));
+	}
+	std::vector<Optional<Value>> checkpointValues = wait(getAll(checkpointEntries));
+
+	for (int i = 0; i < checkpointIds.size(); ++i) {
+		const auto& value = checkpointValues[i];
+		if (!value.present()) {
+			TraceEvent(SevWarnAlways, "CheckpointNotFound", dataMoveId);
+			continue;
+		}
+		CheckpointMetaData checkpoint = decodeCheckpointValue(value.get());
+		ASSERT(checkpointIds.find(checkpoint.checkpointID) != checkpointIds.end());
+		const Key key = checkpointKeyFor(checkpoint.checkpointID);
+		checkpoint.setState(CheckpointMetaData::Deleting);
+		tr->set(key, checkpointValue(checkpoint));
+		tr->clear(singleKeyRange(key));
+		TraceEvent(SevDebug, "DataMoveDeleteCheckpoint", dataMoveId).detail("Checkpoint", checkpoint.toString());
+	}
+
+	return Void();
+}
 } // namespace
 
-bool DDEnabledState::isDDEnabled() const {
-	return ddEnabled;
+bool DDEnabledState::sameId(const UID& id) const {
+	return ddEnabledStatusUID == id;
+}
+bool DDEnabledState::isEnabled() const {
+	return stateValue == ENABLED;
 }
 
-bool DDEnabledState::setDDEnabled(bool status, UID snapUID) {
-	TraceEvent("SetDDEnabled").detail("Status", status).detail("SnapUID", snapUID);
-	ASSERT(snapUID != UID());
-	if (!status) {
-		// disabling DD
-		if (ddEnabledStatusUID != UID()) {
-			// disable DD when a disable is already in progress not allowed
-			return false;
-		}
-		ddEnabled = status;
-		ddEnabledStatusUID = snapUID;
-		return true;
+bool DDEnabledState::isBlobRestorePreparing() const {
+	return stateValue == BLOB_RESTORE_PREPARING;
+}
+
+bool DDEnabledState::trySetSnapshot(UID requesterId) {
+	ASSERT(requesterId != UID());
+	// disabling DD
+	if (!isEnabled()) {
+		// only allow state modification to snapshot when DD is enabled.
+		return false;
 	}
+	ddEnabledStatusUID = requesterId;
+	stateValue = SNAPSHOT;
+	TraceEvent("SetDDSnapshot").detail("RequesterUID", requesterId);
+
+	return true;
+}
+
+bool DDEnabledState::trySetEnabled(UID requesterId) {
+	ASSERT(requesterId != UID());
 	// enabling DD
-	if (snapUID != ddEnabledStatusUID) {
-		// enabling DD not allowed if UID does not match with the disable request
+	if (!sameId(requesterId)) {
+		// enabling DD not allowed if UID does not match with the previous request
 		return false;
 	}
 	// reset to default status
-	ddEnabled = status;
 	ddEnabledStatusUID = UID();
+	stateValue = ENABLED;
+	TraceEvent("SetDDEnabled").detail("RequesterUID", requesterId);
+	return true;
+}
+
+bool DDEnabledState::trySetBlobRestorePreparing(UID requesterId) {
+	ASSERT(requesterId != UID());
+	if (!isEnabled()) {
+		// only allow state modification to RestorePreparing when DD is enabled.
+		return false;
+	}
+	ddEnabledStatusUID = requesterId;
+	stateValue = BLOB_RESTORE_PREPARING;
+	TraceEvent("SetDDBlobRestorePreparing").detail("RequesterUID", requesterId);
 	return true;
 }
 
@@ -221,6 +291,7 @@ ACTOR Future<MoveKeysLock> takeMoveKeysLock(Database cx, UID ddId) {
 			state UID txnId;
 			tr.setOption(FDBTransactionOptions::PRIORITY_SYSTEM_IMMEDIATE);
 			tr.setOption(FDBTransactionOptions::ACCESS_SYSTEM_KEYS);
+			tr.setOption(FDBTransactionOptions::LOCK_AWARE);
 			if (!g_network->isSimulated()) {
 				txnId = deterministicRandom()->randomUniqueID();
 				tr.debugTransaction(txnId);
@@ -242,17 +313,11 @@ ACTOR Future<MoveKeysLock> takeMoveKeysLock(Database cx, UID ddId) {
 	}
 }
 
-ACTOR static Future<Void> checkMoveKeysLock(Transaction* tr,
-                                            MoveKeysLock lock,
-                                            const DDEnabledState* ddEnabledState,
-                                            bool isWrite = true) {
+ACTOR static Future<Void> checkPersistentMoveKeysLock(Transaction* tr, MoveKeysLock lock, bool isWrite = true) {
 	tr->setOption(FDBTransactionOptions::READ_SYSTEM_KEYS);
-	if (!ddEnabledState->isDDEnabled()) {
-		TraceEvent(SevDebug, "DDDisabledByInMemoryCheck").log();
-		throw movekeys_conflict();
-	}
+
 	Optional<Value> readVal = wait(tr->get(moveKeysLockOwnerKey));
-	UID currentOwner = readVal.present() ? BinaryReader::fromStringRef<UID>(readVal.get(), Unversioned()) : UID();
+	state UID currentOwner = readVal.present() ? BinaryReader::fromStringRef<UID>(readVal.get(), Unversioned()) : UID();
 
 	if (currentOwner == lock.prevOwner) {
 		// Check that the previous owner hasn't touched the lock since we took it
@@ -260,6 +325,13 @@ ACTOR static Future<Void> checkMoveKeysLock(Transaction* tr,
 		UID lastWrite = readVal.present() ? BinaryReader::fromStringRef<UID>(readVal.get(), Unversioned()) : UID();
 		if (lastWrite != lock.prevWrite) {
 			CODE_PROBE(true, "checkMoveKeysLock: Conflict with previous owner");
+			TraceEvent(SevDebug, "CheckPersistentMoveKeysWritterConflict")
+			    .errorUnsuppressed(movekeys_conflict())
+			    .detail("PrevOwner", lock.prevOwner.toString())
+			    .detail("PrevWrite", lock.prevWrite.toString())
+			    .detail("MyOwner", lock.myOwner.toString())
+			    .detail("CurrentOwner", currentOwner.toString())
+			    .detail("Writer", lastWrite.toString());
 			throw movekeys_conflict();
 		}
 
@@ -293,8 +365,25 @@ ACTOR static Future<Void> checkMoveKeysLock(Transaction* tr,
 		return Void();
 	} else {
 		CODE_PROBE(true, "checkMoveKeysLock: Conflict with new owner");
+		TraceEvent(SevDebug, "CheckPersistentMoveKeysLockOwnerConflict")
+		    .errorUnsuppressed(movekeys_conflict())
+		    .detail("PrevOwner", lock.prevOwner.toString())
+		    .detail("PrevWrite", lock.prevWrite.toString())
+		    .detail("MyOwner", lock.myOwner.toString())
+		    .detail("CurrentOwner", currentOwner.toString());
 		throw movekeys_conflict();
 	}
+}
+
+Future<Void> checkMoveKeysLock(Transaction* tr,
+                               MoveKeysLock const& lock,
+                               const DDEnabledState* ddEnabledState,
+                               bool isWrite) {
+	if (!ddEnabledState->isEnabled()) {
+		TraceEvent(SevDebug, "DDDisabledByInMemoryCheck").log();
+		throw movekeys_conflict();
+	}
+	return checkPersistentMoveKeysLock(tr, lock, isWrite);
 }
 
 Future<Void> checkMoveKeysLockReadOnly(Transaction* tr, MoveKeysLock lock, const DDEnabledState* ddEnabledState) {
@@ -309,6 +398,270 @@ ACTOR Future<Optional<UID>> checkReadWrite(Future<ErrorOr<GetShardStateReply>> f
 	return Optional<UID>(uid);
 }
 
+// Must propagate corruption signal to outside
+ACTOR Future<bool> validateRangeAssignment(Database occ,
+                                           Transaction* tr,
+                                           KeyRange range,
+                                           UID ssid,
+                                           std::string context,
+                                           UID dataMoveId) {
+	ASSERT(!range.empty());
+	state Key toReadRangeBegin = range.begin;
+	state bool allCorrect = true;
+	tr->setOption(FDBTransactionOptions::READ_SYSTEM_KEYS);
+	loop {
+		RangeResult readResult = wait(krmGetRanges(tr,
+		                                           serverKeysPrefixFor(ssid),
+		                                           KeyRangeRef(toReadRangeBegin, range.end),
+		                                           CLIENT_KNOBS->KRM_GET_RANGE_LIMIT,
+		                                           CLIENT_KNOBS->KRM_GET_RANGE_LIMIT_BYTES));
+		// We do not want to reset tr
+		for (int i = 0; i < readResult.size() - 1; i++) {
+			UID shardId;
+			bool assigned, emptyRange;
+			DataMoveType dataMoveType = DataMoveType::LOGICAL;
+			DataMovementReason dataMoveReason = DataMovementReason::INVALID;
+			decodeServerKeysValue(readResult[i].value, assigned, emptyRange, dataMoveType, shardId, dataMoveReason);
+			if (!assigned) {
+				TraceEvent(SevError, "ValidateRangeAssignmentCorruptionDetected")
+				    .setMaxFieldLength(-1)
+				    .setMaxEventLength(-1)
+				    .detail("DataMoveID", dataMoveId)
+				    .detail("Context", context)
+				    .detail("AuditRange", range)
+				    .detail("ErrorMessage", "KeyServers has range but ServerKeys does not have")
+				    .detail("CurrentEmptyRange", emptyRange)
+				    .detail("CurrentAssignment", assigned)
+				    .detail("DataMoveType", static_cast<uint8_t>(dataMoveType))
+				    .detail("ServerID", ssid)
+				    .detail("ShardID", shardId);
+				allCorrect = false;
+			}
+		}
+		if (!allCorrect) {
+			break; // Stop checking even for incomplete read
+		}
+		if (readResult.back().key < range.end) {
+			toReadRangeBegin = readResult.back().key;
+			TraceEvent(SevWarnAlways, "ValidateRangeAssignmentMultipleReads")
+			    .detail("DataMoveID", dataMoveId)
+			    .detail("Range", range)
+			    .detail("StorageServer", ssid);
+			continue;
+		} else {
+			break;
+		}
+	}
+	if (!allCorrect) {
+		try {
+			// If corruption detected, enter security mode which
+			// stops using data moves and only allow auditStorage
+			wait(success(setDDMode(occ, 2)));
+			TraceEvent(SevInfo, "ValidateRangeAssignmentCorruptionDetectedAndDDStopped")
+			    .detail("DataMoveID", dataMoveId)
+			    .detail("Range", range)
+			    .detail("StorageServer", ssid);
+		} catch (Error& e) {
+			TraceEvent(SevWarnAlways, "ValidateRangeAssignmentCorruptionDetectedButFailedToStopDD")
+			    .detail("DataMoveID", dataMoveId)
+			    .detail("Range", range)
+			    .detail("StorageServer", ssid);
+			// We do not want failure of setDDMode hide the corruption signal
+		}
+	}
+	return allCorrect;
+}
+
+ACTOR Future<Void> auditLocationMetadataPreCheck(Database occ,
+                                                 Transaction* tr,
+                                                 KeyRange range,
+                                                 std::vector<UID> servers,
+                                                 std::string context,
+                                                 UID dataMoveId) {
+	if (range.empty()) {
+		TraceEvent(SevWarn, "CheckLocationMetadataEmptyInputRange").detail("By", "PreCheck").detail("Range", range);
+		return Void();
+	}
+	state std::vector<Future<Void>> actors;
+	state std::unordered_map<UID, Optional<bool>> results;
+	TraceEvent(SevVerbose, "CheckLocationMetadataStart")
+	    .detail("By", "PreCheck")
+	    .detail("DataMoveID", dataMoveId)
+	    .detail("Servers", describe(servers))
+	    .detail("Context", context)
+	    .detail("Range", range);
+	try {
+		actors.clear();
+		results.clear();
+		for (const auto& ssid : servers) {
+			actors.push_back(store(results[ssid], validateRangeAssignment(occ, tr, range, ssid, context, dataMoveId)));
+		}
+		wait(waitForAllReadyThenThrow(actors));
+		for (const auto& [ssid, res] : results) {
+			ASSERT(res.present());
+			if (!res.get()) { // Stop check if corruption detected
+				TraceEvent(SevError, "CheckLocationMetadataCorruptionDetected")
+				    .detail("By", "PreCheck")
+				    .detail("DataMoveID", dataMoveId)
+				    .detail("Servers", describe(servers))
+				    .detail("Context", context)
+				    .detail("Range", range);
+				throw location_metadata_corruption();
+			}
+		}
+		TraceEvent(SevVerbose, "CheckLocationMetadataComplete")
+		    .detail("By", "PreCheck")
+		    .detail("DataMoveID", dataMoveId)
+		    .detail("Servers", describe(servers))
+		    .detail("Context", context)
+		    .detail("Range", range);
+	} catch (Error& e) {
+		if (e.code() == error_code_actor_cancelled || e.code() == error_code_location_metadata_corruption) {
+			throw e;
+		} else {
+			TraceEvent(SevInfo, "CheckLocationMetadataFailed")
+			    .errorUnsuppressed(e)
+			    .detail("By", "PreCheck")
+			    .detail("DataMoveID", dataMoveId)
+			    .detail("Context", context)
+			    .detail("Range", range);
+			// Check any existing result when failure presents
+			for (const auto& [ssid, res] : results) {
+				if (res.present() && !res.get()) {
+					TraceEvent(SevError, "CheckLocationMetadataCorruptionDetectedWhenFailed")
+					    .detail("By", "PreCheck")
+					    .detail("DataMoveID", dataMoveId)
+					    .detail("Servers", describe(servers))
+					    .detail("Context", context)
+					    .detail("Range", range);
+					throw location_metadata_corruption();
+				}
+			}
+			// If no corruption detected, exit silently
+		}
+	}
+	return Void();
+}
+
+ACTOR Future<Void> auditLocationMetadataPostCheck(Database occ, KeyRange range, std::string context, UID dataMoveId) {
+	if (range.empty()) {
+		TraceEvent(SevWarn, "CheckLocationMetadataEmptyInputRange").detail("By", "PostCheck").detail("Range", range);
+		return Void();
+	}
+	state std::vector<Future<Void>> actors;
+	state std::unordered_map<uint64_t, Optional<bool>> results;
+	state Key rangeToReadBegin = range.begin;
+	state RangeResult readResultKS;
+	state RangeResult UIDtoTagMap;
+	state Transaction tr(occ);
+	state int retryCount = 0;
+	TraceEvent(SevVerbose, "CheckLocationMetadataStart")
+	    .detail("By", "PostCheck")
+	    .detail("Context", context)
+	    .detail("Range", range);
+	loop {
+		try {
+			loop {
+				try {
+					actors.clear();
+					readResultKS.clear();
+					results.clear();
+					tr.trState->taskID = TaskPriority::MoveKeys;
+					tr.setOption(FDBTransactionOptions::PRIORITY_SYSTEM_IMMEDIATE);
+					tr.setOption(FDBTransactionOptions::READ_SYSTEM_KEYS);
+					// Read keyServers
+					actors.push_back(store(readResultKS,
+					                       krmGetRanges(&tr,
+					                                    keyServersPrefix,
+					                                    KeyRangeRef(rangeToReadBegin, range.end),
+					                                    CLIENT_KNOBS->KRM_GET_RANGE_LIMIT,
+					                                    CLIENT_KNOBS->KRM_GET_RANGE_LIMIT_BYTES)));
+					actors.push_back(store(UIDtoTagMap, tr.getRange(serverTagKeys, CLIENT_KNOBS->TOO_MANY)));
+					wait(waitForAll(actors));
+					ASSERT(!UIDtoTagMap.more && UIDtoTagMap.size() < CLIENT_KNOBS->TOO_MANY);
+					TraceEvent(SevVerbose, "CheckLocationMetadataReadDone")
+					    .detail("By", "PostCheck")
+					    .detail("ResultSize", readResultKS.size());
+					// Read serverKeys
+					actors.clear();
+					state uint64_t resIdx = 0;
+					for (int i = 0; i < readResultKS.size() - 1; ++i) {
+						std::vector<UID> src;
+						std::vector<UID> dest;
+						UID srcID;
+						UID destID;
+						decodeKeyServersValue(UIDtoTagMap, readResultKS[i].value, src, dest, srcID, destID);
+						std::vector<UID> servers(src.size() + dest.size());
+						std::merge(src.begin(), src.end(), dest.begin(), dest.end(), servers.begin());
+						for (const auto& ssid : servers) {
+							actors.push_back(
+							    store(results[resIdx],
+							          validateRangeAssignment(occ,
+							                                  &tr,
+							                                  KeyRangeRef(readResultKS[i].key, readResultKS[i + 1].key),
+							                                  ssid,
+							                                  context,
+							                                  dataMoveId)));
+							++resIdx;
+						}
+					}
+					wait(waitForAllReadyThenThrow(actors));
+					for (const auto& [idx, res] : results) {
+						ASSERT(res.present());
+						if (!res.get()) { // Stop check if corruption detected
+							throw location_metadata_corruption();
+						}
+					}
+					if (readResultKS.back().key < range.end) {
+						rangeToReadBegin = readResultKS.back().key;
+						continue;
+					} else {
+						TraceEvent(SevVerbose, "CheckLocationMetadataComplete")
+						    .detail("By", "PostCheck")
+						    .detail("DataMoveID", dataMoveId)
+						    .detail("Context", context)
+						    .detail("Range", range);
+						break;
+					}
+				} catch (Error& e) {
+					wait(tr.onError(e));
+					retryCount++;
+				}
+			}
+			break;
+		} catch (Error& e) {
+			if (e.code() == error_code_actor_cancelled || e.code() == error_code_location_metadata_corruption) {
+				throw e;
+			} else {
+				// Check corruptions for the current (failed) round
+				for (const auto& [idx, res] : results) {
+					if (res.present() && !res.get()) {
+						TraceEvent(SevError, "CheckLocationMetadataCorruptionDetectedWhenFailed")
+						    .detail("By", "PostCheck")
+						    .detail("DataMoveID", dataMoveId)
+						    .detail("Context", context)
+						    .detail("Range", range);
+						throw location_metadata_corruption();
+					}
+				}
+				if (retryCount > SERVER_KNOBS->AUDIT_DATAMOVE_POST_CHECK_RETRY_COUNT_MAX) {
+					TraceEvent(SevInfo, "CheckLocationMetadataFailed")
+					    .errorUnsuppressed(e)
+					    .detail("By", "PostCheck")
+					    .detail("DataMoveID", dataMoveId)
+					    .detail("Context", context)
+					    .detail("Range", range);
+					// If no corruption detected, exit silently
+				} else {
+					wait(delay(0.5));
+					retryCount++;
+				}
+			}
+		}
+	}
+	return Void();
+}
+
 // Cleans up dest servers of a single shard, and unassigns the keyrange from the dest servers if necessary.
 ACTOR Future<Void> cleanUpSingleShardDataMove(Database occ,
                                               KeyRange keys,
@@ -318,6 +671,8 @@ ACTOR Future<Void> cleanUpSingleShardDataMove(Database occ,
                                               const DDEnabledState* ddEnabledState) {
 	ASSERT(SERVER_KNOBS->SHARD_ENCODE_LOCATION_METADATA);
 	TraceEvent(SevInfo, "CleanUpSingleShardDataMoveBegin", dataMoveId).detail("Range", keys);
+
+	state bool runPreCheck = true;
 
 	loop {
 		state Transaction tr(occ);
@@ -341,13 +696,22 @@ ACTOR Future<Void> cleanUpSingleShardDataMove(Database occ,
 				throw operation_cancelled();
 			}
 
-			std::vector<UID> src;
-			std::vector<UID> dest;
-			UID srcId, destId;
+			state std::vector<UID> src;
+			state std::vector<UID> dest;
+			state UID srcId;
+			state UID destId;
 			decodeKeyServersValue(UIDtoTagMap, currentShards[0].value, src, dest, srcId, destId);
 
 			if (dest.empty() || destId != anonymousShardId) {
 				return Void();
+			}
+
+			// Pre validate consistency of update of keyServers and serverKeys
+			if (SERVER_KNOBS->AUDIT_DATAMOVE_PRE_CHECK && runPreCheck) {
+				std::vector<UID> servers(src.size() + dest.size());
+				std::merge(src.begin(), src.end(), dest.begin(), dest.end(), servers.begin());
+				wait(auditLocationMetadataPreCheck(
+				    occ, &tr, keys, servers, "cleanUpSingleShardDataMove_precheck", dataMoveId));
 			}
 
 			TraceEvent(SevInfo, "CleanUpSingleShardDataMove", dataMoveId)
@@ -373,10 +737,19 @@ ACTOR Future<Void> cleanUpSingleShardDataMove(Database occ,
 
 			wait(tr.commit());
 
+			// Post validate consistency of update of keyServers and serverKeys
+			if (SERVER_KNOBS->AUDIT_DATAMOVE_POST_CHECK) {
+				wait(auditLocationMetadataPostCheck(occ, keys, "cleanUpSingleShardDataMove_postcheck", dataMoveId));
+			}
 			break;
 		} catch (Error& e) {
 			state Error err = e;
-			wait(tr.onError(e));
+			if (err.code() == error_code_location_metadata_corruption) {
+				throw location_metadata_corruption();
+			} else {
+				runPreCheck = false;
+				wait(tr.onError(err));
+			}
 
 			TraceEvent(SevWarn, "CleanUpSingleShardDataMoveRetriableError", dataMoveId)
 			    .error(err)
@@ -519,14 +892,14 @@ ACTOR Future<std::vector<std::vector<UID>>> additionalSources(RangeResult shards
 		decodeKeyServersValue(UIDtoTagMap, shards[i].value, src, dest);
 
 		for (int s = 0; s < src.size(); s++) {
-			if (!fetching.count(src[s])) {
+			if (!fetching.contains(src[s])) {
 				fetching.insert(src[s]);
 				serverListEntries.push_back(tr->get(serverListKeyFor(src[s])));
 			}
 		}
 
 		for (int s = 0; s < dest.size(); s++) {
-			if (!fetching.count(dest[s])) {
+			if (!fetching.contains(dest[s])) {
 				fetching.insert(dest[s]);
 				serverListEntries.push_back(tr->get(serverListKeyFor(dest[s])));
 			}
@@ -648,10 +1021,8 @@ ACTOR static Future<Void> startMoveKeys(Database occ,
 					state std::vector<Optional<Value>> serverListValues = wait(getAll(serverListEntries));
 
 					for (int s = 0; s < serverListValues.size(); s++) {
+						// This can happen if a SS is removed after a shard move. See comments on PR #10110.
 						if (!serverListValues[s].present()) {
-							// Attempt to move onto a server that isn't in serverList (removed or never added to the
-							// database) This can happen (why?) and is handled by the data distribution algorithm
-							// FIXME: Answer why this can happen?
 							CODE_PROBE(true, "start move keys moving to a removed server", probe::decoration::rare);
 							throw move_to_removed_server();
 						}
@@ -802,10 +1173,6 @@ ACTOR Future<Void> waitForShardReady(StorageServerInterface server,
 		try {
 			GetShardStateReply rep =
 			    wait(server.getShardState.getReply(GetShardStateRequest(keys, mode), TaskPriority::MoveKeys));
-			TraceEvent("GetShardStateReadyDD", server.id())
-			    .detail("RepVersion", rep.first)
-			    .detail("MinVersion", rep.second)
-			    .log();
 			if (rep.first >= minVersion) {
 				return Void();
 			}
@@ -849,9 +1216,12 @@ ACTOR Future<Void> checkFetchingState(Database cx,
 			std::vector<Future<Void>> requests;
 			state std::vector<Future<Void>> tssRequests;
 			for (int s = 0; s < serverListValues.size(); s++) {
+				// We don't think this condition should be triggered, but we're not sure if there are conditions
+				// that might cause it to trigger. Adding this assertion to find any such cases via testing.
+				ASSERT_WE_THINK(serverListValues[s].present());
 				if (!serverListValues[s].present()) {
 					// FIXME: Is this the right behavior?  dataMovementComplete will never be sent!
-					CODE_PROBE(true, "check fetching state moved to removed server", probe::decoration::rare);
+					// CODE_PROBE(true, "check fetching state moved to removed server", probe::decoration::rare);
 					throw move_to_removed_server();
 				}
 				auto si = decodeServerListValue(serverListValues[s].get());
@@ -980,7 +1350,7 @@ ACTOR static Future<Void> finishMoveKeys(Database occ,
 							completeSrc = src;
 						} else {
 							for (int i = 0; i < completeSrc.size(); i++) {
-								if (!srcSet.count(completeSrc[i])) {
+								if (!srcSet.contains(completeSrc[i])) {
 									swapAndPop(&completeSrc, i--);
 								}
 							}
@@ -1035,7 +1405,7 @@ ACTOR static Future<Void> finishMoveKeys(Database occ,
 							srcSet.insert(src2[s]);
 
 						for (int i = 0; i < completeSrc.size(); i++) {
-							if (!srcSet.count(completeSrc[i])) {
+							if (!srcSet.contains(completeSrc[i])) {
 								swapAndPop(&completeSrc, i--);
 							}
 						}
@@ -1082,7 +1452,7 @@ ACTOR static Future<Void> finishMoveKeys(Database occ,
 					state std::vector<UID> newDestinations;
 					std::set<UID> completeSrcSet(completeSrc.begin(), completeSrc.end());
 					for (auto& it : dest) {
-						if (!hasRemote || !completeSrcSet.count(it)) {
+						if (!hasRemote || !completeSrcSet.contains(it)) {
 							newDestinations.push_back(it);
 						}
 					}
@@ -1121,7 +1491,7 @@ ACTOR static Future<Void> finishMoveKeys(Database occ,
 						auto tssPair = tssMapping.find(storageServerInterfaces[s].id());
 
 						if (tssPair != tssMapping.end() && waitForTSSCounter > 0 &&
-						    !tssToIgnore.count(tssPair->second.id())) {
+						    !tssToIgnore.contains(tssPair->second.id())) {
 							tssReadyInterfs.push_back(tssPair->second);
 							tssReady.push_back(waitForShardReady(
 							    tssPair->second, keys, tr.getReadVersion().get(), GetShardStateRequest::READABLE));
@@ -1249,42 +1619,40 @@ ACTOR static Future<Void> startMoveShards(Database occ,
                                           MoveKeysLock lock,
                                           FlowLock* startMoveKeysLock,
                                           UID relocationIntervalId,
+                                          std::map<UID, StorageServerInterface>* tssMapping,
                                           const DDEnabledState* ddEnabledState,
-                                          CancelConflictingDataMoves cancelConflictingDataMoves) {
-	ASSERT(SERVER_KNOBS->SHARD_ENCODE_LOCATION_METADATA);
+                                          CancelConflictingDataMoves cancelConflictingDataMoves,
+                                          Optional<BulkLoadState> bulkLoadState) {
 	state Future<Void> warningLogger = logWarningAfter("StartMoveShardsTooLong", 600, servers);
 
 	wait(startMoveKeysLock->take(TaskPriority::DataDistributionLaunch));
 	state FlowLock::Releaser releaser(*startMoveKeysLock);
+	state bool loadedTssMapping = false;
 	state DataMoveMetaData dataMove;
+	state Severity sevDm = static_cast<Severity>(SERVER_KNOBS->PHYSICAL_SHARD_MOVE_LOG_SEVERITY);
 
-	TraceEvent(SevDebug, "StartMoveShardsBegin", relocationIntervalId)
+	TraceEvent(SevInfo, "StartMoveShardsBegin", relocationIntervalId)
 	    .detail("DataMoveID", dataMoveId)
-	    .detail("TargetRange", describe(ranges));
+	    .detail("TargetRange", describe(ranges))
+	    .detail("BulkLoadState", bulkLoadState.present() ? bulkLoadState.get().toString() : "");
 
 	// TODO: make startMoveShards work with multiple ranges.
 	ASSERT(ranges.size() == 1);
 	state KeyRangeRef keys = ranges[0];
 	state bool cancelDataMove = false;
+	state bool runPreCheck = true;
 	try {
 		loop {
 			state Key begin = keys.begin;
 			state KeyRange currentKeys = keys;
-			state int maxRetries = 0;
-			state bool complete = false;
 
 			state Transaction tr(occ);
 
 			try {
-				// Keep track of old dests that may need to have ranges removed from serverKeys
-				state std::set<UID> oldDests;
-
-				// Keep track of shards for all src servers so that we can preserve their values in serverKeys
-				state std::unordered_map<UID, std::vector<Shard>> physicalShardMap;
-
 				tr.trState->taskID = TaskPriority::MoveKeys;
 				tr.setOption(FDBTransactionOptions::PRIORITY_SYSTEM_IMMEDIATE);
 				tr.setOption(FDBTransactionOptions::ACCESS_SYSTEM_KEYS);
+				tr.setOption(FDBTransactionOptions::LOCK_AWARE);
 
 				wait(checkMoveKeysLock(&tr, lock, ddEnabledState));
 
@@ -1292,9 +1660,16 @@ ACTOR static Future<Void> startMoveShards(Database occ,
 				if (val.present()) {
 					DataMoveMetaData dmv = decodeDataMoveValue(val.get()); // dmv: Data move value.
 					dataMove = dmv;
-					TraceEvent(SevVerbose, "StartMoveShardsFoundDataMove", relocationIntervalId)
+					TraceEvent(sevDm, "StartMoveShardsFoundDataMove", relocationIntervalId)
 					    .detail("DataMoveID", dataMoveId)
-					    .detail("DataMove", dataMove.toString());
+					    .detail("DataMove", dataMove.toString())
+					    .detail("CancelDataMove", cancelDataMove);
+					if (dataMove.getPhase() == DataMoveMetaData::Deleting) {
+						TraceEvent(sevDm, "StartMoveShardsDataMoveDeleted", relocationIntervalId)
+						    .detail("DataMove", dataMove.toString())
+						    .detail("BackgroundCleanUp", dataMove.ranges.empty());
+						throw data_move_cancelled();
+					}
 					ASSERT(!dataMove.ranges.empty() && dataMove.ranges.front().begin == keys.begin);
 					if (cancelDataMove) {
 						dataMove.setPhase(DataMoveMetaData::Deleting);
@@ -1302,13 +1677,8 @@ ACTOR static Future<Void> startMoveShards(Database occ,
 						wait(tr.commit());
 						throw movekeys_conflict();
 					}
-					if (dataMove.getPhase() == DataMoveMetaData::Deleting) {
-						TraceEvent(SevVerbose, "StartMoveShardsDataMove", relocationIntervalId)
-						    .detail("DataMoveBeingDeleted", dataMoveId);
-						throw data_move_cancelled();
-					}
 					if (dataMove.getPhase() == DataMoveMetaData::Running) {
-						TraceEvent(SevVerbose, "StartMoveShardsDataMove", relocationIntervalId)
+						TraceEvent(sevDm, "StartMoveShardsDataMove", relocationIntervalId)
 						    .detail("DataMoveAlreadyCommitted", dataMoveId);
 						ASSERT(keys == dataMove.ranges.front());
 						return Void();
@@ -1320,9 +1690,15 @@ ACTOR static Future<Void> startMoveShards(Database occ,
 					}
 					dataMove = DataMoveMetaData();
 					dataMove.id = dataMoveId;
-					TraceEvent(SevVerbose, "StartMoveKeysNewDataMove", relocationIntervalId)
+					TraceEvent(sevDm, "StartMoveShardssNewDataMove", relocationIntervalId)
 					    .detail("DataMoveRange", keys)
 					    .detail("DataMoveID", dataMoveId);
+				}
+
+				if (!loadedTssMapping) {
+					// share transaction for loading tss mapping with the rest of start move keys
+					wait(readTSSMapping(&tr, tssMapping));
+					loadedTssMapping = true;
 				}
 
 				std::vector<Future<Optional<Value>>> serverListEntries;
@@ -1330,8 +1706,8 @@ ACTOR static Future<Void> startMoveShards(Database occ,
 				for (int s = 0; s < servers.size(); s++) {
 					serverListEntries.push_back(tr.get(serverListKeyFor(servers[s])));
 				}
-
 				std::vector<Optional<Value>> serverListValues = wait(getAll(serverListEntries));
+
 				for (int s = 0; s < serverListValues.size(); s++) {
 					if (!serverListValues[s].present()) {
 						// Attempt to move onto a server that isn't in serverList (removed or never added to the
@@ -1367,7 +1743,7 @@ ACTOR static Future<Void> startMoveShards(Database occ,
 						state UID srcId;
 						state UID destId;
 						decodeKeyServersValue(UIDtoTagMap, old[oldIndex].value, src, dest, srcId, destId);
-						TraceEvent(SevVerbose, "StartMoveShardsProcessingShard", relocationIntervalId)
+						TraceEvent(sevDm, "StartMoveShardsProcessingShard", relocationIntervalId)
 						    .detail("DataMoveID", dataMoveId)
 						    .detail("Range", rangeIntersectKeys)
 						    .detail("OldSrc", describe(src))
@@ -1375,6 +1751,30 @@ ACTOR static Future<Void> startMoveShards(Database occ,
 						    .detail("SrcID", srcId)
 						    .detail("DestID", destId)
 						    .detail("ReadVersion", tr.getReadVersion().get());
+
+						if (bulkLoadState.present()) {
+							state std::vector<UID> owners(src.size() + dest.size());
+							std::merge(src.begin(), src.end(), dest.begin(), dest.end(), owners.begin());
+							for (const auto& ssid : servers) {
+								if (std::find(owners.begin(), owners.end(), ssid) != owners.end()) {
+									TraceEvent(SevWarn, "DDBulkLoadTaskStartMoveShardsMoveInConflict")
+									    .detail("BulkLoadState", bulkLoadState.get().toString())
+									    .detail("DestServerId", ssid)
+									    .detail("OwnerIds", describe(owners))
+									    .detail("DataMove", dataMove.toString());
+									cancelDataMove = true;
+									throw retry();
+								}
+							}
+						}
+
+						// Pre validate consistency of update of keyServers and serverKeys
+						if (SERVER_KNOBS->AUDIT_DATAMOVE_PRE_CHECK && runPreCheck) {
+							std::vector<UID> servers(src.size() + dest.size());
+							std::merge(src.begin(), src.end(), dest.begin(), dest.end(), servers.begin());
+							wait(auditLocationMetadataPreCheck(
+							    occ, &tr, rangeIntersectKeys, servers, "startMoveShards_precheck", dataMoveId));
+						}
 
 						if (destId.isValid()) {
 							TraceEvent(SevWarn, "StartMoveShardsDestIDExist", relocationIntervalId)
@@ -1427,28 +1827,25 @@ ACTOR static Future<Void> startMoveShards(Database occ,
 						                           keyServersValue(src, servers, srcId, dataMoveId),
 						                           old[oldIndex + 1].value);
 
-						// Track old destination servers.  They may be removed from serverKeys soon, since they are
-						// about to be overwritten in keyServers
-						for (const UID& ssId : dest) {
-							oldDests.insert(ssId);
-						}
+						dataMove.src.insert(src.begin(), src.end());
 
-						// Keep track of src shards so that we can preserve their values when we overwrite serverKeys
-						for (const UID& ssId : src) {
-							physicalShardMap[ssId].emplace_back(rangeIntersectKeys, srcId);
-						}
-
-						for (const UID& ssId : src) {
-							dataMove.src.insert(ssId);
-							// TODO(psm): Create checkpoint for the range.
-						}
-					}
-
-					// Remove old dests from serverKeys.
-					for (const UID& destId : oldDests) {
-						if (std::find(servers.begin(), servers.end(), destId) == servers.end()) {
-							actors.push_back(
-							    unassignServerKeys(&tr, destId, currentKeys, physicalShardMap[destId], dataMoveId));
+						// If this is a bulk load data move, need not create checkpoint on the source servers
+						if (shouldCreateCheckpoint(dataMoveId) && !bulkLoadState.present()) {
+							const UID checkpointId = UID(deterministicRandom()->randomUInt64(), srcId.first());
+							CheckpointMetaData checkpoint(std::vector<KeyRange>{ rangeIntersectKeys },
+							                              DataMoveRocksCF,
+							                              src,
+							                              checkpointId,
+							                              dataMoveId);
+							checkpoint.setState(CheckpointMetaData::Pending);
+							tr.set(checkpointKeyFor(checkpointId), checkpointValue(checkpoint));
+							dataMove.checkpoints.insert(checkpointId);
+							TraceEvent(sevDm, "InitiatedCheckpoint", relocationIntervalId)
+							    .detail("CheckpointID", checkpointId.toString())
+							    .detail("Range", rangeIntersectKeys)
+							    .detail("DataMoveID", dataMoveId)
+							    .detail("SrcServers", describe(src))
+							    .detail("ReadVersion", tr.getReadVersion().get());
 						}
 					}
 
@@ -1468,14 +1865,40 @@ ACTOR static Future<Void> startMoveShards(Database occ,
 				}
 
 				if (currentKeys.end == keys.end) {
+					if (bulkLoadState.present()) {
+						state BulkLoadState newBulkLoadState;
+						try {
+							wait(store(newBulkLoadState,
+							           getBulkLoadTask(&tr,
+							                           bulkLoadState.get().getRange(),
+							                           bulkLoadState.get().getTaskId(),
+							                           { BulkLoadPhase::Triggered, BulkLoadPhase::Running })));
+							// It is possible that the previous data move is cancelled but has updated the
+							// task phase as running. In this case, we update the phase from Running to Running
+							newBulkLoadState.phase = BulkLoadPhase::Running;
+						} catch (Error& e) {
+							if (e.code() == error_code_bulkload_task_outdated) {
+								cancelDataMove = true;
+								throw retry();
+							}
+							throw e;
+						}
+						newBulkLoadState.setDataMoveId(dataMoveId);
+						newBulkLoadState.startTime = now();
+						wait(krmSetRange(
+						    &tr, bulkLoadPrefix, newBulkLoadState.getRange(), bulkLoadStateValue(newBulkLoadState)));
+						TraceEvent(SevInfo, "DDBulkLoadTaskRunningPersist", relocationIntervalId)
+						    .detail("BulkLoadState", newBulkLoadState.toString());
+						dataMove.bulkLoadState = newBulkLoadState;
+					}
 					dataMove.setPhase(DataMoveMetaData::Running);
-					complete = true;
-					TraceEvent(SevVerbose, "StartMoveShardsDataMoveComplete", dataMoveId)
+					TraceEvent(sevDm, "StartMoveShardsDataMoveComplete", relocationIntervalId)
 					    .detail("DataMoveID", dataMoveId)
-					    .detail("DataMove", dataMove.toString());
+					    .detail("DataMove", dataMove.toString())
+					    .detail("BulkLoadState", bulkLoadState.present() ? bulkLoadState.get().toString() : "");
 				} else {
 					dataMove.setPhase(DataMoveMetaData::Prepare);
-					TraceEvent(SevVerbose, "StartMoveShardsDataMovePartial", dataMoveId)
+					TraceEvent(sevDm, "StartMoveShardsDataMovePartial", relocationIntervalId)
 					    .detail("DataMoveID", dataMoveId)
 					    .detail("CurrentRange", currentKeys)
 					    .detail("DataMoveRange", keys)
@@ -1488,27 +1911,39 @@ ACTOR static Future<Void> startMoveShards(Database occ,
 
 				wait(tr.commit());
 
-				TraceEvent(SevVerbose, "DataMoveMetaDataCommit", dataMove.id)
+				TraceEvent(sevDm, "DataMoveMetaDataCommit", relocationIntervalId)
 				    .detail("DataMoveID", dataMoveId)
 				    .detail("DataMoveKey", dataMoveKeyFor(dataMoveId))
 				    .detail("CommitVersion", tr.getCommittedVersion())
 				    .detail("DeltaRange", currentKeys.toString())
 				    .detail("Range", describe(dataMove.ranges))
-				    .detail("DataMove", dataMove.toString());
+				    .detail("DataMove", dataMove.toString())
+				    .detail("BulkLoadState", bulkLoadState.present() ? bulkLoadState.get().toString() : "");
+
+				// Post validate consistency of update of keyServers and serverKeys
+				if (SERVER_KNOBS->AUDIT_DATAMOVE_POST_CHECK) {
+					if (!currentKeys.empty()) {
+						wait(auditLocationMetadataPostCheck(occ, currentKeys, "startMoveShards_postcheck", dataMoveId));
+					}
+				}
 
 				dataMove = DataMoveMetaData();
-				if (complete) {
+				if (currentKeys.end == keys.end) {
 					break;
 				}
 			} catch (Error& e) {
-				if (e.code() == error_code_retry) {
+				if (e.code() == error_code_location_metadata_corruption) {
+					throw location_metadata_corruption();
+				} else if (e.code() == error_code_retry) {
+					runPreCheck = false;
 					wait(delay(1));
 				} else {
-					TraceEvent(SevWarn, "StartMoveShardsError", dataMoveId)
+					TraceEvent(SevWarn, "StartMoveShardsError", relocationIntervalId)
 					    .errorUnsuppressed(e)
 					    .detail("DataMoveID", dataMoveId)
 					    .detail("DataMoveRange", keys)
 					    .detail("CurrentDataMoveMetaData", dataMove.toString());
+					runPreCheck = false;
 					wait(tr.onError(e));
 				}
 			}
@@ -1520,7 +1955,7 @@ ACTOR static Future<Void> startMoveShards(Database occ,
 		throw;
 	}
 
-	TraceEvent(SevDebug, "StartMoveShardsEnd", relocationIntervalId).detail("DataMoveID", dataMoveId);
+	TraceEvent(SevInfo, "StartMoveShardsEnd", relocationIntervalId).detail("DataMoveID", dataMoveId);
 
 	return Void();
 }
@@ -1602,24 +2037,27 @@ ACTOR static Future<Void> finishMoveShards(Database occ,
                                            bool hasRemote,
                                            UID relocationIntervalId,
                                            std::map<UID, StorageServerInterface> tssMapping,
-                                           const DDEnabledState* ddEnabledState) {
-	ASSERT(SERVER_KNOBS->SHARD_ENCODE_LOCATION_METADATA);
-
+                                           const DDEnabledState* ddEnabledState,
+                                           Optional<BulkLoadState> bulkLoadState) {
 	// TODO: make startMoveShards work with multiple ranges.
 	ASSERT(targetRanges.size() == 1);
 	state KeyRange keys = targetRanges[0];
 	state Future<Void> warningLogger = logWarningAfter("FinishMoveShardsTooLong", 600, destinationTeam);
 	state int retries = 0;
 	state DataMoveMetaData dataMove;
-	state bool complete = false;
+	state bool cancelDataMove = false;
+	state Severity sevDm = static_cast<Severity>(SERVER_KNOBS->PHYSICAL_SHARD_MOVE_LOG_SEVERITY);
 
 	wait(finishMoveKeysParallelismLock->take(TaskPriority::DataDistributionLaunch));
 	state FlowLock::Releaser releaser = FlowLock::Releaser(*finishMoveKeysParallelismLock);
+	state bool runPreCheck = true;
+	state bool skipTss = false;
+	state double ssReadyTime = std::numeric_limits<double>::max();
 
 	ASSERT(!destinationTeam.empty());
 
 	try {
-		TraceEvent(SevDebug, "FinishMoveShardsBegin", relocationIntervalId)
+		TraceEvent(SevInfo, "FinishMoveShardsBegin", relocationIntervalId)
 		    .detail("DataMoveID", dataMoveId)
 		    .detail("TargetRange", keys);
 
@@ -1631,25 +2069,35 @@ ACTOR static Future<Void> finishMoveShards(Database occ,
 			state std::unordered_set<UID> allServers;
 			state KeyRange range;
 			state Transaction tr(occ);
-			complete = false;
 			try {
 				tr.trState->taskID = TaskPriority::MoveKeys;
 				tr.setOption(FDBTransactionOptions::PRIORITY_SYSTEM_IMMEDIATE);
 				tr.setOption(FDBTransactionOptions::ACCESS_SYSTEM_KEYS);
+				tr.setOption(FDBTransactionOptions::LOCK_AWARE);
 
 				wait(checkMoveKeysLock(&tr, lock, ddEnabledState));
 
 				Optional<Value> val = wait(tr.get(dataMoveKeyFor(dataMoveId)));
 				if (val.present()) {
 					dataMove = decodeDataMoveValue(val.get());
-					TraceEvent(SevVerbose, "FinishMoveShardsFoundDataMove", relocationIntervalId)
+					TraceEvent(sevDm, "FinishMoveShardsFoundDataMove", relocationIntervalId)
+					    .detail("AtVerison", tr.getReadVersion().get())
+					    .detail("DataMoveKey", dataMoveKeyFor(dataMoveId))
 					    .detail("DataMoveID", dataMoveId)
-					    .detail("DataMove", dataMove.toString());
+					    .detail("DataMove", dataMove.toString())
+					    .detail("CancelDataMove", cancelDataMove);
+					if (cancelDataMove) {
+						dataMove.setPhase(DataMoveMetaData::Deleting);
+						tr.set(dataMoveKeyFor(dataMoveId), dataMoveValue(dataMove));
+						wait(tr.commit());
+						throw movekeys_conflict();
+					}
 					destServers.insert(destServers.end(), dataMove.dest.begin(), dataMove.dest.end());
 					std::sort(destServers.begin(), destServers.end());
 					if (dataMove.getPhase() == DataMoveMetaData::Deleting) {
 						TraceEvent(SevWarn, "FinishMoveShardsDataMoveDeleting", relocationIntervalId)
-						    .detail("DataMoveID", dataMoveId);
+						    .detail("DataMoveID", dataMoveId)
+						    .detail("DataMove", dataMove.toString());
 						throw data_move_cancelled();
 					}
 					ASSERT(dataMove.getPhase() == DataMoveMetaData::Running);
@@ -1657,7 +2105,9 @@ ACTOR static Future<Void> finishMoveShards(Database occ,
 					range = dataMove.ranges.front();
 				} else {
 					TraceEvent(SevWarn, "FinishMoveShardsDataMoveDeleted", relocationIntervalId)
-					    .detail("DataMoveID", dataMoveId);
+					    .detail("AtVerison", tr.getReadVersion().get())
+					    .detail("DataMoveID", dataMoveId)
+					    .detail("DataMove", dataMove.toString());
 					wait(checkDataMoveComplete(occ, dataMoveId, keys, relocationIntervalId));
 					return Void();
 				}
@@ -1674,31 +2124,43 @@ ACTOR static Future<Void> finishMoveShards(Database occ,
 				range = KeyRangeRef(range.begin, keyServers.back().key);
 				ASSERT(!range.empty());
 
-				for (int currentIndex = 0; currentIndex < keyServers.size() - 1; ++currentIndex) {
-					std::vector<UID> src;
-					std::vector<UID> dest;
-					UID srcId;
-					UID destId;
+				state int currentIndex = 0;
+				for (; currentIndex < keyServers.size() - 1; ++currentIndex) {
+					state std::vector<UID> src;
+					state std::vector<UID> dest;
+					state UID srcId;
+					state UID destId;
 					decodeKeyServersValue(UIDtoTagMap, keyServers[currentIndex].value, src, dest, srcId, destId);
 					const KeyRange currentRange =
 					    KeyRangeRef(keyServers[currentIndex].key, keyServers[currentIndex + 1].key);
-					TraceEvent(SevVerbose, "FinishMoveShardsProcessingShard", relocationIntervalId)
+					TraceEvent(sevDm, "FinishMoveShardsProcessingShard", relocationIntervalId)
 					    .detail("Range", currentRange)
 					    .detail("SrcID", srcId)
 					    .detail("Src", describe(src))
 					    .detail("DestID", destId)
-					    .detail("Dest", describe(dest));
+					    .detail("Dest", describe(dest))
+					    .detail("DataMove", dataMove.toString());
 					allServers.insert(src.begin(), src.end());
 					allServers.insert(dest.begin(), dest.end());
-					if (!destId.isValid()) {
-						TraceEvent(SevError, "FinishMoveShardsInvalidDestID", relocationIntervalId)
-						    .detail("DataMoveID", dataMoveId);
-						continue;
-					} else {
-						ASSERT(destId == dataMoveId);
-						std::sort(dest.begin(), dest.end());
-						ASSERT(std::equal(destServers.begin(), destServers.end(), dest.begin()));
+					if (destId != dataMoveId) {
+						TraceEvent(SevWarnAlways, "FinishMoveShardsInconsistentIDs", relocationIntervalId)
+						    .detail("DataMoveID", dataMoveId)
+						    .detail("ExistingShardID", destId)
+						    .detail("DataMove", dataMove.toString());
+						cancelDataMove = true;
+						throw retry();
 					}
+
+					// Pre validate consistency of update of keyServers and serverKeys
+					if (SERVER_KNOBS->AUDIT_DATAMOVE_PRE_CHECK && runPreCheck) {
+						std::vector<UID> servers(src.size() + dest.size());
+						std::merge(src.begin(), src.end(), dest.begin(), dest.end(), servers.begin());
+						wait(auditLocationMetadataPreCheck(
+						    occ, &tr, currentRange, servers, "finishMoveShards_precheck", dataMoveId));
+					}
+
+					std::sort(dest.begin(), dest.end());
+					ASSERT(std::equal(destServers.begin(), destServers.end(), dest.begin(), dest.end()));
 
 					std::set<UID> srcSet;
 					for (int s = 0; s < src.size(); s++) {
@@ -1709,7 +2171,7 @@ ACTOR static Future<Void> finishMoveShards(Database occ,
 						completeSrc = src;
 					} else {
 						for (int i = 0; i < completeSrc.size(); i++) {
-							if (!srcSet.count(completeSrc[i])) {
+							if (!srcSet.contains(completeSrc[i])) {
 								swapAndPop(&completeSrc, i--);
 							}
 						}
@@ -1720,10 +2182,12 @@ ACTOR static Future<Void> finishMoveShards(Database occ,
 				// They must also have at least the transaction read version so they can't "forget" the shard
 				// between now and when this transaction commits.
 				state std::vector<Future<Void>> serverReady; // only for count below
+				state std::vector<Future<Void>> tssReady; // for waiting in parallel with tss
+				state std::vector<StorageServerInterface> tssReadyInterfs;
 				state std::vector<UID> newDestinations;
 				std::set<UID> completeSrcSet(completeSrc.begin(), completeSrc.end());
 				for (const UID& id : destServers) {
-					if (!hasRemote || !completeSrcSet.count(id)) {
+					if (!hasRemote || !completeSrcSet.contains(id)) {
 						newDestinations.push_back(id);
 					}
 				}
@@ -1739,38 +2203,81 @@ ACTOR static Future<Void> finishMoveShards(Database occ,
 				releaser.release();
 
 				for (int s = 0; s < serverListValues.size(); s++) {
-					ASSERT(serverListValues[s]
-					           .present()); // There should always be server list entries for servers in keyServers
+					// TODO: if the server is removed,
+					if (!serverListValues[s].present()) {
+						throw retry();
+					}
 					auto si = decodeServerListValue(serverListValues[s].get());
 					ASSERT(si.id() == newDestinations[s]);
 					storageServerInterfaces.push_back(si);
 				}
+
+				// update client info in case tss mapping changed or server got updated
 
 				// Wait for new destination servers to fetch the data range.
 				serverReady.reserve(storageServerInterfaces.size());
 				for (int s = 0; s < storageServerInterfaces.size(); s++) {
 					serverReady.push_back(waitForShardReady(
 					    storageServerInterfaces[s], range, tr.getReadVersion().get(), GetShardStateRequest::READABLE));
+
+					if (skipTss)
+						continue;
+
+					auto tssPair = tssMapping.find(storageServerInterfaces[s].id());
+
+					if (tssPair != tssMapping.end()) {
+						tssReadyInterfs.push_back(tssPair->second);
+						tssReady.push_back(waitForShardReady(
+						    tssPair->second, range, tr.getReadVersion().get(), GetShardStateRequest::READABLE));
+					}
 				}
+
+				TraceEvent(sevDm, "FinishMoveShardsWaitingServers", relocationIntervalId)
+				    .detail("DataMoveID", dataMoveId)
+				    .detail("NewDestinations", describe(newDestinations))
+				    .detail("DataMove", dataMove.toString());
 
 				// Wait for all storage server moves, and explicitly swallow errors for tss ones with
 				// waitForAllReady If this takes too long the transaction will time out and retry, which is ok
-				wait(timeout(waitForAll(serverReady),
+				wait(timeout(waitForAll(serverReady) && waitForAllReady(tssReady),
 				             SERVER_KNOBS->SERVER_READY_QUORUM_TIMEOUT,
 				             Void(),
 				             TaskPriority::MoveKeys));
 
-				std::vector<UID> readyServers;
+				state std::vector<UID> readyServers;
 				for (int s = 0; s < serverReady.size(); ++s) {
 					if (serverReady[s].isReady() && !serverReady[s].isError()) {
 						readyServers.push_back(storageServerInterfaces[s].uniqueID);
 					}
 				}
+				int tssCount = 0;
+				for (int s = 0; s < tssReady.size(); s++) {
+					if (tssReady[s].isReady() && !tssReady[s].isError()) {
+						tssCount += 1;
+					}
+				}
 
-				TraceEvent(SevVerbose, "FinishMoveShardsWaitedServers", relocationIntervalId)
+				if (readyServers.size() == serverReady.size() && !skipTss) {
+					ssReadyTime = std::min(now(), ssReadyTime);
+					if (tssCount < tssReady.size() &&
+					    now() - ssReadyTime >= SERVER_KNOBS->DD_WAIT_TSS_DATA_MOVE_DELAY) {
+						skipTss = true;
+						TraceEvent(SevWarnAlways, "FinishMoveShardsSkipTSS")
+						    .detail("DataMoveID", dataMoveId)
+						    .detail("ReadyServers", describe(readyServers))
+						    .detail("NewDestinations", describe(newDestinations))
+						    .detail("ReadyTSS", tssCount)
+						    .detail("TSSInfo", describe(tssReadyInterfs))
+						    .detail("SSReadyTime", ssReadyTime);
+					}
+				}
+
+				TraceEvent(sevDm, "FinishMoveShardsWaitedServers", relocationIntervalId)
 				    .detail("DataMoveID", dataMoveId)
 				    .detail("ReadyServers", describe(readyServers))
-				    .detail("NewDestinations", describe(newDestinations));
+				    .detail("NewDestinations", describe(newDestinations))
+				    .detail("ReadyTSS", tssCount)
+				    .detail("DataMove", dataMove.toString());
 
 				if (readyServers.size() == newDestinations.size()) {
 
@@ -1787,31 +2294,67 @@ ACTOR static Future<Void> finishMoveShards(Database occ,
 						                          range,
 						                          allKeys,
 						                          destHasServer ? serverKeysValue(dataMoveId) : serverKeysFalse));
-						TraceEvent(SevVerbose, "FinishMoveShardsSetServerKeyRange", dataMoveId)
+						TraceEvent(sevDm, "FinishMoveShardsSetServerKeyRange", relocationIntervalId)
 						    .detail("StorageServerID", ssId)
 						    .detail("KeyRange", range)
-						    .detail("ShardID", destHasServer ? dataMoveId : UID());
+						    .detail("ShardID", destHasServer ? dataMoveId : UID())
+						    .detail("DataMove", dataMove.toString());
 					}
 
 					wait(waitForAll(actors));
 
 					if (range.end == dataMove.ranges.front().end) {
+						if (bulkLoadState.present()) {
+							state BulkLoadState newBulkLoadState;
+							try {
+								wait(store(newBulkLoadState,
+								           getBulkLoadTask(&tr,
+								                           bulkLoadState.get().getRange(),
+								                           bulkLoadState.get().getTaskId(),
+								                           { BulkLoadPhase::Running, BulkLoadPhase::Complete })));
+								newBulkLoadState.phase = BulkLoadPhase::Complete;
+							} catch (Error& e) {
+								if (e.code() == error_code_bulkload_task_outdated) {
+									cancelDataMove = true;
+									throw retry();
+								}
+								throw e;
+							}
+							ASSERT(newBulkLoadState.getDataMoveId().present() &&
+							       newBulkLoadState.getDataMoveId().get() == dataMoveId);
+							newBulkLoadState.completeTime = now();
+							wait(krmSetRange(&tr,
+							                 bulkLoadPrefix,
+							                 newBulkLoadState.getRange(),
+							                 bulkLoadStateValue(newBulkLoadState)));
+							TraceEvent(SevInfo, "DDBulkLoadTaskCompletePersist", relocationIntervalId)
+							    .detail("BulkLoadState", newBulkLoadState.toString());
+							dataMove.bulkLoadState = newBulkLoadState;
+						}
+						wait(deleteCheckpoints(&tr, dataMove.checkpoints, dataMoveId));
 						tr.clear(dataMoveKeyFor(dataMoveId));
-						complete = true;
-						TraceEvent(SevVerbose, "FinishMoveShardsDeleteMetaData", dataMoveId)
+						TraceEvent(sevDm, "FinishMoveShardsDeleteMetaData", relocationIntervalId)
 						    .detail("DataMove", dataMove.toString());
-					} else {
-						TraceEvent(SevInfo, "FinishMoveShardsPartialComplete", dataMoveId)
+					} else if (!bulkLoadState.present()) {
+						// Bulk Loading data move does not allow partial complete
+						TraceEvent(SevInfo, "FinishMoveShardsPartialComplete", relocationIntervalId)
 						    .detail("DataMoveID", dataMoveId)
 						    .detail("CurrentRange", range)
-						    .detail("NewDataMoveMetaData", dataMove.toString());
+						    .detail("NewDataMoveMetaData", dataMove.toString())
+						    .detail("DataMove", dataMove.toString());
 						dataMove.ranges.front() = KeyRangeRef(range.end, dataMove.ranges.front().end);
 						tr.set(dataMoveKeyFor(dataMoveId), dataMoveValue(dataMove));
 					}
 
 					wait(tr.commit());
 
-					if (complete) {
+					// Post validate consistency of update of keyServers and serverKeys
+					if (SERVER_KNOBS->AUDIT_DATAMOVE_POST_CHECK) {
+						wait(auditLocationMetadataPostCheck(
+						    occ, range, "finishMoveShards_postcheck", relocationIntervalId));
+					}
+
+					if (range.end == dataMove.ranges.front().end) {
 						break;
 					}
 				} else {
@@ -1821,17 +2364,26 @@ ACTOR static Future<Void> finishMoveShards(Database occ,
 				TraceEvent(SevWarn, "TryFinishMoveShardsError", relocationIntervalId)
 				    .errorUnsuppressed(error)
 				    .detail("DataMoveID", dataMoveId);
-				if (error.code() == error_code_actor_cancelled)
+				if (error.code() == error_code_location_metadata_corruption) {
+					throw location_metadata_corruption();
+				} else if (error.code() == error_code_retry) {
+					runPreCheck = false;
+					++retries;
+					wait(delay(1));
+				} else if (error.code() == error_code_actor_cancelled) {
 					throw;
-				state Error err = error;
-				wait(tr.onError(error));
-				retries++;
-				if (retries % 10 == 0) {
-					TraceEvent(retries == 20 ? SevWarnAlways : SevWarn,
-					           "RelocateShard_FinishMoveKeysRetrying",
-					           relocationIntervalId)
-					    .error(err)
-					    .detail("DataMoveID", dataMoveId);
+				} else {
+					state Error err = error;
+					runPreCheck = false;
+					wait(tr.onError(err));
+					retries++;
+					if (retries % 10 == 0) {
+						TraceEvent(retries == 20 ? SevWarnAlways : SevWarn,
+						           "RelocateShard_FinishMoveShardsRetrying",
+						           relocationIntervalId)
+						    .error(err)
+						    .detail("DataMoveID", dataMoveId);
+					}
 				}
 			}
 		}
@@ -1840,7 +2392,10 @@ ACTOR static Future<Void> finishMoveShards(Database occ,
 		throw;
 	}
 
-	TraceEvent(SevDebug, "FinishMoveShardsEnd", relocationIntervalId).detail("DataMoveID", dataMoveId);
+	TraceEvent(SevInfo, "FinishMoveShardsEnd", relocationIntervalId)
+	    .detail("DataMoveID", dataMoveId)
+	    .detail("BulkLoadState", bulkLoadState.present() ? bulkLoadState.get().toString() : "")
+	    .detail("DataMove", dataMove.toString());
 	return Void();
 }
 
@@ -1857,6 +2412,7 @@ ACTOR Future<std::pair<Version, Tag>> addStorageServer(Database cx, StorageServe
 	loop {
 		try {
 			tr->setOption(FDBTransactionOptions::ACCESS_SYSTEM_KEYS);
+			tr->setOption(FDBTransactionOptions::PRIORITY_SYSTEM_IMMEDIATE);
 
 			// FIXME: don't fetch tag localities, all tags, and history tags if tss. Just fetch pair's tag
 			state Future<RangeResult> fTagLocalities = tr->getRange(tagLocalityListKeys, CLIENT_KNOBS->TOO_MANY);
@@ -1999,9 +2555,6 @@ ACTOR Future<std::pair<Version, Tag>> addStorageServer(Database cx, StorageServe
 				tr->addReadConflictRange(conflictRange);
 				tr->addWriteConflictRange(conflictRange);
 
-				StorageMetadataType metadata(StorageMetadataType::currentTime());
-				metadataMap.set(tr, server.id(), metadata);
-
 				if (SERVER_KNOBS->TSS_HACK_IDENTITY_MAPPING) {
 					// THIS SHOULD NEVER BE ENABLED IN ANY NON-TESTING ENVIRONMENT
 					TraceEvent(SevError, "TSSIdentityMappingEnabled").log();
@@ -2009,9 +2562,15 @@ ACTOR Future<std::pair<Version, Tag>> addStorageServer(Database cx, StorageServe
 				}
 			}
 
+			StorageMetadataType metadata(StorageMetadataType::currentTime());
+			metadataMap.set(tr, server.id(), metadata);
+			tr->set(serverMetadataChangeKey, deterministicRandom()->randomUniqueID().toString());
+
 			tr->set(serverListKeyFor(server.id()), serverListValue(server));
 			wait(tr->commit());
-			TraceEvent("AddedStorageServerSystemKey").detail("ServerID", server.id());
+			TraceEvent("AddedStorageServerSystemKey")
+			    .detail("ServerID", server.id())
+			    .detail("CommitVersion", tr->getCommittedVersion());
 
 			return std::make_pair(tr->getCommittedVersion(), tag);
 		} catch (Error& e) {
@@ -2043,9 +2602,11 @@ ACTOR Future<bool> canRemoveStorageServer(Reference<ReadYourWritesTransaction> t
 
 	// Return true if the entire range is false.  Since these values are coalesced, we can return false if there is more
 	// than one result
-	UID teamId;
+	UID shardId;
 	bool assigned, emptyRange;
-	decodeServerKeysValue(keys[0].value, assigned, emptyRange, teamId);
+	DataMoveType dataMoveType = DataMoveType::LOGICAL;
+	DataMovementReason dataMoveReason = DataMovementReason::INVALID;
+	decodeServerKeysValue(keys[0].value, assigned, emptyRange, dataMoveType, shardId, dataMoveReason);
 	TraceEvent(SevVerbose, "CanRemoveStorageServer")
 	    .detail("ServerID", serverID)
 	    .detail("Key1", keys[0].key)
@@ -2072,7 +2633,8 @@ ACTOR Future<Void> removeStorageServer(Database cx,
 			tr->setOption(FDBTransactionOptions::PRIORITY_SYSTEM_IMMEDIATE);
 			tr->setOption(FDBTransactionOptions::ACCESS_SYSTEM_KEYS);
 			wait(checkMoveKeysLock(&(tr->getTransaction()), lock, ddEnabledState));
-			TraceEvent("RemoveStorageServerLocked")
+			TraceEvent("RemoveStorageServer")
+			    .detail("State", "Locked")
 			    .detail("ServerID", serverID)
 			    .detail("Version", tr->getReadVersion().get());
 
@@ -2081,10 +2643,12 @@ ACTOR Future<Void> removeStorageServer(Database cx,
 				CODE_PROBE(true,
 				           "The caller had a transaction in flight that assigned keys to the server.  Wait for it to "
 				           "reverse its mistake.");
-				TraceEvent(SevWarn, "NoCanRemove").detail("Count", noCanRemoveCount++).detail("ServerID", serverID);
+				TraceEvent(SevWarn, "RemoveStorageServer")
+				    .detail("State", "CanRemoveFailed")
+				    .detail("ServerID", serverID)
+				    .detail("Count", noCanRemoveCount++);
 				wait(delayJittered(SERVER_KNOBS->REMOVE_RETRY_DELAY, TaskPriority::DataDistributionLaunch));
 				tr->reset();
-				TraceEvent("RemoveStorageServerRetrying").detail("CanRemove", canRemove);
 			} else {
 				state Future<Optional<Value>> fListKey = tr->get(serverListKeyFor(serverID));
 				state Future<RangeResult> fTags = tr->getRange(serverTagKeys, CLIENT_KNOBS->TOO_MANY);
@@ -2128,7 +2692,7 @@ ACTOR Future<Void> removeStorageServer(Database cx,
 					allLocalities.insert(dcId_locality[decodeTLogDatacentersKey(it.key)]);
 				}
 
-				if (locality >= 0 && !allLocalities.count(locality)) {
+				if (locality >= 0 && !allLocalities.contains(locality)) {
 					for (auto& it : fTagLocalities.get()) {
 						if (locality == decodeTagLocalityListValue(it.value)) {
 							tr->clear(it.key);
@@ -2158,15 +2722,20 @@ ACTOR Future<Void> removeStorageServer(Database cx,
 				}
 
 				metadataMap.erase(tr, serverID);
+				tr->set(serverMetadataChangeKey, deterministicRandom()->randomUniqueID().toString());
 
 				retry = true;
 				wait(tr->commit());
+				TraceEvent("RemoveStorageServer")
+				    .detail("State", "Success")
+				    .detail("ServerID", serverID)
+				    .detail("CommitVersion", tr->getCommittedVersion());
 				return Void();
 			}
 		} catch (Error& e) {
 			state Error err = e;
 			wait(tr->onError(e));
-			TraceEvent("RemoveStorageServerRetrying").error(err);
+			TraceEvent("RemoveStorageServer").error(err).detail("State", "Retry").detail("ServerID", serverID);
 		}
 	}
 }
@@ -2274,7 +2843,10 @@ ACTOR Future<Void> removeKeysFromFailedServer(Database cx,
 							}
 						}
 
-						const UID shardId = newShardId(deterministicRandom()->randomUInt64(), AssignEmptyRange::True);
+						const UID shardId = newDataMoveId(deterministicRandom()->randomUInt64(),
+						                                  AssignEmptyRange::True,
+						                                  DataMoveType::LOGICAL,
+						                                  DataMovementReason::ASSIGN_EMPTY_RANGE);
 
 						// Assign the shard to teamForDroppedRange in keyServer space.
 						if (SERVER_KNOBS->SHARD_ENCODE_LOCATION_METADATA) {
@@ -2349,15 +2921,81 @@ ACTOR Future<Void> removeKeysFromFailedServer(Database cx,
 	return Void();
 }
 
-ACTOR Future<Void> cleanUpDataMove(Database occ,
-                                   UID dataMoveId,
-                                   MoveKeysLock lock,
-                                   FlowLock* cleanUpDataMoveParallelismLock,
-                                   KeyRange keys,
-                                   const DDEnabledState* ddEnabledState) {
+// In cleanUpDataMoveCore, to do the actual cleanup, we suppose the target data move already update its
+// information to the metadata. However, this does not always happen.
+// Background cleanup is used to handle the case where the normal cleanup (cleanUpDataMoveCore)
+// and the moveShard (startMoveShard) has race on update of metadata.
+// Background cleanup is triggered when the normal cleanup (cleanUpDataMoveCore) with a succeed transaction
+// is failed to see the update of metadata (datamove key space) by the startMoveShard
+// For this case, the startMoveShard must exit without update the meta data
+// This background cleanup is used to clean the placehold left by the normal cleanup
+// To understand this trick of cleanup place holder, we have three cases:
+// (1) Race condition of dataMove metadata between cleanUpDataMoveCore and startMoveShard, and
+// cleanUpDataMoveCore wins the race. Then startMoveShard retries and see the place holder on the metadata
+// put by cleanUpDataMoveCore, and startMoveShard gives up and exits. No update to the metadata
+// (2) Race condition of dataMove metadata between cleanUpDataMoveCore and startMoveShard, and
+// startMoveShard wins the race. Then cleanUpDataMoveCore retries and see the update of metadata by
+// startMoveShard. Then cleanUpDataMoveCore does the cleanup as normal
+// (3) cleanUpDataMoveCore happens before startMoveShard. No race happens. Then, cleanUpDataMoveCore sees
+// the place holder on the metadata put by cleanUpDataMoveCore. Then, startMoveShard gives up and exits.
+// No update to the metadata by the startMoveShard
+// For all three cases, the background cleanup only needs to cleanup the place holder
+ACTOR Future<Void> cleanUpDataMoveBackground(Database occ,
+                                             UID dataMoveId,
+                                             MoveKeysLock lock,
+                                             FlowLock* cleanUpDataMoveParallelismLock,
+                                             KeyRange keys,
+                                             const DDEnabledState* ddEnabledState,
+                                             double delaySeconds) {
+	wait(delay(std::max(10.0, delaySeconds)));
+	TraceEvent(SevDebug, "CleanUpDataMoveBackgroundBegin", dataMoveId)
+	    .detail("DataMoveID", dataMoveId)
+	    .detail("Range", keys);
+	wait(cleanUpDataMoveParallelismLock->take(TaskPriority::DataDistributionLaunch));
+	state FlowLock::Releaser releaser = FlowLock::Releaser(*cleanUpDataMoveParallelismLock);
+	state DataMoveMetaData dataMove;
+	state Transaction tr(occ);
+	loop {
+		try {
+			tr.trState->taskID = TaskPriority::MoveKeys;
+			tr.setOption(FDBTransactionOptions::PRIORITY_SYSTEM_IMMEDIATE);
+			tr.setOption(FDBTransactionOptions::ACCESS_SYSTEM_KEYS);
+			wait(checkMoveKeysLock(&tr, lock, ddEnabledState));
+
+			Optional<Value> val = wait(tr.get(dataMoveKeyFor(dataMoveId)));
+			if (!val.present()) {
+				break;
+			}
+			dataMove = decodeDataMoveValue(val.get());
+			ASSERT(dataMove.ranges.empty());
+			ASSERT(dataMove.getPhase() == DataMoveMetaData::Deleting);
+			tr.clear(dataMoveKeyFor(dataMoveId));
+			wait(tr.commit());
+			break;
+		} catch (Error& e) {
+			TraceEvent(SevWarn, "CleanUpDataMoveBackgroundFail", dataMoveId).errorUnsuppressed(e);
+			wait(tr.onError(e));
+		}
+	}
+
+	TraceEvent(SevDebug, "CleanUpDataMoveBackgroundEnd", dataMoveId)
+	    .detail("DataMoveID", dataMoveId)
+	    .detail("DataMoveRange", keys);
+
+	return Void();
+}
+
+ACTOR Future<Void> cleanUpDataMoveCore(Database occ,
+                                       UID dataMoveId,
+                                       MoveKeysLock lock,
+                                       FlowLock* cleanUpDataMoveParallelismLock,
+                                       KeyRange keys,
+                                       const DDEnabledState* ddEnabledState) {
 	state KeyRange range;
-	TraceEvent(SevVerbose, "CleanUpDataMoveBegin", dataMoveId).detail("DataMoveID", dataMoveId).detail("Range", keys);
-	state bool complete = false;
+	state Severity sevDm = static_cast<Severity>(SERVER_KNOBS->PHYSICAL_SHARD_MOVE_LOG_SEVERITY);
+	TraceEvent(SevInfo, "CleanUpDataMoveBegin", dataMoveId).detail("DataMoveID", dataMoveId).detail("Range", keys);
+	state Error lastError;
+	state bool runPreCheck = true;
 
 	wait(cleanUpDataMoveParallelismLock->take(TaskPriority::DataDistributionLaunch));
 	state FlowLock::Releaser releaser = FlowLock::Releaser(*cleanUpDataMoveParallelismLock);
@@ -2375,20 +3013,36 @@ ACTOR Future<Void> cleanUpDataMove(Database occ,
 				tr.trState->taskID = TaskPriority::MoveKeys;
 				tr.setOption(FDBTransactionOptions::PRIORITY_SYSTEM_IMMEDIATE);
 				tr.setOption(FDBTransactionOptions::ACCESS_SYSTEM_KEYS);
+				tr.setOption(FDBTransactionOptions::LOCK_AWARE);
 				wait(checkMoveKeysLock(&tr, lock, ddEnabledState));
 
 				Optional<Value> val = wait(tr.get(dataMoveKeyFor(dataMoveId)));
 				if (val.present()) {
 					dataMove = decodeDataMoveValue(val.get());
-					ASSERT(!dataMove.ranges.empty());
-					TraceEvent(SevVerbose, "CleanUpDataMoveMetaData", dataMoveId)
+					if (dataMove.ranges.empty()) {
+						// Need a background cleanup
+						throw retry_clean_up_datamove_tombstone_added();
+					}
+					TraceEvent(sevDm, "CleanUpDataMoveMetaData", dataMoveId)
 					    .detail("DataMoveID", dataMoveId)
 					    .detail("DataMoveMetaData", dataMove.toString());
+					ASSERT(!dataMove.ranges.empty());
 					range = dataMove.ranges.front();
 					ASSERT(!range.empty());
 				} else {
-					TraceEvent(SevDebug, "CleanUpDataMoveNotExist", dataMoveId).detail("DataMoveID", dataMoveId);
-					break;
+					if (lastError.code() == error_code_commit_unknown_result) {
+						// It means the commit was succeed last time
+						// For this case, safely do nothing
+						TraceEvent(sevDm, "CleanUpDataMoveHaveDoneExit", dataMoveId).detail("DataMoveID", dataMoveId);
+						return Void();
+					}
+					// If a normal cleanup sees nothing, triggers background cleanup
+					dataMove = DataMoveMetaData(dataMoveId);
+					dataMove.setPhase(DataMoveMetaData::Deleting);
+					tr.set(dataMoveKeyFor(dataMoveId), dataMoveValue(dataMove));
+					wait(tr.commit());
+					TraceEvent(sevDm, "CleanUpDataMovePlaceHolder", dataMoveId).detail("DataMoveID", dataMoveId);
+					throw retry_clean_up_datamove_tombstone_added();
 				}
 
 				dataMove.setPhase(DataMoveMetaData::Deleting);
@@ -2408,17 +3062,26 @@ ACTOR Future<Void> cleanUpDataMove(Database occ,
 				// For each intersecting range, clear existing dest servers and checkpoints on all src servers.
 				state int i = 0;
 				for (; i < currentShards.size() - 1; ++i) {
-					KeyRangeRef rangeIntersectKeys(currentShards[i].key, currentShards[i + 1].key);
-					std::vector<UID> src;
-					std::vector<UID> dest;
-					UID srcId, destId;
+					state KeyRangeRef rangeIntersectKeys(currentShards[i].key, currentShards[i + 1].key);
+					state std::vector<UID> src;
+					state std::vector<UID> dest;
+					state UID srcId;
+					state UID destId;
 					decodeKeyServersValue(UIDtoTagMap, currentShards[i].value, src, dest, srcId, destId);
+
+					// Pre validate consistency of update of keyServers and serverKeys
+					if (SERVER_KNOBS->AUDIT_DATAMOVE_PRE_CHECK && runPreCheck) {
+						std::vector<UID> servers(src.size() + dest.size());
+						std::merge(src.begin(), src.end(), dest.begin(), dest.end(), servers.begin());
+						wait(auditLocationMetadataPreCheck(
+						    occ, &tr, rangeIntersectKeys, servers, "cleanUpDataMoveCore_precheck", dataMoveId));
+					}
 
 					for (const auto& uid : src) {
 						physicalShardMap[uid].push_back(Shard(rangeIntersectKeys, srcId));
 					}
 
-					TraceEvent(SevVerbose, "CleanUpDataMoveShard", dataMoveId)
+					TraceEvent(sevDm, "CleanUpDataMoveShard", dataMoveId)
 					    .detail("DataMoveID", dataMoveId)
 					    .detail("ShardRange", rangeIntersectKeys)
 					    .detail("Src", describe(src))
@@ -2431,7 +3094,7 @@ ACTOR Future<Void> cleanUpDataMove(Database occ,
 						for (const auto& uid : dest) {
 							physicalShardMap[uid].push_back(Shard(rangeIntersectKeys, destId));
 						}
-						TraceEvent(SevVerbose, "CleanUpDataMoveSkipShard", dataMoveId)
+						TraceEvent(SevWarn, "CleanUpDataMoveSkipShard", dataMoveId)
 						    .detail("DataMoveID", dataMoveId)
 						    .detail("ShardRange", rangeIntersectKeys)
 						    .detail("Src", describe(src))
@@ -2454,16 +3117,16 @@ ACTOR Future<Void> cleanUpDataMove(Database occ,
 				}
 
 				if (range.end == dataMove.ranges.front().end) {
+					wait(deleteCheckpoints(&tr, dataMove.checkpoints, dataMoveId));
 					tr.clear(dataMoveKeyFor(dataMoveId));
-					complete = true;
-					TraceEvent(SevVerbose, "CleanUpDataMoveDeleteMetaData", dataMoveId)
+					TraceEvent(sevDm, "CleanUpDataMoveDeleteMetaData", dataMoveId)
 					    .detail("DataMoveID", dataMove.toString());
 
 				} else {
 					dataMove.ranges.front() = KeyRangeRef(range.end, dataMove.ranges.front().end);
 					dataMove.setPhase(DataMoveMetaData::Deleting);
 					tr.set(dataMoveKeyFor(dataMoveId), dataMoveValue(dataMove));
-					TraceEvent(SevVerbose, "CleanUpDataMovePartial", dataMoveId)
+					TraceEvent(sevDm, "CleanUpDataMovePartial", dataMoveId)
 					    .detail("DataMoveID", dataMoveId)
 					    .detail("CurrentRange", range)
 					    .detail("NewDataMove", dataMove.toString());
@@ -2477,28 +3140,71 @@ ACTOR Future<Void> cleanUpDataMove(Database occ,
 
 				wait(tr.commit());
 
-				TraceEvent(SevVerbose, "CleanUpDataMoveCommitted", dataMoveId)
+				TraceEvent(sevDm, "CleanUpDataMoveCommitted", dataMoveId)
 				    .detail("DataMoveID", dataMoveId)
 				    .detail("Range", range);
-				if (complete) {
+
+				// Post validate consistency of update of keyServers and serverKeys
+				if (SERVER_KNOBS->AUDIT_DATAMOVE_POST_CHECK) {
+					wait(auditLocationMetadataPostCheck(occ, range, "cleanUpDataMoveCore_postcheck", dataMoveId));
+				}
+
+				if (range.end == dataMove.ranges.front().end) {
 					break;
 				}
 			} catch (Error& e) {
-				state Error err = e;
-				wait(tr.onError(e));
-				TraceEvent(SevWarn, "CleanUpDataMoveRetriableError", dataMoveId)
-				    .error(err)
-				    .detail("DataMoveRange", range.toString());
+				if (e.code() == error_code_location_metadata_corruption) {
+					throw location_metadata_corruption();
+				} else {
+					runPreCheck = false;
+					lastError = e;
+					wait(tr.onError(e)); // throw error if retry_clean_up_datamove_tombstone_added
+					TraceEvent(SevWarn, "CleanUpDataMoveRetriableError", dataMoveId)
+					    .error(lastError)
+					    .detail("DataMoveRange", range.toString());
+				}
 			}
 		}
 	} catch (Error& e) {
-		TraceEvent(SevWarn, "CleanUpDataMoveFail", dataMoveId).errorUnsuppressed(e);
 		throw;
 	}
 
-	TraceEvent(SevDebug, "CleanUpDataMoveEnd", dataMoveId)
+	TraceEvent(SevInfo, "CleanUpDataMoveEnd", dataMoveId)
 	    .detail("DataMoveID", dataMoveId)
 	    .detail("DataMoveRange", range.toString());
+
+	return Void();
+}
+
+ACTOR Future<Void> cleanUpDataMove(Database occ,
+                                   UID dataMoveId,
+                                   MoveKeysLock lock,
+                                   FlowLock* cleanUpDataMoveParallelismLock,
+                                   KeyRange keys,
+                                   const DDEnabledState* ddEnabledState,
+                                   Optional<PromiseStream<Future<Void>>> addCleanUpDataMoveActor) {
+	state Severity sevDm = static_cast<Severity>(SERVER_KNOBS->PHYSICAL_SHARD_MOVE_LOG_SEVERITY);
+	try {
+		wait(cleanUpDataMoveCore(occ, dataMoveId, lock, cleanUpDataMoveParallelismLock, keys, ddEnabledState));
+	} catch (Error& e) {
+		if (e.code() == error_code_retry_clean_up_datamove_tombstone_added) {
+			if (addCleanUpDataMoveActor.present()) {
+				TraceEvent(SevDebug, "CleanUpDataMoveTriggerBackground", dataMoveId).detail("DataMoveID", dataMoveId);
+				addCleanUpDataMoveActor.get().send(cleanUpDataMoveBackground(occ,
+				                                                             dataMoveId,
+				                                                             lock,
+				                                                             cleanUpDataMoveParallelismLock,
+				                                                             keys,
+				                                                             ddEnabledState,
+				                                                             /*backgroundDelaySeconds=*/10));
+			} else {
+				TraceEvent(SevWarn, "CleanUpDataMoveNotFound", dataMoveId).errorUnsuppressed(e);
+			}
+		} else {
+			TraceEvent(sevDm, "CleanUpDataMoveFail", dataMoveId).errorUnsuppressed(e);
+			throw e;
+		}
+	}
 
 	return Void();
 }
@@ -2515,8 +3221,10 @@ Future<Void> rawStartMovement(Database occ,
 		                       params.lock,
 		                       params.startMoveKeysParallelismLock,
 		                       params.relocationIntervalId,
+		                       &tssMapping,
 		                       params.ddEnabledState,
-		                       params.cancelConflictingDataMoves);
+		                       params.cancelConflictingDataMoves,
+		                       params.bulkLoadState);
 	}
 	ASSERT(params.keys.present());
 	return startMoveKeys(std::move(occ),
@@ -2566,7 +3274,8 @@ Future<Void> rawFinishMovement(Database occ,
 		                        params.hasRemote,
 		                        params.relocationIntervalId,
 		                        tssMapping,
-		                        params.ddEnabledState);
+		                        params.ddEnabledState,
+		                        params.bulkLoadState);
 	}
 	ASSERT(params.keys.present());
 	return finishMoveKeys(std::move(occ),
@@ -2607,7 +3316,7 @@ void seedShardServers(Arena& arena, CommitTransactionRef& tr, std::vector<Storag
 	std::map<UID, Tag> server_tag;
 	int8_t nextLocality = 0;
 	for (auto& s : servers) {
-		if (!dcId_locality.count(s.locality.dcId())) {
+		if (!dcId_locality.contains(s.locality.dcId())) {
 			tr.set(arena, tagLocalityListKeyFor(s.locality.dcId()), tagLocalityListValue(nextLocality));
 			dcId_locality[s.locality.dcId()] = Tag(nextLocality, 0);
 			nextLocality++;
@@ -2628,7 +3337,7 @@ void seedShardServers(Arena& arena, CommitTransactionRef& tr, std::vector<Storag
 	for (auto& s : servers) {
 		tr.set(arena, serverTagKeyFor(s.id()), serverTagValue(server_tag[s.id()]));
 		tr.set(arena, serverListKeyFor(s.id()), serverListValue(s));
-		tr.set(arena, metadataMap.serializeKey(s.id()), metadataMap.serializeValue(metadata));
+		tr.set(arena, metadataMap.packKey(s.id()), metadataMap.packValue(metadata));
 
 		if (SERVER_KNOBS->TSS_HACK_IDENTITY_MAPPING) {
 			// THIS SHOULD NEVER BE ENABLED IN ANY NON-TESTING ENVIRONMENT
@@ -2638,6 +3347,7 @@ void seedShardServers(Arena& arena, CommitTransactionRef& tr, std::vector<Storag
 			tr.set(arena, uidRef.withPrefix(tssMappingKeys.begin), uidRef);
 		}
 	}
+	tr.set(arena, serverMetadataChangeKey, deterministicRandom()->randomUniqueID().toString());
 
 	std::vector<Tag> serverTags;
 	std::vector<UID> serverSrcUID;
@@ -2653,13 +3363,17 @@ void seedShardServers(Arena& arena, CommitTransactionRef& tr, std::vector<Storag
 	// to a specific
 	//   key (keyServersKeyServersKey)
 	if (SERVER_KNOBS->SHARD_ENCODE_LOCATION_METADATA) {
-		const UID teamId = deterministicRandom()->randomUniqueID();
-		ksValue = keyServersValue(serverSrcUID, /*dest=*/std::vector<UID>(), teamId, UID());
+		const UID shardId = newDataMoveId(deterministicRandom()->randomUInt64(),
+		                                  AssignEmptyRange(false),
+		                                  DataMoveType::PHYSICAL,
+		                                  DataMovementReason::SEED_SHARD_SERVER,
+		                                  UnassignShard(false));
+		ksValue = keyServersValue(serverSrcUID, /*dest=*/std::vector<UID>(), shardId, UID());
 		krmSetPreviouslyEmptyRange(tr, arena, keyServersPrefix, KeyRangeRef(KeyRef(), allKeys.end), ksValue, Value());
 
 		for (auto& s : servers) {
 			krmSetPreviouslyEmptyRange(
-			    tr, arena, serverKeysPrefixFor(s.id()), allKeys, serverKeysValue(teamId), serverKeysFalse);
+			    tr, arena, serverKeysPrefixFor(s.id()), allKeys, serverKeysValue(shardId), serverKeysFalse);
 		}
 	} else {
 		krmSetPreviouslyEmptyRange(tr, arena, keyServersPrefix, KeyRangeRef(KeyRef(), allKeys.end), ksValue, Value());
@@ -2667,6 +3381,94 @@ void seedShardServers(Arena& arena, CommitTransactionRef& tr, std::vector<Storag
 		for (auto& s : servers) {
 			krmSetPreviouslyEmptyRange(
 			    tr, arena, serverKeysPrefixFor(s.id()), allKeys, serverKeysTrue, serverKeysFalse);
+		}
+	}
+}
+
+// Unassign given key range from its current storage servers
+ACTOR template <typename TrType = Transaction*>
+Future<Void> unassignServerKeys(UID traceId, TrType tr, KeyRangeRef keys, std::set<UID> ignoreServers) {
+	state RangeResult serverList = wait(tr->getRange(serverListKeys, CLIENT_KNOBS->TOO_MANY, Snapshot::True));
+	ASSERT(!serverList.more && serverList.size() < CLIENT_KNOBS->TOO_MANY);
+	for (auto& server : serverList) {
+		state UID id = decodeServerListValue(server.value).id();
+		Optional<Value> tag = wait(tr->get(serverTagKeyFor(id)));
+		if (!tag.present()) {
+			dprint("Server {} no tag\n", id.shortString());
+			continue;
+		}
+
+		if (ignoreServers.contains(id)) {
+			dprint("Ignore un-assignment from {} .\n", id.toString());
+			continue;
+		}
+		RangeResult ranges = wait(krmGetRanges(tr, serverKeysPrefixFor(id), keys));
+
+		bool owning = false;
+		for (auto& r : ranges) {
+			if (r.value != serverKeysFalse) {
+				owning = true;
+				break;
+			}
+		}
+		if (owning) {
+			wait(krmSetRangeCoalescing(tr, serverKeysPrefixFor(id), keys, allKeys, serverKeysFalse));
+			dprint("Unassign {} from storage server {}\n", keys.toString(), id.toString());
+			TraceEvent("UnassignKeys", traceId).detail("Keys", keys).detail("SS", id);
+		}
+	}
+	return Void();
+}
+
+// Assign given key range to specified storage server.
+ACTOR template <typename TrType = Transaction*>
+Future<Void> assignKeysToServer(UID traceId, TrType tr, KeyRangeRef keys, UID serverUID) {
+	state Value value = keyServersValue(std::vector<UID>({ serverUID }), std::vector<UID>(), UID(), UID());
+	wait(krmSetRangeCoalescing(tr, keyServersPrefix, keys, allKeys, value));
+	wait(krmSetRangeCoalescing(tr, serverKeysPrefixFor(serverUID), keys, allKeys, serverKeysTrue));
+	dprint("Assign {} to server {}\n", normalKeys.toString(), serverUID.toString());
+	TraceEvent("AssignKeys", traceId).detail("Keys", keys).detail("SS", serverUID);
+	return Void();
+}
+
+ACTOR Future<Void> prepareBlobRestore(Database occ,
+                                      MoveKeysLock lock,
+                                      const DDEnabledState* ddEnabledState,
+                                      UID traceId,
+                                      KeyRangeRef keys,
+                                      UID bmId,
+                                      UID reqId) {
+	state int retries = 0;
+	state Transaction tr = Transaction(occ);
+	ASSERT(ddEnabledState->isBlobRestorePreparing());
+	loop {
+		tr.debugTransaction(reqId);
+		tr.setOption(FDBTransactionOptions::PRIORITY_SYSTEM_IMMEDIATE);
+		tr.setOption(FDBTransactionOptions::ACCESS_SYSTEM_KEYS);
+		tr.setOption(FDBTransactionOptions::LOCK_AWARE);
+		try {
+			wait(checkPersistentMoveKeysLock(&tr, lock));
+			UID currentOwnerId = wait(BlobGranuleRestoreConfig().lock().getD(&tr));
+			if (currentOwnerId != bmId) {
+				CODE_PROBE(true, "Blob migrator replaced in prepareBlobRestore");
+				dprint("Blob migrator {} is replaced by {}\n", bmId.toString(), currentOwnerId.toString());
+				TraceEvent("BlobMigratorReplaced", traceId).detail("Current", currentOwnerId).detail("BM", bmId);
+				throw blob_migrator_replaced();
+			}
+			wait(unassignServerKeys(traceId, &tr, keys, { bmId }));
+			wait(assignKeysToServer(traceId, &tr, keys, bmId));
+			wait(tr.commit());
+			TraceEvent("BlobRestorePrepare", traceId)
+			    .detail("State", "PrepareTxnCommitted")
+			    .detail("ReqId", reqId)
+			    .detail("BM", bmId);
+			return Void();
+		} catch (Error& e) {
+			wait(tr.onError(e));
+
+			if (++retries > SERVER_KNOBS->BLOB_MIGRATOR_ERROR_RETRIES) {
+				throw restore_error();
+			}
 		}
 	}
 }

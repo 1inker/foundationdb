@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -75,6 +75,7 @@ void FlowKnobs::initialize(Randomize randomize, IsSimulated isSimulated) {
 	init( FAST_ALLOC_ALLOW_GUARD_PAGES,                      false );
 	init( HUGE_ARENA_LOGGING_BYTES,                          100e6 );
 	init( HUGE_ARENA_LOGGING_INTERVAL,                         5.0 );
+	init( ABORT_ON_FAILURE,                                  false );
 
 	init( MEMORY_USAGE_CHECK_INTERVAL,                         1.0 );
 
@@ -120,6 +121,9 @@ void FlowKnobs::initialize(Randomize randomize, IsSimulated isSimulated) {
 	init( INCOMPATIBLE_PEER_DELAY_BEFORE_LOGGING,              5.0 );
 	init( PING_LOGGING_INTERVAL,                               3.0 );
 	init( PING_SKETCH_ACCURACY,                                0.1 );
+	init( LOG_CONNECTION_ATTEMPTS_ENABLED,                   false );
+	init( CONNECTION_LOG_DIRECTORY,                             "" );
+	init( LOG_CONNECTION_INTERVAL_SECS,                          3 );
 
 	init( TLS_CERT_REFRESH_DELAY_SECONDS,                 12*60*60 );
 	init( TLS_SERVER_CONNECTION_THROTTLE_TIMEOUT,              9.0 );
@@ -145,6 +149,7 @@ void FlowKnobs::initialize(Randomize randomize, IsSimulated isSimulated) {
 	init( PUBLIC_KEY_FILE_REFRESH_INTERVAL_SECONDS,            300 );
 	init( AUDIT_TIME_WINDOW,                                   5.0 );
 	init( TOKEN_CACHE_SIZE,                                   2000 );
+	init( WIPE_SENSITIVE_DATA_FROM_PACKET_BUFFER,             true );
 
 	//AsyncFileCached
 	init( PAGE_CACHE_4K,                                   2LL<<30 );
@@ -153,6 +158,7 @@ void FlowKnobs::initialize(Randomize randomize, IsSimulated isSimulated) {
 	init( SIM_PAGE_CACHE_64K,                                  1e7 );
 	init( BUGGIFY_SIM_PAGE_CACHE_4K,                           1e6 );
 	init( BUGGIFY_SIM_PAGE_CACHE_64K,                          1e6 );
+	init( BLOB_WORKER_PAGE_CACHE,                            500e6 );
 	init( MAX_EVICT_ATTEMPTS,                                  100 ); if( randomize && BUGGIFY ) MAX_EVICT_ATTEMPTS = 2;
 	init( CACHE_EVICTION_POLICY,                          "random" );
 	init( PAGE_CACHE_TRUNCATE_LOOKUP_FRACTION,                 0.1 ); if( randomize && BUGGIFY ) PAGE_CACHE_TRUNCATE_LOOKUP_FRACTION = 0.0; else if( randomize && BUGGIFY ) PAGE_CACHE_TRUNCATE_LOOKUP_FRACTION = 1.0;
@@ -184,14 +190,18 @@ void FlowKnobs::initialize(Randomize randomize, IsSimulated isSimulated) {
 	init( NON_DURABLE_MAX_WRITE_DELAY,                         2.0 ); if( randomize && BUGGIFY ) NON_DURABLE_MAX_WRITE_DELAY = 5.0;
 	init( MAX_PRIOR_MODIFICATION_DELAY,                        1.0 ); if( randomize && BUGGIFY ) MAX_PRIOR_MODIFICATION_DELAY = 10.0;
 
+	//AsyncFileWriteChecker
+	init( ASYNC_FILE_WRITE_CHEKCER_LOGGING_INTERVAL,          60.0 );
+	init( ASYNC_FILE_WRITE_CHEKCER_CHECKING_DELAY,             5.0 );
+
 	//GenericActors
 	init( BUGGIFY_FLOW_LOCK_RELEASE_DELAY,                     1.0 );
 	init( LOW_PRIORITY_DELAY_COUNT,                              5 );
 	init( LOW_PRIORITY_MAX_DELAY,                              5.0 );
 
 	// HTTP
-	init( HTTP_READ_SIZE,                                 128*1024 );
-	init( HTTP_SEND_SIZE,                                  32*1024 );
+	init( HTTP_READ_SIZE,                                 128*1024 ); if (randomize && BUGGIFY) HTTP_READ_SIZE = deterministicRandom()->randomSkewedUInt32(1024, 2 * HTTP_READ_SIZE);
+	init( HTTP_SEND_SIZE,                                  32*1024 ); if (randomize && BUGGIFY) HTTP_SEND_SIZE = deterministicRandom()->randomSkewedUInt32(1024, 2 * HTTP_SEND_SIZE);
 	init( HTTP_VERBOSE_LEVEL,                                    0 );
 	init( HTTP_REQUEST_ID_HEADER,                               "" );
 	init( HTTP_RESPONSE_SKIP_VERIFY_CHECKSUM_FOR_PARTIAL_CONTENT, false );
@@ -199,7 +209,7 @@ void FlowKnobs::initialize(Randomize randomize, IsSimulated isSimulated) {
 	//IAsyncFile
 	init( INCREMENTAL_DELETE_TRUNCATE_AMOUNT,                  5e8 ); //500MB
 	init( INCREMENTAL_DELETE_INTERVAL,                         1.0 ); //every 1 second
-		
+
 	//Net2 and FlowTransport
 	init( MIN_COALESCE_DELAY,                                10e-6 ); if( randomize && BUGGIFY ) MIN_COALESCE_DELAY = 0;
 	init( MAX_COALESCE_DELAY,                                20e-6 ); if( randomize && BUGGIFY ) MAX_COALESCE_DELAY = 0;
@@ -220,6 +230,7 @@ void FlowKnobs::initialize(Randomize randomize, IsSimulated isSimulated) {
 	init( MIN_PACKET_BUFFER_FREE_BYTES,                        256 );
 	init( FLOW_TCP_NODELAY,                                      1 );
 	init( FLOW_TCP_QUICKACK,                                     0 );
+	init( RESOLVE_PREFER_IPV4_ADDR,                          false );  // Default to prefer IPv6 addresses. Set to true to prefer IPv4 addresses.
 
 	//Sim2
 	init( MIN_OPEN_TIME,                                    0.0002 );
@@ -232,7 +243,7 @@ void FlowKnobs::initialize(Randomize randomize, IsSimulated isSimulated) {
 	init( MAX_CLOGGING_LATENCY,                                  0 ); if( randomize && BUGGIFY ) MAX_CLOGGING_LATENCY =  0.1 * deterministicRandom()->random01();
 	init( MAX_BUGGIFIED_DELAY,                                   0 ); if( randomize && BUGGIFY ) MAX_BUGGIFIED_DELAY =  0.2 * deterministicRandom()->random01();
 	init( MAX_RUNLOOP_SLEEP_DELAY,                               0 );
-	init( SIM_CONNECT_ERROR_MODE, deterministicRandom()->randomInt(0,3) );
+	init( SIM_CONNECT_ERROR_MODE,                                0 ); if( randomize && BUGGIFY ) SIM_CONNECT_ERROR_MODE = deterministicRandom()->randomInt(0,3);
 
 	//Tracefiles
 	init( ZERO_LENGTH_FILE_PAD,                                  1 );
@@ -296,6 +307,9 @@ void FlowKnobs::initialize(Randomize randomize, IsSimulated isSimulated) {
 	init( LOAD_BALANCE_TSS_MISMATCH_VERIFY_SS,                true ); if( randomize && BUGGIFY ) LOAD_BALANCE_TSS_MISMATCH_VERIFY_SS = false; // Whether the client should validate the SS teams all agree on TSS mismatch
 	init( LOAD_BALANCE_TSS_MISMATCH_TRACE_FULL,              false ); if( randomize && BUGGIFY ) LOAD_BALANCE_TSS_MISMATCH_TRACE_FULL = true; // If true, saves the full details of the mismatch in a trace event. If false, saves them in the DB and the trace event references the DB row.
 	init( TSS_LARGE_TRACE_SIZE,                              50000 );
+	init( LOAD_BALANCE_FETCH_REPLICA_TIMEOUT,                  5.0 );
+	init( ENABLE_REPLICA_CONSISTENCY_CHECK_ON_READS,         false ); if( randomize && BUGGIFY ) ENABLE_REPLICA_CONSISTENCY_CHECK_ON_READS = true;
+	init( CONSISTENCY_CHECK_REQUIRED_REPLICAS,                  -2 ); // Do consistency check based on all available storage replicas
 
 	// Health Monitor
 	init( FAILURE_DETECTION_DELAY,                             4.0 ); if( randomize && BUGGIFY ) FAILURE_DETECTION_DELAY = 1.0;
@@ -308,23 +322,23 @@ void FlowKnobs::initialize(Randomize randomize, IsSimulated isSimulated) {
 	if ( randomize && BUGGIFY) { ENCRYPT_CIPHER_KEY_CACHE_TTL = deterministicRandom()->randomInt(2, 10) * 60; }
 	init( ENCRYPT_KEY_REFRESH_INTERVAL,   isSimulated ? 60 : 8 * 60 );
 	if ( randomize && BUGGIFY) { ENCRYPT_KEY_REFRESH_INTERVAL = deterministicRandom()->randomInt(2, 10); }
+	init( ENCRYPT_KEY_HEALTH_CHECK_INTERVAL,                    10 );
+	if ( randomize && BUGGIFY) { ENCRYPT_KEY_HEALTH_CHECK_INTERVAL = deterministicRandom()->randomInt(10, 60); }
+	init( EKP_HEALTH_CHECK_REQUEST_TIMEOUT,                    10.0);
+	init( ENCRYPT_KEY_CACHE_ENABLE_DETAIL_LOGGING,           false ); if( randomize && BUGGIFY ) ENCRYPT_KEY_CACHE_ENABLE_DETAIL_LOGGING = true;
 	init( ENCRYPT_KEY_CACHE_LOGGING_INTERVAL,                  5.0 );
 	init( ENCRYPT_KEY_CACHE_LOGGING_SKETCH_ACCURACY,          0.01 );
 	// Refer to EncryptUtil::EncryptAuthTokenAlgo for more details
 	init( ENCRYPT_HEADER_AUTH_TOKEN_ENABLED,                 false ); if ( randomize && BUGGIFY ) { ENCRYPT_HEADER_AUTH_TOKEN_ENABLED = !ENCRYPT_HEADER_AUTH_TOKEN_ENABLED; }
 	init( ENCRYPT_HEADER_AUTH_TOKEN_ALGO,                        0 ); if ( randomize && ENCRYPT_HEADER_AUTH_TOKEN_ENABLED ) { ENCRYPT_HEADER_AUTH_TOKEN_ALGO = getRandomAuthTokenAlgo(); }
-	// start exponential backoff at 5s when reaching out to the KMS from EKP
-	init( EKP_KMS_CONNECTION_BACKOFF,                          5.0 );
-	// number of times to retry KMS requests from the EKP (roughly attempt to reach out to the KMS for a total of 5 minutes)
-	init( EKP_KMS_CONNECTION_RETRIES,                          6 );
 
 	// REST Client
 	init( RESTCLIENT_MAX_CONNECTIONPOOL_SIZE,                   10 );
 	init( RESTCLIENT_CONNECT_TRIES,                             10 );
-	init( RESTCLIENT_CONNECT_TIMEOUT,                           10 );
+	init( RESTCLIENT_CONNECT_TIMEOUT,                            1 );
 	init( RESTCLIENT_MAX_CONNECTION_LIFE,                      120 );
 	init( RESTCLIENT_REQUEST_TRIES,                             10 );
-	init( RESTCLIENT_REQUEST_TIMEOUT_SEC,                      120 );
+	init( RESTCLIENT_REQUEST_TIMEOUT_SEC,                        6 );
 	init( REST_LOG_LEVEL,                                        3 );
 }
 // clang-format on
@@ -375,7 +389,7 @@ static int64_t safe_stoi64(std::string const& str) {
 }
 
 // Converts the given string into a bool. "true" and "false" are case
-// insenstively interpreted as true and false. Otherwise, any non-zero
+// insensitively interpreted as true and false. Otherwise, any non-zero
 // integer is true. If any errors are encountered, it throws an
 // invalid_option_value exception.
 static bool safe_stob(std::string const& str) {

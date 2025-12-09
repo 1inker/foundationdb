@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -29,6 +29,7 @@
 #include "fdbserver/LogSystemConfig.h"
 #include "fdbserver/MasterInterface.h"
 #include "flow/ObjectSerializerTraits.h"
+#include "fdbserver/Knobs.h"
 
 class LogSet;
 struct OldLogData;
@@ -57,7 +58,7 @@ struct CoreTLogSet {
 	TLogVersion tLogVersion;
 
 	CoreTLogSet()
-	  : tLogWriteAntiQuorum(0), tLogReplicationFactor(0), isLocal(true), locality(tagLocalityUpgraded),
+	  : tLogWriteAntiQuorum(0), tLogReplicationFactor(0), isLocal(true), locality(tagLocalityInvalid),
 	    startVersion(invalidVersion) {}
 	explicit CoreTLogSet(const LogSet& logset);
 
@@ -81,12 +82,8 @@ struct CoreTLogSet {
 		           isLocal,
 		           locality,
 		           startVersion,
-		           satelliteTagLocations);
-		if (ar.isDeserializing && !ar.protocolVersion().hasTLogVersion()) {
-			tLogVersion = TLogVersion::V2;
-		} else {
-			serializer(ar, tLogVersion);
-		}
+		           satelliteTagLocations,
+		           tLogVersion);
 	}
 };
 
@@ -95,41 +92,39 @@ struct OldTLogCoreData {
 	int32_t logRouterTags;
 	int32_t txsTags;
 	Version epochBegin, epochEnd;
+	Version recoverAt;
 	std::set<int8_t> pseudoLocalities;
 	LogEpoch epoch;
 
-	OldTLogCoreData() : logRouterTags(0), txsTags(0), epochBegin(0), epochEnd(0), epoch(0) {}
+	OldTLogCoreData() : logRouterTags(0), txsTags(0), epochBegin(0), epochEnd(0), recoverAt(0), epoch(0) {}
 	explicit OldTLogCoreData(const OldLogData&);
 
 	bool operator==(const OldTLogCoreData& rhs) const {
-		return tLogs == rhs.tLogs && logRouterTags == rhs.logRouterTags && txsTags == rhs.txsTags &&
-		       epochBegin == rhs.epochBegin && epochEnd == rhs.epochEnd && pseudoLocalities == rhs.pseudoLocalities &&
-		       epoch == rhs.epoch;
+		if (SERVER_KNOBS->RECORD_RECOVER_AT_IN_CSTATE) {
+			return tLogs == rhs.tLogs && logRouterTags == rhs.logRouterTags && txsTags == rhs.txsTags &&
+			       epochBegin == rhs.epochBegin && epochEnd == rhs.epochEnd && recoverAt == rhs.recoverAt &&
+			       pseudoLocalities == rhs.pseudoLocalities && epoch == rhs.epoch;
+		} else {
+			return tLogs == rhs.tLogs && logRouterTags == rhs.logRouterTags && txsTags == rhs.txsTags &&
+			       epochBegin == rhs.epochBegin && epochEnd == rhs.epochEnd &&
+			       pseudoLocalities == rhs.pseudoLocalities && epoch == rhs.epoch;
+		}
 	}
 
 	template <class Archive>
 	void serialize(Archive& ar) {
-		if (ar.protocolVersion().hasTagLocality()) {
-			serializer(ar, tLogs, logRouterTags, epochEnd);
-		} else if (ar.isDeserializing) {
-			tLogs.push_back(CoreTLogSet());
-			serializer(ar,
-			           tLogs[0].tLogs,
-			           tLogs[0].tLogWriteAntiQuorum,
-			           tLogs[0].tLogReplicationFactor,
-			           tLogs[0].tLogPolicy,
-			           epochEnd,
-			           tLogs[0].tLogLocalities);
-			tLogs[0].tLogVersion = TLogVersion::V2;
-		}
-		if (ar.protocolVersion().hasPseudoLocalities()) {
-			serializer(ar, pseudoLocalities);
-		}
-		if (ar.protocolVersion().hasShardedTxsTags()) {
-			serializer(ar, txsTags);
-		}
-		if (ar.protocolVersion().hasBackupWorker()) {
-			serializer(ar, epoch, epochBegin);
+		ASSERT_WE_THINK(ar.protocolVersion().hasBackupWorker());
+		serializer(ar,
+		           tLogs,
+		           logRouterTags,
+		           epochEnd,
+		           pseudoLocalities, // since 6.1
+		           txsTags, // since 6.1
+		           epoch, // since 6.3
+		           epochBegin // since 6.3
+		);
+		if (ar.protocolVersion().hasGcTxnGenerations()) {
+			serializer(ar, recoverAt); // since 7.3
 		}
 	}
 };
@@ -179,48 +174,21 @@ struct DBCoreState {
 
 	template <class Archive>
 	void serialize(Archive& ar) {
-		ASSERT(ar.protocolVersion().hasMultiGenerationTLog());
-		if (ar.protocolVersion().hasTagLocality()) {
-			serializer(ar, tLogs, logRouterTags, oldTLogData, recoveryCount, logSystemType);
-			if (ar.protocolVersion().hasPseudoLocalities()) {
-				serializer(ar, pseudoLocalities);
-			}
-			if (ar.protocolVersion().hasShardedTxsTags()) {
-				serializer(ar, txsTags);
-			}
-			if (ar.protocolVersion().hasSWVersionTracking()) {
-				serializer(ar, newestProtocolVersion, lowestCompatibleProtocolVersion);
-			}
-			if (ar.protocolVersion().hasEncryptionAtRest()) {
-				serializer(ar, encryptionAtRestMode);
-			}
-		} else if (ar.isDeserializing) {
-			tLogs.push_back(CoreTLogSet());
-			serializer(ar,
-			           tLogs[0].tLogs,
-			           tLogs[0].tLogWriteAntiQuorum,
-			           recoveryCount,
-			           tLogs[0].tLogReplicationFactor,
-			           logSystemType);
-			tLogs[0].tLogVersion = TLogVersion::V2;
+		ASSERT_WE_THINK(ar.protocolVersion().hasShardedTxsTags()); // 6.1
+		serializer(ar,
+		           tLogs,
+		           logRouterTags,
+		           oldTLogData,
+		           recoveryCount,
+		           logSystemType,
+		           pseudoLocalities, // since 6.1
+		           txsTags); // since 6.1
 
-			uint64_t tLocalitySize = (uint64_t)tLogs[0].tLogLocalities.size();
-			serializer(ar, oldTLogData, tLogs[0].tLogPolicy, tLocalitySize);
-			if (ar.isDeserializing) {
-				tLogs[0].tLogLocalities.reserve(tLocalitySize);
-				for (size_t i = 0; i < tLocalitySize; i++) {
-					LocalityData locality;
-					serializer(ar, locality);
-					tLogs[0].tLogLocalities.push_back(locality);
-				}
-
-				if (oldTLogData.size()) {
-					tLogs[0].startVersion = oldTLogData[0].epochEnd;
-					for (int i = 0; i < oldTLogData.size() - 1; i++) {
-						oldTLogData[i].tLogs[0].startVersion = oldTLogData[i + 1].epochEnd;
-					}
-				}
-			}
+		if (ar.protocolVersion().hasSWVersionTracking()) {
+			serializer(ar, newestProtocolVersion, lowestCompatibleProtocolVersion); // 7.2
+		}
+		if (ar.protocolVersion().hasEncryptionAtRest()) {
+			serializer(ar, encryptionAtRestMode); // 7.2
 		}
 	}
 };

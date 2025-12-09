@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2018 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -45,7 +45,9 @@ class FDBDatabase extends NativeObjectWrapper implements Database, OptionConsume
 		// Automatically set the UsedDuringCommitProtectionDisable option
 		// This is because the Java bindings disallow use of Transaction objects after
 		// Transaction#onError is called.
-		this.options.setTransactionUsedDuringCommitProtectionDisable();
+		if (FDB.instance().getAPIVersion() >= 730) {
+			this.options.setTransactionUsedDuringCommitProtectionDisable();
+		}
 		this.eventKeeper = eventKeeper;
 	}
 
@@ -170,6 +172,10 @@ class FDBDatabase extends NativeObjectWrapper implements Database, OptionConsume
 		Transaction tr = null;
 		try {
 			tr = new FDBTransaction(Database_createTransaction(getPtr()), this, e, eventKeeper);
+			// In newer versions, this option is set as a default option on the database
+			if (FDB.instance().getAPIVersion() < 730) {
+				tr.options().setUsedDuringCommitProtectionDisable();
+			}
 			return tr;
 		} catch (RuntimeException err) {
 			if (tr != null) {

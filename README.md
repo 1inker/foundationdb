@@ -20,6 +20,25 @@ Contributing to FoundationDB can be in contributions to the code base, sharing y
 
 ## Getting Started
 
+### Latest Stable Releases
+
+The lastest stable releases are (were) versions that are recommended for production use, which have been extensively validated via simulation and real cluster tests and used in our production environment.
+
+| Branch   |     Latest Production Release      |  Notes |
+|:--------:|:-------------:|------:|
+| 7.3      |  [7.3.43](https://github.com/apple/foundationdb/releases/tag/7.3.43) | Supported |
+| 7.2      |   | Experimental |
+| 7.1      |  [7.1.57](https://github.com/apple/foundationdb/releases/tag/7.1.57)   |   Bug fixes |
+| 7.0      |           |   Experimental |
+| 6.3      |  [6.3.25](https://github.com/apple/foundationdb/releases/tag/6.3.25) |   Unsupported |
+
+- `Supported` branches are those we actively maintain and will publish new patch releases.
+- `Bug fixes` are branches we still accept bug fixes into the branch, but may not publish newer patch releases. The community can build the latest release binaries if needed and is encouraged to upgrade to the `Supported` branches.
+- `Experimental` branches are those used for internal feature testing. They are not recommended for production use.
+- `Unsupported` branches are those which will no longer receive any updates.
+
+If you are running on old production releases, we recommend always upgrading to the next major release's latest version, and then continue to the next major version, e.g., 6.2.X -> 6.3.25 -> 7.1.57 -> 7.3.43. These upgrade paths have been well tested in production (skipping a major release, not marked as `Experimental`, for an upgrade is only tested in simulation).
+
 ### Binary downloads
 
 Developers interested in using FoundationDB can get started by downloading and installing a binary package. Please see the [downloads page](https://github.com/apple/foundationdb/releases) for a list of available packages.
@@ -30,9 +49,9 @@ Developers interested in using FoundationDB can get started by downloading and i
 Developers on an OS for which there is no binary package, or who would like
 to start hacking on the code, can get started by compiling from source.
 
-The official docker image for building is [`foundationdb/build`](https://hub.docker.com/r/foundationdb/build) which has all dependencies installed. The Docker image definitions used by FoundationDB team members can be found in the [dedicated repository.](https://github.com/FoundationDB/fdb-build-support).
+The official docker image for building is [`foundationdb/build`](https://hub.docker.com/r/foundationdb/build), which has all dependencies installed. The Docker image definitions used by FoundationDB team members can be found in the [dedicated repository](https://github.com/FoundationDB/fdb-build-support).
 
-To build outside the official docker image you'll need at least these dependencies:
+To build outside of the official docker image, you'll need at least these dependencies:
 
 1. Install cmake Version 3.13 or higher [CMake](https://cmake.org/)
 1. Install [Mono](https://www.mono-project.com/download/stable/)
@@ -46,7 +65,7 @@ Once you have your dependencies, you can run cmake and then build:
 
 1. Check out this repository.
 1. Create a build directory (you can have the build directory anywhere you
-   like). There is currently a directory in the source tree called build, but you should not use it. See [#3098](https://github.com/apple/foundationdb/issues/3098)
+   like).
 1. `cd <PATH_TO_BUILD_DIRECTORY>`
 1. `cmake -G Ninja <PATH_TO_FOUNDATIONDB_DIRECTORY>`
 1. `ninja # If this crashes it probably ran out of memory. Try ninja -j1`
@@ -97,8 +116,8 @@ will generate a project which can be opened in an IDE for editing. You won't be
 able to build this project, but you will be able to edit the files and get most
 edit and navigation features your IDE supports.
 
-For example, if you want to use XCode to make changes to FoundationDB you can
-create a XCode-project with the following command:
+For example, if you want to use Xcode to make changes to FoundationDB you can
+create an Xcode project with the following command:
 
 ```sh
 cmake -G Xcode -DOPEN_FOR_IDE=ON <FDB_SOURCE_DIRECTORY>
@@ -142,7 +161,7 @@ There are no special requirements for Linux.  A docker image can be pulled from
 `foundationdb/build` that has all of FoundationDB's dependencies
 pre-installed, and is what the CI uses to build and test PRs.
 
-```
+```sh
 cmake -G Ninja <FDB_SOURCE_DIR>
 ninja
 cpack -G DEB

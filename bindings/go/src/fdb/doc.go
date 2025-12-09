@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2018 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -25,7 +25,7 @@ Package fdb provides an interface to FoundationDB databases (version 2.0 or high
 
 To build and run programs using this package, you must have an installed copy of
 the FoundationDB client libraries (version 2.0.0 or later), available for Linux,
-Windows and OS X at https://www.foundationdb.org/download/.
+Windows and OS X at https://github.com/apple/foundationdb/releases
 
 This documentation specifically applies to the FoundationDB Go binding. For more
 extensive guidance to programming with FoundationDB, as well as API
@@ -46,7 +46,7 @@ A basic interaction with the FoundationDB API is demonstrated below:
 
     func main() {
         // Different API versions may expose different runtime behaviors.
-        fdb.MustAPIVersion(720)
+        fdb.MustAPIVersion(740)
 
         // Open the default database from the system cluster
         db := fdb.MustOpenDefault()

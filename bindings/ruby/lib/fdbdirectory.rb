@@ -5,7 +5,7 @@
 #
 # This source file is part of the FoundationDB open source project
 #
-# Copyright 2013-2018 Apple Inc. and the FoundationDB project authors
+# Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -197,7 +197,7 @@ module FDB
 
         if old_path == new_path[0...old_path.length]
           raise ArgumentError, 
-            'The desination directory cannot be a subdirectory of the source directory.'
+            'The destination directory cannot be a subdirectory of the source directory.'
         end
 
         old_node = find(tr, old_path).prefetch_metadata(tr)

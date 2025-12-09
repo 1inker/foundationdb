@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -40,8 +40,8 @@
 typedef StringRef TransactionTagRef;
 typedef Standalone<TransactionTagRef> TransactionTag;
 
-FDB_DECLARE_BOOLEAN_PARAM(ContainsRecommended);
-FDB_DECLARE_BOOLEAN_PARAM(Capitalize);
+FDB_BOOLEAN_PARAM(ContainsRecommended);
+FDB_BOOLEAN_PARAM(Capitalize);
 
 class TagSet {
 public:
@@ -165,14 +165,8 @@ struct TagThrottleValue {
 	// considered
 	template <class Ar>
 	void serialize(Ar& ar) {
-		if (ar.protocolVersion().hasTagThrottleValueReason()) {
-			serializer(ar, tpsRate, expirationTime, initialDuration, reason);
-		} else if (ar.protocolVersion().hasTagThrottleValue()) {
-			serializer(ar, tpsRate, expirationTime, initialDuration);
-			if (ar.isDeserializing) {
-				reason = TagThrottledReason::UNSET;
-			}
-		}
+		ASSERT_WE_THINK(ar.protocolVersion().hasTagThrottleValueReason());
+		serializer(ar, tpsRate, expirationTime, initialDuration, reason);
 	}
 };
 

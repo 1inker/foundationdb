@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -51,6 +51,11 @@ struct BackupAndRestoreCorrectnessWorkload : TestWorkload {
 	bool shouldSkipRestoreRanges;
 	bool defaultBackup;
 	Optional<std::string> encryptionKeyFileName;
+
+	// This workload is not compatible with RandomRangeLock workload because they will race in locked range
+	void disableFailureInjectionWorkloads(std::set<std::string>& out) const override {
+		out.insert({ "RandomRangeLock" });
+	}
 
 	BackupAndRestoreCorrectnessWorkload(WorkloadContext const& wcx) : TestWorkload(wcx) {
 		locked.set(sharedRandomNumber % 2);
@@ -306,7 +311,7 @@ struct BackupAndRestoreCorrectnessWorkload : TestWorkload {
 	                                   Key tag,
 	                                   Standalone<VectorRef<KeyRangeRef>> backupRanges,
 	                                   double stopDifferentialDelay,
-	                                   Promise<Void> submittted) {
+	                                   Promise<Void> submitted) {
 
 		state UID randomID = nondeterministicRandom()->randomUniqueID();
 
@@ -352,7 +357,7 @@ struct BackupAndRestoreCorrectnessWorkload : TestWorkload {
 				throw;
 		}
 
-		submittted.send(Void());
+		submitted.send(Void());
 
 		// Stop the differential backup, if enabled
 		if (stopDifferentialDelay) {
@@ -555,7 +560,6 @@ struct BackupAndRestoreCorrectnessWorkload : TestWorkload {
 	ACTOR static Future<Void> _start(Database cx, BackupAndRestoreCorrectnessWorkload* self) {
 		state FileBackupAgent backupAgent;
 		state Future<Void> extraBackup;
-		state bool extraTasks = false;
 		state DatabaseConfiguration config = wait(getDatabaseConfiguration(cx));
 		TraceEvent("BARW_Arguments")
 		    .detail("BackupTag", printable(self->backupTag))
@@ -850,7 +854,6 @@ struct BackupAndRestoreCorrectnessWorkload : TestWorkload {
 
 			if (extraBackup.isValid()) {
 				TraceEvent("BARW_WaitExtraBackup", randomID).detail("BackupTag", printable(self->backupTag));
-				extraTasks = true;
 				try {
 					wait(extraBackup);
 				} catch (Error& e) {
@@ -988,7 +991,7 @@ struct BackupAndRestoreCorrectnessWorkload : TestWorkload {
 
 			TraceEvent("BARW_Complete", randomID).detail("BackupTag", printable(self->backupTag));
 
-			// Decrement the backup agent requets
+			// Decrement the backup agent requests
 			if (self->agentRequest) {
 				BackupAndRestoreCorrectnessWorkload::backupAgentRequests--;
 			}

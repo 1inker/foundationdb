@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -21,24 +21,25 @@
 #ifndef FDBSERVER_LOGSYSTEM_H
 #define FDBSERVER_LOGSYSTEM_H
 
+#include <cstdint>
 #include <set>
-#include <stdint.h>
 #include <vector>
 
-#include "fdbserver/SpanContextMessage.h"
+#include "fdbclient/DatabaseConfiguration.h"
+#include "fdbrpc/Locality.h"
+#include "fdbrpc/Replication.h"
+#include "fdbrpc/ReplicationPolicy.h"
+#include "fdbserver/LogSystemConfig.h"
+#include "fdbserver/MutationTracking.h"
 #include "fdbserver/OTELSpanContextMessage.h"
+#include "fdbserver/SpanContextMessage.h"
 #include "fdbserver/TLogInterface.h"
 #include "fdbserver/WorkerInterface.actor.h"
-#include "fdbclient/DatabaseConfiguration.h"
-#include "fdbserver/MutationTracking.h"
 #include "flow/Arena.h"
 #include "flow/Error.h"
 #include "flow/Histogram.h"
 #include "flow/IndexedSet.h"
 #include "flow/Knobs.h"
-#include "fdbrpc/ReplicationPolicy.h"
-#include "fdbrpc/Locality.h"
-#include "fdbrpc/Replication.h"
 
 struct DBCoreState;
 struct TLogSet;
@@ -452,16 +453,10 @@ struct ILogSystem {
 		int targetQueueSize;
 		UID randomID;
 
-		// FIXME: collectTags is needed to support upgrades from 5.X to 6.0. Remove this code when we no longer support
-		// that upgrade.
-		bool collectTags;
-		void combineMessages();
-
 		BufferedCursor(std::vector<Reference<IPeekCursor>> cursors,
 		               Version begin,
 		               Version end,
 		               bool withTags,
-		               bool collectTags,
 		               bool canDiscardPopped);
 		BufferedCursor(std::vector<Reference<AsyncVar<OptionalInterface<TLogInterface>>>> const& logServers,
 		               Tag tag,
@@ -504,6 +499,8 @@ struct ILogSystem {
 
 	virtual bool remoteStorageRecovered() const = 0;
 
+	virtual void purgeOldRecoveredGenerations() = 0;
+
 	virtual Future<Void> onCoreStateChanged() const = 0;
 	// Returns if and when the output of toCoreState() would change (for example, when older logs can be discarded from
 	// the state)
@@ -514,11 +511,14 @@ struct ILogSystem {
 	virtual Future<Void> onError() const = 0;
 	// Never returns normally, but throws an error if the subsystem stops working
 
-	// Future<Void> push( UID bundle, int64_t seq, VectorRef<TaggedMessageRef> messages );
-	virtual Future<Version> push(Version prevVersion,
-	                             Version version,
-	                             Version knownCommittedVersion,
-	                             Version minKnownCommittedVersion,
+	struct PushVersionSet {
+		Version prevVersion;
+		Version version;
+		Version knownCommittedVersion;
+		Version minKnownCommittedVersion;
+	};
+
+	virtual Future<Version> push(const PushVersionSet& verisonSet,
 	                             LogPushData& data,
 	                             SpanContext const& spanContext,
 	                             Optional<UID> debugID = Optional<UID>(),
@@ -527,7 +527,7 @@ struct ILogSystem {
 	// Waits for the version number of the bundle (in this epoch) to be prevVersion (i.e. for all pushes ordered
 	// earlier) Puts the given messages into the bundle, each with the given tags, and with message versions (version,
 	// 0) - (version, N) Changes the version number of the bundle to be version (unblocking the next push) Returns when
-	// the preceding changes are durable.  (Later we will need multiple return signals for diffferent durability levels)
+	// the preceding changes are durable.  (Later we will need multiple return signals for different durability levels)
 	// If the current epoch has ended, push will not return, and the pushed messages will not be visible in any
 	// subsequent epoch (but may become visible in this epoch)
 
@@ -555,7 +555,11 @@ struct ILogSystem {
 	// Same contract as peek(), but blocks until the preferred log server(s) for the given tag are available (and is
 	// correspondingly less expensive)
 
-	virtual Reference<IPeekCursor> peekLogRouter(UID dbgid, Version begin, Tag tag, bool useSatellite) = 0;
+	virtual Reference<IPeekCursor> peekLogRouter(UID dbgid,
+	                                             Version begin,
+	                                             Tag tag,
+	                                             bool useSatellite,
+	                                             Optional<Version> end = Optional<Version>()) = 0;
 	// Same contract as peek(), but can only peek from the logs elected in the same generation.
 	// If the preferred log server is down, a different log from the same generation will merge results locally before
 	// sending them to the log router.
@@ -656,6 +660,9 @@ struct ILogSystem {
 	// using fromLogSystemConfig()
 	virtual LogSystemConfig getLogSystemConfig() const = 0;
 
+	// Returns the type of LogSystem, this should be faster than using RTTI
+	virtual LogSystemType getLogSystemType() const = 0;
+
 	virtual Standalone<StringRef> getLogsValue() const = 0;
 
 	// Returns when the log system configuration has changed due to a tlog rejoin.
@@ -682,6 +689,7 @@ struct ILogSystem {
 
 	virtual void stopRejoins() = 0;
 
+	// XXX: Should Tag related functions stay inside TagPartitionedLogSystem??
 	// Returns the pseudo tag to be popped for the given process class. If the
 	// process class doesn't use pseudo tag, return the same tag.
 	virtual Tag getPseudoPopTag(Tag tag, ProcessClass::ClassType type) const = 0;
@@ -772,12 +780,6 @@ struct LogPushData : NonCopyable {
 		writtenTLogs.insert(msg_locations.begin(), msg_locations.end());
 	}
 
-	void getLocations(const std::vector<Tag>& vtags, std::set<uint16_t>& writtenTLogs) {
-		std::vector<int> msg_locations;
-		logSystem->getPushLocations(vtags, msg_locations, false /*allLocations*/);
-		writtenTLogs.insert(msg_locations.begin(), msg_locations.end());
-	}
-
 	// store tlogs as represented by index
 	void saveLocations(std::set<uint16_t>& writtenTLogs) {
 		writtenTLogs.insert(msg_locations.begin(), msg_locations.end());
@@ -804,12 +806,16 @@ struct LogPushData : NonCopyable {
 	// MUST be called after getMessages() and recordEmptyMessage().
 	float getEmptyMessageRatio() const;
 
-	// Returns the total number of mutations.
-	uint32_t getMutationCount() const { return subsequence; }
+	// Returns the total number of mutations. Subsequence is initialized to 1, so subtract 1 to get count.
+	uint32_t getMutationCount() const { return subsequence - 1; }
 
 	// Sets mutations for all internal writers. "mutations" is the output from
 	// getAllMessages() and is used before writing any other mutations.
 	void setMutations(uint32_t totalMutations, VectorRef<StringRef> mutations);
+
+	Optional<Tag> savedRandomRouterTag;
+	void storeRandomRouterTag() { savedRandomRouterTag = logSystem->getRandomRouterTag(); }
+	int getLogRouterTags() { return logSystem->getLogRouterTags(); }
 
 private:
 	Reference<ILogSystem> logSystem;
@@ -832,13 +838,17 @@ private:
 	// true on a successful write, and false if the location has already been
 	// written.
 	bool writeTransactionInfo(int location, uint32_t subseq);
+
+	Tag chooseRouterTag() {
+		return savedRandomRouterTag.present() ? savedRandomRouterTag.get() : logSystem->getRandomRouterTag();
+	}
 };
 
 template <class T>
 void LogPushData::writeTypedMessage(T const& item, bool metadataMessage, bool allLocations) {
 	prev_tags.clear();
 	if (logSystem->hasRemoteLogs()) {
-		prev_tags.push_back(logSystem->getRandomRouterTag());
+		prev_tags.push_back(chooseRouterTag());
 	}
 	for (auto& tag : next_message_tags) {
 		prev_tags.push_back(tag);

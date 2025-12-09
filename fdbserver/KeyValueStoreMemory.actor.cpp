@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -23,6 +23,7 @@
 #include "fdbclient/Knobs.h"
 #include "fdbclient/Notified.h"
 #include "fdbclient/SystemData.h"
+#include "fdbserver/ServerDBInfo.actor.h"
 #include "fdbserver/DeltaTree.h"
 #include "fdbclient/GetEncryptCipherKeys.h"
 #include "fdbserver/IDiskQueue.h"
@@ -51,6 +52,7 @@ public:
 	                    bool exactRecovery,
 	                    bool enableEncryption);
 
+	bool getReplaceContent() const override { return replaceContent; }
 	// IClosable
 	Future<Void> getError() const override { return log->getError(); }
 	Future<Void> onClosed() const override { return log->onClosed(); }
@@ -133,7 +135,7 @@ public:
 		}
 	}
 
-	void clear(KeyRangeRef range, const StorageServerMetrics* storageMetrics, const Arena* arena) override {
+	void clear(KeyRangeRef range, const Arena* arena) override {
 		// A commit that occurs with no available space returns Never, so we can throw out all modifications
 		if (getAvailableSize() <= 0)
 			return;
@@ -276,10 +278,6 @@ public:
 		}
 
 		result.more = rowLimit == 0 || byteLimit <= 0;
-		if (result.more) {
-			ASSERT(result.size() > 0);
-			result.readThrough = result[result.size() - 1].key;
-		}
 		return result;
 	}
 
@@ -475,7 +473,7 @@ private:
 	}
 
 	// NOTE: The first bit of opType indicates whether the entry is encrypted or not. This is fine for backwards
-	// compatability since the first bit was never used previously
+	// compatibility since the first bit was never used previously
 	//
 	// Unencrypted data format:
 	// +-------------+-------------+-------------+--------+--------+-----------+
@@ -497,7 +495,7 @@ private:
 		uint32_t opType = (uint32_t)op;
 		// Make sure the first bit of the optype is empty
 		ASSERT(opType >> ENCRYPTION_ENABLED_BIT == 0);
-		if (!enableEncryption || metaOps.count(op) > 0) {
+		if (!enableEncryption || metaOps.contains(op)) {
 			OpHeader h = { opType, v1.size(), v2.size() };
 			log->push(StringRef((const uint8_t*)&h, sizeof(h)));
 			log->push(v1);
@@ -526,25 +524,14 @@ private:
 			uint16_t encryptHeaderSize;
 			// TODO: If possible we want to avoid memcpy to the disk log by using the same arena used by IDiskQueue
 			Arena arena;
-			if (CLIENT_KNOBS->ENABLE_CONFIGURABLE_ENCRYPTION) {
-				BlobCipherEncryptHeaderRef headerRef;
-				StringRef cipherText = cipher.encrypt(plaintext, v1.size() + v2.size(), &headerRef, arena);
-				Standalone<StringRef> headerRefStr = BlobCipherEncryptHeaderRef::toStringRef(headerRef);
-				encryptHeaderSize = headerRefStr.size();
-				ASSERT(encryptHeaderSize > 0);
-				log->push(StringRef((const uint8_t*)&encryptHeaderSize, sizeof(encryptHeaderSize)));
-				log->push(headerRefStr);
-				log->push(cipherText);
-			} else {
-				BlobCipherEncryptHeader cipherHeader;
-				StringRef ciphertext =
-				    cipher.encrypt(plaintext, v1.size() + v2.size(), &cipherHeader, arena)->toStringRef();
-				encryptHeaderSize = BlobCipherEncryptHeader::headerSize;
-				ASSERT(encryptHeaderSize > 0);
-				log->push(StringRef((const uint8_t*)&encryptHeaderSize, sizeof(encryptHeaderSize)));
-				log->push(StringRef((const uint8_t*)&cipherHeader, encryptHeaderSize));
-				log->push(ciphertext);
-			}
+			BlobCipherEncryptHeaderRef headerRef;
+			StringRef cipherText = cipher.encrypt(plaintext, v1.size() + v2.size(), &headerRef, arena);
+			Standalone<StringRef> headerRefStr = BlobCipherEncryptHeaderRef::toStringRef(headerRef);
+			encryptHeaderSize = headerRefStr.size();
+			ASSERT(encryptHeaderSize > 0);
+			log->push(StringRef((const uint8_t*)&encryptHeaderSize, sizeof(encryptHeaderSize)));
+			log->push(headerRefStr);
+			log->push(cipherText);
 		}
 		return log->push("\x01"_sr); // Changes here should be reflected in OP_DISK_OVERHEAD
 	}
@@ -559,7 +546,7 @@ private:
 		ASSERT(!isOpEncrypted(&h));
 		// Metadata op types to be excluded from encryption.
 		static std::unordered_set<OpType> metaOps = { OpSnapshotEnd, OpSnapshotAbort, OpCommit, OpRollback };
-		if (metaOps.count((OpType)h.op) == 0) {
+		if (!metaOps.contains((OpType)h.op)) {
 			// It is not supported to open an encrypted store as unencrypted, or vice-versa.
 			ASSERT_EQ(encryptedOp, self->enableEncryption);
 		}
@@ -596,25 +583,15 @@ private:
 		}
 		state Arena arena;
 		state StringRef plaintext;
-		if (CLIENT_KNOBS->ENABLE_CONFIGURABLE_ENCRYPTION) {
-			state BlobCipherEncryptHeaderRef cipherHeaderRef =
-			    BlobCipherEncryptHeaderRef::fromStringRef(StringRef(data.begin(), encryptHeaderSize));
-			TextAndHeaderCipherKeys cipherKeys = wait(GetEncryptCipherKeys<ServerDBInfo>::getEncryptCipherKeys(
-			    self->db, cipherHeaderRef, BlobCipherMetrics::KV_MEMORY));
-			DecryptBlobCipherAes256Ctr cipher(cipherKeys.cipherTextKey,
-			                                  cipherKeys.cipherHeaderKey,
-			                                  cipherHeaderRef.getIV(),
-			                                  BlobCipherMetrics::KV_MEMORY);
-			plaintext = cipher.decrypt(data.begin() + encryptHeaderSize, h.len1 + h.len2, cipherHeaderRef, arena);
-		} else {
-			state BlobCipherEncryptHeader cipherHeader = *(BlobCipherEncryptHeader*)data.begin();
-			TextAndHeaderCipherKeys cipherKeys = wait(GetEncryptCipherKeys<ServerDBInfo>::getEncryptCipherKeys(
-			    self->db, cipherHeader, BlobCipherMetrics::KV_MEMORY));
-			DecryptBlobCipherAes256Ctr cipher(
-			    cipherKeys.cipherTextKey, cipherKeys.cipherHeaderKey, cipherHeader.iv, BlobCipherMetrics::KV_MEMORY);
-			plaintext =
-			    cipher.decrypt(data.begin() + encryptHeaderSize, h.len1 + h.len2, cipherHeader, arena)->toStringRef();
-		}
+		state BlobCipherEncryptHeaderRef cipherHeaderRef =
+		    BlobCipherEncryptHeaderRef::fromStringRef(StringRef(data.begin(), encryptHeaderSize));
+		TextAndHeaderCipherKeys cipherKeys = wait(GetEncryptCipherKeys<ServerDBInfo>::getEncryptCipherKeys(
+		    self->db, cipherHeaderRef, BlobCipherMetrics::KV_MEMORY));
+		DecryptBlobCipherAes256Ctr cipher(cipherKeys.cipherTextKey,
+		                                  cipherKeys.cipherHeaderKey,
+		                                  cipherHeaderRef.getIV(),
+		                                  BlobCipherMetrics::KV_MEMORY);
+		plaintext = cipher.decrypt(data.begin() + encryptHeaderSize, h.len1 + h.len2, cipherHeaderRef, arena);
 		return Standalone<StringRef>(plaintext, arena);
 	}
 
@@ -1104,8 +1081,8 @@ IKeyValueStore* keyValueStoreMemory(std::string const& basename,
 	    .detail("MemoryLimit", memoryLimit)
 	    .detail("StoreType", storeType);
 
-	// SOMEDAY: update to use DiskQueueVersion::V2 with xxhash3 checksum for FDB >= 7.2
-	IDiskQueue* log = openDiskQueue(basename, ext, logID, DiskQueueVersion::V1);
+	// Use DiskQueueVersion::V2 with xxhash3 checksum
+	IDiskQueue* log = openDiskQueue(basename, ext, logID, DiskQueueVersion::V2);
 	if (storeType == KeyValueStoreType::MEMORY_RADIXTREE) {
 		return new KeyValueStoreMemory<radix_tree>(
 		    log, Reference<AsyncVar<ServerDBInfo> const>(), logID, memoryLimit, storeType, false, false, false, false);

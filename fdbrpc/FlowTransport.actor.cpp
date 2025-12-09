@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,9 +20,14 @@
 
 #include "fdbrpc/FlowTransport.h"
 #include "flow/Arena.h"
+#include "flow/IThreadPool.h"
+#include "flow/Knobs.h"
+#include "flow/NetworkAddress.h"
 #include "flow/network.h"
 
 #include <cstdint>
+#include <fstream>
+#include <string>
 #include <unordered_map>
 #if VALGRIND
 #include <memcheck.h>
@@ -352,7 +357,106 @@ public:
 	Future<Void> publicKeyFileWatch;
 
 	std::unordered_map<Standalone<StringRef>, PublicKey> publicKeys;
+
+	struct ConnectionHistoryEntry {
+		int64_t time;
+		NetworkAddress addr;
+		bool failed;
+	};
+	std::deque<ConnectionHistoryEntry> connectionHistory;
+	Future<Void> connectionHistoryLoggerF;
+	Reference<IThreadPool> connectionLogWriterThread;
 };
+
+struct ConnectionLogWriter : IThreadPoolReceiver {
+	const std::string baseDir;
+	std::string fileName;
+	std::fstream file;
+
+	ConnectionLogWriter(const std::string baseDir) : baseDir(baseDir) {}
+
+	virtual ~ConnectionLogWriter() {
+		if (file.is_open())
+			file.close();
+	}
+
+	struct AppendAction : TypedAction<ConnectionLogWriter, AppendAction> {
+		std::string localAddr;
+		std::deque<TransportData::ConnectionHistoryEntry> entries;
+		AppendAction(std::string localAddr, std::deque<TransportData::ConnectionHistoryEntry>&& entries)
+		  : localAddr(localAddr), entries(std::move(entries)) {}
+
+		double getTimeEstimate() const { return 2; }
+	};
+
+	std::string newFileName() const { return baseDir + "fdb-connection-log-" + time_str() + ".csv"; }
+
+	void init() { fileName = newFileName(); }
+
+	std::string time_str() const { return std::to_string(now()); }
+
+	void openOrRoll() {
+		if (!file.is_open()) {
+			TraceEvent("OpenConnectionLog").detail("FileName", fileName);
+			file = std::fstream(fileName, std::ios::in | std::ios::out | std::ios::app);
+		}
+
+		if (!file.is_open()) {
+			TraceEvent(SevError, "ErrorOpenConnectionLog").detail("FileName", fileName);
+			throw io_error();
+		}
+
+		if (file.tellg() > 100 * 1024 * 1024 /* 100 MB */) {
+			file.close();
+			fileName = newFileName();
+			TraceEvent("RollConnectionLog").detail("FileName", fileName);
+			openOrRoll();
+		}
+	}
+
+	void action(AppendAction& a) {
+		openOrRoll();
+
+		std::string output;
+		for (const auto& entry : a.entries) {
+			output += std::to_string(entry.time) + ",";
+			output += a.localAddr + ",";
+			output += entry.failed ? "failed," : "success,";
+			output += entry.addr.toString() + "\n";
+		}
+		file << output;
+		file.flush();
+	}
+};
+
+ACTOR Future<Void> connectionHistoryLogger(TransportData* self) {
+	if (!FLOW_KNOBS->LOG_CONNECTION_ATTEMPTS_ENABLED) {
+		return Void();
+	}
+
+	state Future<Void> next = Void();
+
+	// One thread ensures async serialized execution on the log file.
+	if (g_network->isSimulated()) {
+		self->connectionLogWriterThread = Reference<IThreadPool>(new DummyThreadPool());
+	} else {
+		self->connectionLogWriterThread = createGenericThreadPool();
+	}
+
+	self->connectionLogWriterThread->addThread(new ConnectionLogWriter(FLOW_KNOBS->CONNECTION_LOG_DIRECTORY));
+	loop {
+		wait(next);
+		next = delay(FLOW_KNOBS->LOG_CONNECTION_INTERVAL_SECS);
+		if (self->connectionHistory.size() == 0) {
+			continue;
+		}
+		std::string localAddr = FlowTransport::getGlobalLocalAddress().toString();
+		auto action = new ConnectionLogWriter::AppendAction(localAddr, std::move(self->connectionHistory));
+		ASSERT(action != nullptr);
+		self->connectionLogWriterThread->post(action);
+		ASSERT(self->connectionHistory.size() == 0);
+	}
+}
 
 ACTOR Future<Void> pingLatencyLogger(TransportData* self) {
 	state NetworkAddress lastAddress = NetworkAddress();
@@ -365,7 +469,10 @@ ACTOR Future<Void> pingLatencyLogger(TransportData* self) {
 			lastAddress = *it;
 			auto peer = self->getPeer(lastAddress);
 			if (!peer) {
-				TraceEvent(SevWarnAlways, "MissingNetworkAddress").suppressFor(10.0).detail("PeerAddr", lastAddress);
+				TraceEvent(SevWarnAlways, "MissingNetworkAddress")
+				    .suppressFor(10.0)
+				    .detail("PeerAddr", lastAddress)
+				    .detail("PeerAddress", lastAddress);
 			}
 			if (peer->lastLoggedTime <= 0.0) {
 				peer->lastLoggedTime = peer->lastConnectTime;
@@ -376,6 +483,7 @@ ACTOR Future<Void> pingLatencyLogger(TransportData* self) {
 				TraceEvent("PingLatency")
 				    .detail("Elapsed", now() - peer->lastLoggedTime)
 				    .detail("PeerAddr", lastAddress)
+				    .detail("PeerAddress", lastAddress)
 				    .detail("MinLatency", peer->pingLatencies.min())
 				    .detail("MaxLatency", peer->pingLatencies.max())
 				    .detail("MeanLatency", peer->pingLatencies.mean())
@@ -418,6 +526,8 @@ TransportData::TransportData(uint64_t transportId, int maxWellKnownEndpoints, IP
     allowList(allowList == nullptr ? IPAllowList() : *allowList) {
 	degraded = makeReference<AsyncVar<bool>>(false);
 	pingLogger = pingLatencyLogger(this);
+
+	connectionHistoryLoggerF = connectionHistoryLogger(this);
 }
 
 #define CONNECT_PACKET_V0 0x0FDB00A444020001LL
@@ -477,14 +587,10 @@ struct ConnectPacket {
 		}
 
 		serializer(ar, protocolVersion, canonicalRemotePort, connectionId, canonicalRemoteIp4);
-		if (ar.isDeserializing && !ar.protocolVersion().hasIPv6()) {
-			flags = 0;
-		} else {
-			// We can send everything in serialized packet, since the current version of ConnectPacket
-			// is backward compatible with CONNECT_PACKET_V0.
-			serializer(ar, flags);
-			ar.serializeBytes(&canonicalRemoteIp6, sizeof(canonicalRemoteIp6));
-		}
+		// We can send everything in serialized packet, since the current version of ConnectPacket
+		// is backward compatible with CONNECT_PACKET_V0.
+		serializer(ar, flags);
+		ar.serializeBytes(&canonicalRemoteIp6, sizeof(canonicalRemoteIp6));
 	}
 };
 
@@ -504,6 +610,8 @@ static ReliablePacket* sendPacket(TransportData* self,
 
 ACTOR Future<Void> connectionMonitor(Reference<Peer> peer) {
 	state Endpoint remotePingEndpoint({ peer->destination }, Endpoint::wellKnownToken(WLTOKEN_PING_PACKET));
+	// set this to not immediately close the connection as idle if the peer already existed
+	peer->lastDataPacketSentTime = now();
 	loop {
 		if (!FlowTransport::isClient() && !peer->destination.isPublic() && peer->compatible) {
 			// Don't send ping messages to clients unless necessary. Instead monitor incoming client pings.
@@ -649,6 +757,7 @@ ACTOR Future<Void> connectionKeeper(Reference<Peer> self,
                                     Future<Void> reader = Void()) {
 	TraceEvent(SevDebug, "ConnectionKeeper", conn ? conn->getDebugID() : UID())
 	    .detail("PeerAddr", self->destination)
+	    .detail("PeerAddress", self->destination)
 	    .detail("ConnSet", (bool)conn);
 	ASSERT_WE_THINK(FlowTransport::transport().getLocalAddress() != self->destination);
 
@@ -691,6 +800,7 @@ ACTOR Future<Void> connectionKeeper(Reference<Peer> self,
 				TraceEvent("ConnectingTo", conn ? conn->getDebugID() : UID())
 				    .suppressFor(1.0)
 				    .detail("PeerAddr", self->destination)
+				    .detail("PeerAddress", self->destination)
 				    .detail("PeerReferences", self->peerReferences)
 				    .detail("FailureStatus",
 				            IFailureMonitor::failureMonitor().getState(self->destination).isAvailable() ? "OK"
@@ -722,7 +832,8 @@ ACTOR Future<Void> connectionKeeper(Reference<Peer> self,
 
 							TraceEvent("ConnectionExchangingConnectPacket", conn->getDebugID())
 							    .suppressFor(1.0)
-							    .detail("PeerAddr", self->destination);
+							    .detail("PeerAddr", self->destination)
+							    .detail("PeerAddress", self->destination);
 							self->prependConnectPacket();
 							reader = connectionReader(self->transport, conn, self, Promise<Reference<Peer>>());
 						}
@@ -737,7 +848,8 @@ ACTOR Future<Void> connectionKeeper(Reference<Peer> self,
 					}
 					TraceEvent("ConnectionTimedOut", conn ? conn->getDebugID() : UID())
 					    .suppressFor(1.0)
-					    .detail("PeerAddr", self->destination);
+					    .detail("PeerAddr", self->destination)
+					    .detail("PeerAddress", self->destination);
 
 					throw;
 				}
@@ -756,7 +868,8 @@ ACTOR Future<Void> connectionKeeper(Reference<Peer> self,
 				     self->resetConnection.onTrigger());
 				TraceEvent("ConnectionReset", conn ? conn->getDebugID() : UID())
 				    .suppressFor(1.0)
-				    .detail("PeerAddr", self->destination);
+				    .detail("PeerAddr", self->destination)
+				    .detail("PeerAddress", self->destination);
 				throw connection_failed();
 			} catch (Error& e) {
 				if (e.code() == error_code_connection_failed || e.code() == error_code_actor_cancelled ||
@@ -782,7 +895,8 @@ ACTOR Future<Void> connectionKeeper(Reference<Peer> self,
 				if (now() - firstConnFailedTime.get() > FLOW_KNOBS->PEER_UNAVAILABLE_FOR_LONG_TIME_TIMEOUT) {
 					TraceEvent(SevWarnAlways, "PeerUnavailableForLongTime", conn ? conn->getDebugID() : UID())
 					    .suppressFor(1.0)
-					    .detail("PeerAddr", self->destination);
+					    .detail("PeerAddr", self->destination)
+					    .detail("PeerAddress", self->destination);
 					firstConnFailedTime = now() - FLOW_KNOBS->PEER_UNAVAILABLE_FOR_LONG_TIME_TIMEOUT / 2.0;
 				}
 			} else {
@@ -811,13 +925,15 @@ ACTOR Future<Void> connectionKeeper(Reference<Peer> self,
 				TraceEvent(ok ? SevInfo : SevWarnAlways, "ConnectionClosed", conn ? conn->getDebugID() : UID())
 				    .errorUnsuppressed(e)
 				    .suppressFor(1.0)
-				    .detail("PeerAddr", self->destination);
+				    .detail("PeerAddr", self->destination)
+				    .detail("PeerAddress", self->destination);
 			} else {
 				TraceEvent(
 				    ok ? SevInfo : SevWarnAlways, "IncompatibleConnectionClosed", conn ? conn->getDebugID() : UID())
 				    .errorUnsuppressed(e)
 				    .suppressFor(1.0)
-				    .detail("PeerAddr", self->destination);
+				    .detail("PeerAddr", self->destination)
+				    .detail("PeerAddress", self->destination);
 
 				// Since the connection has closed, we need to check the protocol version the next time we connect
 				self->compatible = true;
@@ -832,7 +948,8 @@ ACTOR Future<Void> connectionKeeper(Reference<Peer> self,
 				} else if (now() - it.first > FLOW_KNOBS->TOO_MANY_CONNECTIONS_CLOSED_TIMEOUT) {
 					TraceEvent(SevWarnAlways, "TooManyConnectionsClosed", conn ? conn->getDebugID() : UID())
 					    .suppressFor(5.0)
-					    .detail("PeerAddr", self->destination);
+					    .detail("PeerAddr", self->destination)
+					    .detail("PeerAddress", self->destination);
 					self->transport->degraded->set(true);
 				}
 				it.second = now();
@@ -877,7 +994,11 @@ ACTOR Future<Void> connectionKeeper(Reference<Peer> self,
 
 			if (self->peerReferences <= 0 && self->reliable.empty() && self->unsent.empty() &&
 			    self->outstandingReplies == 0) {
-				TraceEvent("PeerDestroy").errorUnsuppressed(e).suppressFor(1.0).detail("PeerAddr", self->destination);
+				TraceEvent("PeerDestroy")
+				    .errorUnsuppressed(e)
+				    .suppressFor(1.0)
+				    .detail("PeerAddr", self->destination)
+				    .detail("PeerAddress", self->destination);
 				self->connect.cancel();
 				self->transport->peers.erase(self->destination);
 				self->transport->orderedAddresses.erase(self->destination);
@@ -1063,7 +1184,8 @@ ACTOR static void deliver(TransportData* self,
 			TraceEvent(SevError, "ReceiverError")
 			    .error(e)
 			    .detail("Token", destination.token.toString())
-			    .detail("Peer", destination.getPrimaryAddress());
+			    .detail("Peer", destination.getPrimaryAddress())
+			    .detail("PeerAddress", destination.getPrimaryAddress());
 			if (!FlowTransport::isClient()) {
 				flushAndExit(FDB_EXIT_ERROR);
 			}
@@ -1360,6 +1482,10 @@ ACTOR static Future<Void> connectionReader(TransportData* transport,
 									            pkt.canonicalRemotePort
 									                ? NetworkAddress(pkt.canonicalRemoteIp(), pkt.canonicalRemotePort)
 									                : conn->getPeerAddress())
+									    .detail("PeerAddress",
+									            pkt.canonicalRemotePort
+									                ? NetworkAddress(pkt.canonicalRemoteIp(), pkt.canonicalRemotePort)
+									                : conn->getPeerAddress())
 									    .detail("ConnectionId", connectionId);
 									transport->lastIncompatibleMessage = now();
 								}
@@ -1385,6 +1511,7 @@ ACTOR static Future<Void> connectionReader(TransportData* transport,
 							TraceEvent("ConnectionEstablished", conn->getDebugID())
 							    .suppressFor(1.0)
 							    .detail("Peer", conn->getPeerAddress())
+							    .detail("PeerAddress", conn->getPeerAddress())
 							    .detail("ConnectionId", connectionId);
 						}
 
@@ -1400,7 +1527,9 @@ ACTOR static Future<Void> connectionReader(TransportData* transport,
 							// Outgoing connection; port information should be what we expect
 							TraceEvent("ConnectedOutgoing")
 							    .suppressFor(1.0)
-							    .detail("PeerAddr", NetworkAddress(pkt.canonicalRemoteIp(), pkt.canonicalRemotePort));
+							    .detail("PeerAddr", NetworkAddress(pkt.canonicalRemoteIp(), pkt.canonicalRemotePort))
+							    .detail("PeerAddress",
+							            NetworkAddress(pkt.canonicalRemoteIp(), pkt.canonicalRemotePort));
 							peer->compatible = compatible;
 							if (!compatible) {
 								peer->transport->numIncompatibleConnections++;
@@ -1467,10 +1596,17 @@ ACTOR static Future<Void> connectionReader(TransportData* transport,
 }
 
 ACTOR static Future<Void> connectionIncoming(TransportData* self, Reference<IConnection> conn) {
+	state TransportData::ConnectionHistoryEntry entry;
+	entry.time = now();
+	entry.addr = conn->getPeerAddress();
 	try {
 		wait(conn->acceptHandshake());
 		state Promise<Reference<Peer>> onConnected;
 		state Future<Void> reader = connectionReader(self, conn, Reference<Peer>(), onConnected);
+		if (FLOW_KNOBS->LOG_CONNECTION_ATTEMPTS_ENABLED) {
+			entry.failed = false;
+			self->connectionHistory.push_back(entry);
+		}
 		choose {
 			when(wait(reader)) {
 				ASSERT(false);
@@ -1484,17 +1620,21 @@ ACTOR static Future<Void> connectionIncoming(TransportData* self, Reference<ICon
 				throw timed_out();
 			}
 		}
-		return Void();
 	} catch (Error& e) {
 		if (e.code() != error_code_actor_cancelled) {
 			TraceEvent("IncomingConnectionError", conn->getDebugID())
 			    .errorUnsuppressed(e)
 			    .suppressFor(1.0)
 			    .detail("FromAddress", conn->getPeerAddress());
+			if (FLOW_KNOBS->LOG_CONNECTION_ATTEMPTS_ENABLED) {
+				entry.failed = true;
+				self->connectionHistory.push_back(entry);
+			}
 		}
 		conn->close();
-		return Void();
 	}
+
+	return Void();
 }
 
 ACTOR static Future<Void> listen(TransportData* self, NetworkAddress listenAddr) {

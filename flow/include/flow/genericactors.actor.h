@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,8 +22,11 @@
 
 // When actually compiled (NO_INTELLISENSE), include the generated version of this file.  In intellisense use the source
 // version.
+#include "flow/Error.h"
 #include "flow/FastRef.h"
+#include "flow/TaskPriority.h"
 #include "flow/network.h"
+#include "flow/swift_support.h"
 #include <utility>
 #include <functional>
 #include <unordered_set>
@@ -37,6 +40,7 @@
 #include <utility>
 
 #include "flow/flow.h"
+#include "flow/CoroUtils.h"
 #include "flow/Knobs.h"
 #include "flow/Util.h"
 #include "flow/IndexedSet.h"
@@ -328,8 +332,8 @@ Future<Void> holdWhileVoid(X object, Future<T> what) {
 }
 
 // Assign the future value of what to out
-template <class T>
-Future<Void> store(T& out, Future<T> what) {
+template <class T, class X>
+[[nodiscard]] Future<Void> store(X& out, Future<T> what) {
 	return map(what, [&out](T const& v) {
 		out = v;
 		return Void();
@@ -749,8 +753,17 @@ private:
 	V value;
 };
 
+// FIXME(swift): Remove once https://github.com/apple/swift/issues/61620 is fixed.
+#define SWIFT_CXX_REF_ASYNCVAR                                                                                         \
+	__attribute__((swift_attr("import_reference"))) __attribute__((swift_attr("retain:immortal")))                     \
+	__attribute__((swift_attr("release:immortal")))
+// // TODO(swift): https://github.com/apple/swift/issues/62456 can't support retain/release funcs that are templates
+// themselves
+//    __attribute__((swift_attr("retain:addref_AsyncVar")))   \
+//    __attribute__((swift_attr("release:delref_AsyncVar")))
+
 template <class V>
-class AsyncVar : NonCopyable, public ReferenceCounted<AsyncVar<V>> {
+class SWIFT_CXX_REF_ASYNCVAR AsyncVar : NonCopyable, public ReferenceCounted<AsyncVar<V>> {
 public:
 	AsyncVar() : value() {}
 	AsyncVar(V const& v) : value(v) {}
@@ -761,6 +774,7 @@ public:
 	}
 
 	V const& get() const { return value; }
+	V getCopy() const __attribute__((swift_attr("import_unsafe"))) { return value; }
 	Future<Void> onChange() const { return nextChange.getFuture(); }
 	void set(V const& v) {
 		if (v != value)
@@ -931,6 +945,35 @@ Future<Void> setWhenDoneOrError(Future<Void> condition, Reference<AsyncVar<T>> v
 	return Void();
 }
 
+ACTOR Future<Void> lowPriorityDelay(double waitTime);
+
+// Delay after condition is cleared (i.e. equal to false).
+// If during delay, condition changes to true, wait till condition become false again, and repeat.
+ACTOR Future<Void> delayAfterCleared(Reference<AsyncVar<bool>> condition,
+                                     double time,
+                                     TaskPriority taskID = TaskPriority::DefaultDelay);
+
+// Same as delayAfterCleared, but use lowPriorityDelay.
+ACTOR Future<Void> lowPriorityDelayAfterCleared(Reference<AsyncVar<bool>> condition, double time);
+
+// Similar to timeoutError, but does not throw timed_out if condition is true.
+// Once condition becomes false again, reset the timer (e.g. if time is 10s, wait for 10s again before throwing
+// timed_out, if condition remains to be false).
+ACTOR template <class T>
+Future<T> timeoutErrorIfCleared(Future<T> what,
+                                Reference<AsyncVar<bool>> condition,
+                                double time,
+                                TaskPriority taskID = TaskPriority::DefaultDelay) {
+	choose {
+		when(T t = wait(what)) {
+			return t;
+		}
+		when(wait(delayAfterCleared(condition, time, taskID))) {
+			throw timed_out();
+		}
+	}
+}
+
 Future<bool> allTrue(const std::vector<Future<bool>>& all);
 Future<Void> anyTrue(std::vector<Reference<AsyncVar<bool>>> const& input, Reference<AsyncVar<bool>> const& output);
 Future<Void> cancelOnly(std::vector<Future<Void>> const& futures);
@@ -939,7 +982,6 @@ Future<Void> timeoutWarningCollector(FutureStream<Void> const& input,
                                      const char* const& context,
                                      UID const& id);
 ACTOR Future<bool> quorumEqualsTrue(std::vector<Future<bool>> futures, int required);
-Future<Void> lowPriorityDelay(double const& waitTime);
 
 ACTOR template <class T>
 Future<Void> streamHelper(PromiseStream<T> output, PromiseStream<Error> errors, Future<T> input) {
@@ -1326,19 +1368,29 @@ Future<Void> recurring(Func what, double interval, TaskPriority taskID = TaskPri
 	}
 }
 
+ACTOR template <class Func>
+Future<Void> checkUntil(double checkInterval, Func f, TaskPriority taskID = TaskPriority::DefaultDelay) {
+	loop {
+		wait(delay(checkInterval, taskID));
+		if (f())
+			return Void();
+	}
+}
+
 // Invoke actorFunc() forever in a loop
 // At least wait<interval> between two actor functor invocations
 ACTOR template <class F>
 Future<Void> recurringAsync(
     F actorFunc, // Callback actor functor
     double interval, // Interval between two subsequent invocations of actor functor.
-    bool absoluteIntervalDelay, // Flag guarantees "interval" delay between two subequent actor functor invocations. If
+    bool absoluteIntervalDelay, // Flag guarantees "interval" delay between two subsequent actor functor invocations. If
                                 // not selected, guarantees provided are "at least 'interval' delay" between two
                                 // subsequent actor functor invocations, however, due to either 'poorly choose' interval
                                 // value AND/OR actor functor taking longer than expected to return, could cause actor
                                 // functor to run with no-delay
     double initialDelay, // Initial delay interval
-    TaskPriority taskID = TaskPriority::DefaultDelay) {
+    TaskPriority taskID = TaskPriority::DefaultDelay,
+    bool jittered = false) {
 
 	wait(delay(initialDelay));
 
@@ -1350,12 +1402,20 @@ Future<Void> recurringAsync(
 		if (absoluteIntervalDelay) {
 			wait(val);
 			// Ensure subsequent actorFunc executions observe client supplied delay interval.
-			wait(delay(interval));
+			if (jittered) {
+				wait(delayJittered(interval));
+			} else {
+				wait(delay(interval));
+			}
 		} else {
 			// Guarantee at-least client supplied interval delay; two possible scenarios:
 			// 1. The actorFunc executions finishes before 'interval' delay
 			// 2. The actorFunc executions takes > 'interval' delay.
-			wait(val && delay(interval));
+			if (jittered) {
+				wait(val && delayJittered(interval));
+			} else {
+				wait(val && delay(interval));
+			}
 		}
 	}
 }
@@ -1425,11 +1485,70 @@ Future<T> waitOrError(Future<T> f, Future<Void> errorSignal) {
 	}
 }
 
+// A simple counter designed to track an ongoing count of something, such as how many actors are in a critical section,
+// how many bytes are currently being processed, etc... Can be explicitly released idempotently, or will automatically
+// release when destructed to handle actor ending or errors.
+// Can be used for any type T so long as it has += and -= operators.
+
+// Usage Example: tracking number of actors in code section
+// ActiveCounter<int> counter;
+//
+//   state ActiveCounter::Releaser tracker = counter.take(1);
+//   wait(perform my operation);
+//   tracker.release();
+
+template <class T>
+struct ActiveCounter {
+	struct Releaser : NonCopyable {
+		ActiveCounter<T>* parent;
+		T delta;
+		std::function<void()> releaseCallback;
+
+		Releaser() : parent(nullptr) {}
+		Releaser(ActiveCounter<T>* parent, T delta, std::function<void()> releaseCallback)
+		  : parent(parent), delta(delta), releaseCallback(releaseCallback) {
+			parent->counter += delta;
+		}
+		Releaser(Releaser&& r) noexcept : parent(r.parent), delta(r.delta), releaseCallback(r.releaseCallback) {
+			r.parent = nullptr;
+		}
+		void operator=(Releaser&& r) {
+			release();
+			parent = r.parent;
+			delta = r.delta;
+			releaseCallback = r.releaseCallback;
+			r.parent = nullptr;
+		}
+
+		void release() {
+			if (parent) {
+				parent->counter -= delta;
+				parent = nullptr;
+				if (releaseCallback) {
+					releaseCallback();
+				}
+			}
+		}
+
+		~Releaser() { release(); }
+	};
+
+	T counter;
+
+	ActiveCounter(T initialValue) : counter(initialValue) {}
+
+	T getValue() { return counter; }
+
+	Releaser take(T delta, std::function<void()> releaseCallback = {}) {
+		return Releaser(this, delta, releaseCallback);
+	}
+};
+
 // A low-overhead FIFO mutex made with no internal queue structure (no list, deque, vector, etc)
 // The lock is implemented as a Promise<Void>, which is returned to callers in a convenient wrapper
 // called Lock.
 //
-// The default behavior is that if a Lock is droppped without error or release, existing and future
+// The default behavior is that if a Lock is dropped without error or release, existing and future
 // waiters will see a broken_promise exception.
 //
 // If hangOnDroppedMutex is true, then if a Lock is dropped without error or release, existing and

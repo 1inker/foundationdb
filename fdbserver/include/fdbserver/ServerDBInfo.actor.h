@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -52,7 +52,6 @@ struct ServerDBInfo {
 	Optional<RatekeeperInterface> ratekeeper;
 	Optional<BlobManagerInterface> blobManager;
 	Optional<BlobMigratorInterface> blobMigrator;
-	Optional<EncryptKeyProxyInterface> encryptKeyProxy;
 	Optional<ConsistencyScanInterface> consistencyScan;
 	std::vector<ResolverInterface> resolvers;
 	DBRecoveryCount
@@ -87,7 +86,6 @@ struct ServerDBInfo {
 		           ratekeeper,
 		           blobManager,
 		           blobMigrator,
-		           encryptKeyProxy,
 		           consistencyScan,
 		           resolvers,
 		           recoveryCount,
@@ -99,6 +97,7 @@ struct ServerDBInfo {
 		           infoGeneration);
 	}
 };
+using AsyncVar_ServerDBInfo = AsyncVar<ServerDBInfo>;
 
 struct UpdateServerDBInfoRequest {
 	constexpr static FileIdentifier file_identifier = 9467438;

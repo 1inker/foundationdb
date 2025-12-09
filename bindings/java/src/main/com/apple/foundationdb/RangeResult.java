@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2018 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -35,7 +35,7 @@ class RangeResult {
 
 	RangeResult(byte[] keyValues, int[] lengths, boolean more) {
 		if(lengths.length % 2 != 0) {
-			throw new IllegalArgumentException("There needs to be an even number of lenghts!");
+			throw new IllegalArgumentException("There needs to be an even number of lengths!");
 		}
 
 		int count = lengths.length / 2;

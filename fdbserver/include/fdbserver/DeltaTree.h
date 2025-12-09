@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -684,7 +684,7 @@ public:
 					// Compare s to the node jumped to
 					cmp = s.compare(n->item, skipLen);
 
-					// n is on the oposite side of s than node is, then n is too far.
+					// n is on the opposite side of s than node is, then n is too far.
 					if (cmp != 0 && ((initialCmp ^ cmp) < 0)) {
 						if (!othersChild) {
 							n = (cmp < 0) ? node->rightChild : node->leftChild;

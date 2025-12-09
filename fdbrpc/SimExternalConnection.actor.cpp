@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -151,10 +151,12 @@ std::vector<NetworkAddress> SimExternalConnection::resolveTCPEndpointBlocking(co
 		while (iter != end) {
 			auto endpoint = iter->endpoint();
 			auto addr = endpoint.address();
+			// register the endpoint as public so that if it does happen to be an fdb process, we can connect to it
+			// successfully
 			if (addr.is_v6()) {
-				addrs.emplace_back(IPAddress(addr.to_v6().to_bytes()), endpoint.port());
+				addrs.emplace_back(IPAddress(addr.to_v6().to_bytes()), endpoint.port(), true, false);
 			} else {
-				addrs.emplace_back(addr.to_v4().to_ulong(), endpoint.port());
+				addrs.emplace_back(addr.to_v4().to_ulong(), endpoint.port(), true, false);
 			}
 			++iter;
 		}

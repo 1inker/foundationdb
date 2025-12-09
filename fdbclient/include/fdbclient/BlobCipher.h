@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -54,12 +54,10 @@
 #include <unordered_map>
 #include <variant>
 #include <vector>
-#if defined(HAVE_WOLFSSL)
-#include <wolfssl/options.h>
-#endif
 
 #define AES_256_KEY_LENGTH 32
 #define AES_256_IV_LENGTH 16
+#define ENABLE_MUTATION_TRACKING_WITH_BLOB_CIPHER 0 // works when simulation
 
 constexpr const int INVALID_ENCRYPT_HEADERS_FLAG_VERSION = 0;
 constexpr const int INVALID_ENCRYPT_HEADER_ALGO_HEADER_VERSION = 0;
@@ -76,7 +74,8 @@ public:
 
 	// Order of this enum has to match initializer of counterSets.
 	enum UsageType : int {
-		TLOG = 0,
+		ALL = 0,
+		TLOG,
 		TLOG_POST_RESOLUTION,
 		KV_MEMORY,
 		KV_REDWOOD,
@@ -87,19 +86,7 @@ public:
 		MAX,
 	};
 
-	struct CounterSet {
-		Counter encryptCPUTimeNS;
-		Counter decryptCPUTimeNS;
-		LatencySample getCipherKeysLatency;
-		LatencySample getLatestCipherKeysLatency;
-
-		CounterSet(CounterCollection& cc, std::string name);
-	};
-
-	static CounterSet& counters(UsageType t) {
-		ASSERT(t < UsageType::MAX);
-		return getInstance()->counterSets[int(t)];
-	}
+	static const std::unordered_map<int, std::string> usageTypeNames;
 
 private:
 	BlobCipherMetrics();
@@ -114,10 +101,9 @@ public:
 	Counter latestCipherKeyCacheHit;
 	Counter latestCipherKeyCacheMiss;
 	Counter latestCipherKeyCacheNeedsRefresh;
+	LatencySample getBlobMetadataLatency;
 	LatencySample getCipherKeysLatency;
 	LatencySample getLatestCipherKeysLatency;
-	LatencySample getBlobMetadataLatency;
-	std::array<CounterSet, int(UsageType::MAX)> counterSets;
 };
 
 std::string toString(BlobCipherMetrics::UsageType type);
@@ -289,8 +275,12 @@ struct AesCtrWithAuthV1 {
 
 	// Text cipher encryption information
 	BlobCipherDetails cipherTextDetails;
+	// Text cipher Key Check Value
+	EncryptCipherKeyCheckValue textKCV;
 	// Header cipher encryption information
 	BlobCipherDetails cipherHeaderDetails;
+	// Header cipher Key Check Value
+	EncryptCipherKeyCheckValue headerKCV;
 	// Initialization vector
 	uint8_t iv[AES_256_IV_LENGTH];
 	// Authentication token
@@ -298,10 +288,12 @@ struct AesCtrWithAuthV1 {
 
 	AesCtrWithAuthV1() = default;
 	AesCtrWithAuthV1(const BlobCipherDetails& textDetails,
+	                 const EncryptCipherKeyCheckValue tKCV,
 	                 const BlobCipherDetails& headerDetails,
+	                 const EncryptCipherKeyCheckValue hKCV,
 	                 const uint8_t* ivBuf,
 	                 const int ivLen)
-	  : cipherTextDetails(textDetails), cipherHeaderDetails(headerDetails) {
+	  : cipherTextDetails(textDetails), textKCV(tKCV), cipherHeaderDetails(headerDetails), headerKCV(hKCV) {
 		ASSERT_EQ(ivLen, AES_256_IV_LENGTH);
 		memcpy(&iv[0], ivBuf, ivLen);
 		memset(&authToken[0], 0, Params::authTokenSize);
@@ -309,15 +301,18 @@ struct AesCtrWithAuthV1 {
 
 	bool operator==(const Self& o) const {
 		return cipherHeaderDetails == o.cipherHeaderDetails && cipherTextDetails == o.cipherTextDetails &&
-		       memcmp(&iv[0], &o.iv[0], AES_256_IV_LENGTH) == 0 &&
+		       textKCV == o.textKCV && headerKCV == o.headerKCV && memcmp(&iv[0], &o.iv[0], AES_256_IV_LENGTH) == 0 &&
 		       memcmp(&authToken[0], &o.authToken[0], Params::authTokenSize) == 0;
 	}
 
-	static uint32_t getSize() { return BlobCipherDetails::getSize() * 2 + AES_256_IV_LENGTH + Params::authTokenSize; }
+	static uint32_t getSize() {
+		return BlobCipherDetails::getSize() * 2 + sizeof(EncryptCipherKeyCheckValue) * 2 + AES_256_IV_LENGTH +
+		       Params::authTokenSize;
+	}
 
 	template <class Ar>
 	void serialize(Ar& ar) {
-		serializer(ar, cipherTextDetails, cipherHeaderDetails);
+		serializer(ar, cipherTextDetails, textKCV, cipherHeaderDetails, headerKCV);
 		ar.serializeBytes(iv, AES_256_IV_LENGTH);
 		ar.serializeBytes(authToken, Params::authTokenSize);
 	}
@@ -389,25 +384,33 @@ struct AesCtrNoAuthV1 {
 
 	// Text cipher encryption information
 	BlobCipherDetails cipherTextDetails;
+	// Text cipher Key Check Value
+	EncryptCipherKeyCheckValue textKCV;
 	// Initialization vector
 	uint8_t iv[AES_256_IV_LENGTH];
 
 	AesCtrNoAuthV1() = default;
-	AesCtrNoAuthV1(const BlobCipherDetails& textDetails, const uint8_t* ivBuf, const int ivLen)
-	  : cipherTextDetails(textDetails) {
+	AesCtrNoAuthV1(const BlobCipherDetails& textDetails,
+	               const EncryptCipherKeyCheckValue tKCV,
+	               const uint8_t* ivBuf,
+	               const int ivLen)
+	  : cipherTextDetails(textDetails), textKCV(tKCV) {
 		ASSERT_EQ(ivLen, AES_256_IV_LENGTH);
 		memcpy(&iv[0], ivBuf, ivLen);
 	}
 
 	bool operator==(const AesCtrNoAuthV1& o) const {
-		return cipherTextDetails == o.cipherTextDetails && memcmp(&iv[0], &o.iv[0], AES_256_IV_LENGTH) == 0;
+		return cipherTextDetails == o.cipherTextDetails && textKCV == o.textKCV &&
+		       memcmp(&iv[0], &o.iv[0], AES_256_IV_LENGTH) == 0;
 	}
 
-	static uint32_t getSize() { return BlobCipherDetails::getSize() + AES_256_IV_LENGTH; }
+	static uint32_t getSize() {
+		return BlobCipherDetails::getSize() + sizeof(EncryptCipherKeyCheckValue) + AES_256_IV_LENGTH;
+	}
 
 	template <class Ar>
 	void serialize(Ar& ar) {
-		serializer(ar, cipherTextDetails);
+		serializer(ar, cipherTextDetails, textKCV);
 		ar.serializeBytes(iv, AES_256_IV_LENGTH);
 	}
 };
@@ -456,6 +459,16 @@ struct AesCtrNoAuth {
 	}
 };
 
+struct EncryptHeaderCipherKCVs {
+	EncryptCipherKeyCheckValue textKCV;
+	Optional<EncryptCipherKeyCheckValue> headerKCV;
+
+	EncryptHeaderCipherKCVs() = default;
+	EncryptHeaderCipherKCVs(const EncryptCipherKeyCheckValue tKCV) : textKCV(tKCV) {}
+	EncryptHeaderCipherKCVs(const EncryptCipherKeyCheckValue tKCV, const EncryptCipherKeyCheckValue hKCV)
+	  : textKCV(tKCV), headerKCV(hKCV) {}
+};
+
 struct BlobCipherEncryptHeaderRef {
 	// Serializable fields
 	std::variant<BlobCipherEncryptHeaderFlagsV1> flags;
@@ -495,9 +508,18 @@ struct BlobCipherEncryptHeaderRef {
 	const EncryptHeaderCipherDetails getCipherDetails() const;
 	EncryptAuthTokenMode getAuthTokenMode() const;
 	EncryptCipherDomainId getDomainId() const;
+	EncryptHeaderCipherKCVs getKCVs() const;
 
+	// API supports following validation:
+	// 1. Ensure input BlobCipherDetails (textDetails and/or headerDetails) matches with the input
+	// 2. Ensure persisted KCV matches with the input values
+	// 3. Ensure input IV buffer matches with the persisted ones.
+	//
+	// Currently API is used by BlobGranule encryption where encryption key lookup based on persisted
+	// BlobGranuleCipherKeyCtx
 	void validateEncryptionHeaderDetails(const BlobCipherDetails& textCipherDetails,
 	                                     const BlobCipherDetails& headerCipherDetails,
+	                                     const EncryptHeaderCipherKCVs& kcvs,
 	                                     const StringRef& ivRef) const;
 };
 
@@ -511,7 +533,7 @@ struct BlobCipherEncryptHeaderRef {
 
 #pragma pack(push, 1) // exact fit - no padding
 typedef struct BlobCipherEncryptHeader {
-	static constexpr int headerSize = 104;
+	static constexpr int headerSize = 112;
 	union {
 		struct {
 			uint8_t size; // reading first byte is sufficient to determine header
@@ -527,8 +549,12 @@ typedef struct BlobCipherEncryptHeader {
 
 	// Cipher text encryption information
 	BlobCipherDetails cipherTextDetails;
+	// Text Key Check Value
+	EncryptCipherKeyCheckValue textKCV;
 	// Cipher header encryption information
 	BlobCipherDetails cipherHeaderDetails;
+	// Header Key Check Value
+	EncryptCipherKeyCheckValue headerKCV;
 	// Initialization vector used to encrypt the payload.
 	uint8_t iv[AES_256_IV_LENGTH];
 
@@ -594,13 +620,15 @@ public:
 	BlobCipherKey(const EncryptCipherDomainId& domainId,
 	              const EncryptCipherBaseKeyId& baseCiphId,
 	              const uint8_t* baseCiph,
-	              int baseCiphLen,
+	              const int baseCiphLen,
+	              const EncryptCipherKeyCheckValue baseCipherKCV,
 	              const int64_t refreshAt,
 	              int64_t expireAt);
 	BlobCipherKey(const EncryptCipherDomainId& domainId,
 	              const EncryptCipherBaseKeyId& baseCiphId,
 	              const uint8_t* baseCiph,
-	              int baseCiphLen,
+	              const int baseCiphLen,
+	              const EncryptCipherKeyCheckValue baseCipherKCV,
 	              const EncryptCipherRandomSalt& salt,
 	              const int64_t refreshAt,
 	              const int64_t expireAt);
@@ -612,6 +640,7 @@ public:
 	EncryptCipherRandomSalt getSalt() const { return randomSalt; }
 	EncryptCipherBaseKeyId getBaseCipherId() const { return baseCipherId; }
 	int getBaseCipherLen() const { return baseCipherLen; }
+	EncryptCipherKeyCheckValue getBaseCipherKCV() const { return baseCipherKCV; }
 	uint8_t* rawCipher() const { return cipher.get(); }
 	uint8_t* rawBaseCipher() const { return baseCipher.get(); }
 	bool isEqual(const Reference<BlobCipherKey> toCompare) {
@@ -649,6 +678,7 @@ private:
 	EncryptCipherDomainId encryptDomainId;
 	// Base encryption cipher key properties
 	std::unique_ptr<uint8_t[]> baseCipher;
+	EncryptCipherKeyCheckValue baseCipherKCV;
 	int baseCipherLen;
 	EncryptCipherBaseKeyId baseCipherId;
 	// Random salt used for encryption cipher key derivation
@@ -661,9 +691,10 @@ private:
 	int64_t expireAtTS;
 
 	void initKey(const EncryptCipherDomainId& domainId,
-	             const uint8_t* baseCiph,
-	             int baseCiphLen,
 	             const EncryptCipherBaseKeyId& baseCiphId,
+	             const uint8_t* baseCiph,
+	             const int baseCiphLen,
+	             const EncryptCipherKeyCheckValue baseCipherKCV,
 	             const EncryptCipherRandomSalt& salt,
 	             const int64_t refreshAt,
 	             const int64_t expireAt);
@@ -671,7 +702,7 @@ private:
 };
 
 // This interface allows FDB processes participating in encryption to store and
-// index recently used encyption cipher keys. FDB encryption has two dimensions:
+// index recently used encryption cipher keys. FDB encryption has two dimensions:
 // 1. Mapping on cipher encryption keys per "encryption domains"
 // 2. Per encryption domain, the cipher keys are index using {baseCipherKeyId, salt} tuple.
 //
@@ -679,7 +710,7 @@ private:
 // key. For details refer to:
 // https://csrc.nist.gov/publications/detail/sp/800-57-part-1/rev-3/archive/2012-07-10
 //
-// Below gives a pictoral representation of in-memory datastructure implemented
+// Below gives a pictorial representation of in-memory datastructure implemented
 // to index encryption keys:
 //                  { encryptionDomain -> { {baseCipherId, salt} -> cipherKey } }
 //
@@ -728,23 +759,25 @@ public:
 
 	Reference<BlobCipherKey> insertBaseCipherKey(const EncryptCipherBaseKeyId& baseCipherId,
 	                                             const uint8_t* baseCipher,
-	                                             int baseCipherLen,
+	                                             const int baseCipherLen,
+	                                             const EncryptCipherKeyCheckValue baseCipherKCV,
 	                                             const int64_t refreshAt,
 	                                             const int64_t expireAt);
 
 	// API enables inserting base encryption cipher details to the BlobCipherKeyIdCache
 	// Given cipherKeys are immutable, attempting to re-insert same 'identical' cipherKey
 	// is treated as a NOP (success), however, an attempt to update cipherKey would throw
-	// 'encrypt_update_cipher' exception. Returns the inserted cipher key if sucess.
+	// 'encrypt_update_cipher' exception. Returns the inserted cipher key if success.
 	//
 	// API NOTE: Recommended usecase is to update encryption cipher-key regeneration while performing
-	// decryption. The encryptionheader would contain relevant details including: 'encryptDomainId',
+	// decryption. The encryption header would contain relevant details including: 'encryptDomainId',
 	// 'baseCipherId' & 'salt'. The caller needs to fetch 'baseCipherKey' detail and re-populate KeyCache.
 	// Also, the invocation will NOT update the latest cipher-key details.
 
 	Reference<BlobCipherKey> insertBaseCipherKey(const EncryptCipherBaseKeyId& baseCipherId,
 	                                             const uint8_t* baseCipher,
-	                                             int baseCipherLen,
+	                                             const int baseCipherLen,
+	                                             const EncryptCipherKeyCheckValue baseCipherKCV,
 	                                             const EncryptCipherRandomSalt& salt,
 	                                             const int64_t refreshAt,
 	                                             const int64_t expireAt);
@@ -755,7 +788,7 @@ public:
 	// API returns list of all 'cached' cipherKeys
 	std::vector<Reference<BlobCipherKey>> getAllCipherKeys();
 
-	// Return number of cipher keys in the cahce.
+	// Return number of cipher keys in the cache.
 	size_t getSize() const { return keyIdCache.size(); }
 
 private:
@@ -770,7 +803,7 @@ using BlobCipherDomainCacheMap = std::unordered_map<EncryptCipherDomainId, Refer
 
 class BlobCipherKeyCache : NonCopyable, public ReferenceCounted<BlobCipherKeyCache> {
 public:
-	// Public visibility constructior ONLY to assist FlowSingleton instance creation.
+	// Public visibility constructor ONLY to assist FlowSingleton instance creation.
 	// API Note: Constructor is expected to be instantiated only in simulation mode.
 
 	explicit BlobCipherKeyCache(bool ignored) { ASSERT(g_network->isSimulated()); }
@@ -787,7 +820,8 @@ public:
 	Reference<BlobCipherKey> insertCipherKey(const EncryptCipherDomainId& domainId,
 	                                         const EncryptCipherBaseKeyId& baseCipherId,
 	                                         const uint8_t* baseCipher,
-	                                         int baseCipherLen,
+	                                         const int baseCipherLen,
+	                                         const EncryptCipherKeyCheckValue baseCipherKCV,
 	                                         const int64_t refreshAt,
 	                                         const int64_t expireAt);
 
@@ -805,7 +839,8 @@ public:
 	Reference<BlobCipherKey> insertCipherKey(const EncryptCipherDomainId& domainId,
 	                                         const EncryptCipherBaseKeyId& baseCipherId,
 	                                         const uint8_t* baseCipher,
-	                                         int baseCipherLen,
+	                                         const int baseCipherLen,
+	                                         const EncryptCipherKeyCheckValue baseCipherKCV,
 	                                         const EncryptCipherRandomSalt& salt,
 	                                         const int64_t refreshAt,
 	                                         const int64_t expireAt);
@@ -897,13 +932,25 @@ public:
 	Reference<EncryptBuf> encrypt(const uint8_t* plaintext,
 	                              const int plaintextLen,
 	                              BlobCipherEncryptHeader* header,
-	                              Arena&);
-	StringRef encrypt(const uint8_t*, const int, BlobCipherEncryptHeaderRef*, Arena&);
+	                              Arena&,
+	                              double* encryptTime = nullptr);
+	StringRef encrypt(const uint8_t*, const int, BlobCipherEncryptHeaderRef*, Arena&, double* encryptTime = nullptr);
+
+	void encryptInplace(uint8_t* plaintext,
+	                    const int plaintextLen,
+	                    BlobCipherEncryptHeader* header,
+	                    double* encryptTime = nullptr);
+
+	void encryptInplace(uint8_t* plaintext,
+	                    const int plaintextLen,
+	                    BlobCipherEncryptHeaderRef* headerRef,
+	                    double* encryptTime = nullptr);
 
 private:
 	void init();
 
 	void updateEncryptHeader(const uint8_t*, const int, BlobCipherEncryptHeaderRef* headerRef);
+	void updateEncryptHeader(const uint8_t*, const int, BlobCipherEncryptHeader* header);
 	void updateEncryptHeaderFlagsV1(BlobCipherEncryptHeaderRef* headerRef, BlobCipherEncryptHeaderFlagsV1* flags);
 	void setCipherAlgoHeaderV1(const uint8_t*,
 	                           const int,
@@ -939,18 +986,36 @@ public:
 	Reference<EncryptBuf> decrypt(const uint8_t* ciphertext,
 	                              const int ciphertextLen,
 	                              const BlobCipherEncryptHeader& header,
-	                              Arena&);
+	                              Arena&,
+	                              double* decryptTime = nullptr);
 	StringRef decrypt(const uint8_t* ciphertext,
 	                  const int ciphertextLen,
 	                  const BlobCipherEncryptHeaderRef& headerRef,
-	                  Arena&);
+	                  Arena&,
+	                  double* decryptTime = nullptr);
+
+	void decryptInplace(uint8_t* ciphertext,
+	                    const int ciphertextLen,
+	                    const BlobCipherEncryptHeader& header,
+	                    double* decryptTime = nullptr);
+
+	void decryptInplace(uint8_t* ciphertext,
+	                    const int ciphertextLen,
+	                    const BlobCipherEncryptHeaderRef& headerRef,
+	                    double* decryptTime = nullptr);
 
 private:
 	EVP_CIPHER_CTX* ctx;
-	BlobCipherMetrics::UsageType usageType;
 	Reference<BlobCipherKey> textCipherKey;
 	Optional<Reference<BlobCipherKey>> headerCipherKeyOpt;
 	bool authTokensValidationDone;
+
+	// API is responsible to validate persisted EncryptionHeader sanity, it does following checks
+	// 1. Parse and validate EncryptionHeaderFlags (version compliant checks)
+	// 2. Parse and validate KCVs
+	// 3. Parse and validate auth-tokens if applicable.
+	//
+	// Routine is invoked for every decryption buffer request and is done transparently to the caller
 
 	void validateEncryptHeader(const uint8_t*,
 	                           const int,
@@ -970,7 +1035,8 @@ private:
 	void validateAuthTokenV1(const uint8_t* ciphertext,
 	                         const int ciphertextLen,
 	                         const BlobCipherEncryptHeaderFlagsV1&,
-	                         const BlobCipherEncryptHeaderRef& header);
+	                         const BlobCipherEncryptHeaderRef&);
+	void vaidateEncryptHeaderCipherKCVs(const BlobCipherEncryptHeaderRef&, const BlobCipherEncryptHeaderFlagsV1&);
 
 	void verifyEncryptHeaderMetadata(const BlobCipherEncryptHeader& header);
 	void verifyAuthTokens(const uint8_t* ciphertext, const int ciphertextLen, const BlobCipherEncryptHeader& header);
@@ -1001,6 +1067,19 @@ public:
 
 private:
 	CMAC_CTX* ctx;
+};
+
+class Sha256KCV final : NonCopyable {
+public:
+	Sha256KCV();
+	~Sha256KCV();
+
+	EncryptCipherKeyCheckValue computeKCV(const uint8_t* cipher, const int len);
+
+	static void checkEqual(const Reference<BlobCipherKey>& cipher, const EncryptCipherKeyCheckValue persisted);
+
+private:
+	EVP_MD_CTX* ctx;
 };
 
 void computeAuthToken(const std::vector<std::pair<const uint8_t*, size_t>>& payload,

@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2023 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -39,9 +39,9 @@
 // This workload tests a gray failure scenario: a satellite TLog is have network issue
 // for sending packets to the remote data center's log routers. This will cause these
 // log routers to fail to progress, and causing data center lag, i.e., lag between the
-// primary and remote DC's tlags. With changes to log routers, they can detect that the
-// peek is taking a long time (> LOG_ROUTER_PEEK_SWITCH_DC_TIME) and swith to use
-// another DC to get data, thus recoverying from the data center lag.
+// primary and remote DC's tlogs. With changes to log routers, they can detect that the
+// peek is taking a long time (> LOG_ROUTER_PEEK_SWITCH_DC_TIME) and switch to use
+// another DC to get data, thus recovering from the data center lag.
 struct DcLagWorkload : TestWorkload {
 	static constexpr auto NAME = "DcLag";
 	bool enabled;
@@ -75,7 +75,7 @@ struct DcLagWorkload : TestWorkload {
 		std::vector<IPAddress> ips; // all remote process IPs
 		for (const auto& process : g_simulator->getAllProcesses()) {
 			const auto& ip = process->address.ip;
-			if (process->locality.dcId().present() && process->locality.dcId().get() == g_simulator->remoteDcId) {
+			if (process->locality.dcId().present() && process->locality.dcId() == g_simulator->remoteDcId) {
 				ips.push_back(ip);
 			}
 		}
@@ -117,7 +117,7 @@ struct DcLagWorkload : TestWorkload {
 		cloggedPairs.clear();
 	}
 
-	ACTOR static Future<Optional<double>> fetchDatacenterLag(DcLagWorkload* self, Database cx) {
+	ACTOR static Future<Optional<double>> fetchDatacenterLag(Database cx) {
 		StatusObject result = wait(StatusClient::statusFetcher(cx));
 		StatusObjectReader statusObj(result);
 		StatusObjectReader statusObjCluster;
@@ -167,7 +167,7 @@ struct DcLagWorkload : TestWorkload {
 		loop choose {
 			when(wait(delay(5.0))) {
 				// Fetch DC lag every 5s
-				status = fetchDatacenterLag(self, cx);
+				status = fetchDatacenterLag(cx);
 			}
 			when(Optional<double> lag = wait(status)) {
 				if (lag.present() && lag.get() >= SERVER_KNOBS->LOG_ROUTER_PEEK_SWITCH_DC_TIME - 10.0) {

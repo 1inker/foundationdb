@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2023 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -29,7 +29,9 @@
 #include "flow/IUDPSocket.h"
 #include "flow/TDMetric.actor.h"
 #include "flow/ChaosMetrics.h"
+#include "flow/Histogram.h"
 
+#include "fdbrpc/Locality.h"
 #include "fdbrpc/SimulatorMachineInfo.h"
 #include "fdbrpc/SimulatorKillType.h"
 
@@ -62,7 +64,7 @@ struct ProcessInfo : NonCopyable {
 	INetworkConnections* network;
 
 	uint64_t fault_injection_r;
-	double fault_injection_p1, fault_injection_p2;
+	double fault_injection_p1, fault_injection_p2, blob_inject_failure_rate;
 	bool failedDisk;
 
 	UID uid;
@@ -82,7 +84,8 @@ struct ProcessInfo : NonCopyable {
 	  : name(name), coordinationFolder(coordinationFolder), dataFolder(dataFolder), machine(nullptr),
 	    addresses(addresses), address(addresses.address), locality(locality), startingClass(startingClass),
 	    failed(false), excluded(false), cleared(false), rebooting(false), drProcess(false), network(net),
-	    fault_injection_r(0), fault_injection_p1(0), fault_injection_p2(0), failedDisk(false) {
+	    fault_injection_r(0), fault_injection_p1(0), fault_injection_p2(0), blob_inject_failure_rate(0),
+	    failedDisk(false) {
 		uid = deterministicRandom()->randomUniqueID();
 	}
 

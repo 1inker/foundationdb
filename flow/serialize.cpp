@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -40,10 +40,6 @@ const void* BinaryReader::readBytes(int bytes) {
 	}
 	begin = e;
 	return b;
-}
-
-uint8_t* PacketWriter::packetWriterAlloc(const size_t size, void* self) {
-	return static_cast<PacketWriter*>(self)->writeBytes(size);
 }
 
 namespace {

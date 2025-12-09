@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -29,8 +29,6 @@
 #include "flow/ApiVersion.h"
 #include "flow/UnitTest.h"
 
-FDB_DEFINE_BOOLEAN_PARAM(EnforceValidTenantId);
-
 namespace TenantAPI {
 
 KeyRef idToPrefix(Arena& p, int64_t id) {
@@ -50,6 +48,7 @@ int64_t prefixToId(KeyRef prefix, EnforceValidTenantId enforceValidTenantId) {
 	if (enforceValidTenantId) {
 		ASSERT(id >= 0);
 	} else if (id < 0) {
+		CODE_PROBE(true, "Attempt to convert invalid tenant prefix");
 		return TenantInfo::INVALID_TENANT;
 	}
 	return id;
@@ -153,8 +152,10 @@ bool TenantMapEntry::matchesConfiguration(TenantMapEntry const& other) const {
 
 void TenantMapEntry::configure(Standalone<StringRef> parameter, Optional<Value> value) {
 	if (parameter == "tenant_group"_sr) {
+		CODE_PROBE(true, "Configure tenant's group");
 		tenantGroup = value;
 	} else {
+		CODE_PROBE(true, "Invalid tenant configuration parameter");
 		TraceEvent(SevWarnAlways, "UnknownTenantConfigurationParameter").detail("Parameter", parameter);
 		throw invalid_tenant_configuration();
 	}

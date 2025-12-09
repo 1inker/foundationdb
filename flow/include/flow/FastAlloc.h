@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,7 +22,6 @@
 #define FLOW_FASTALLOC_H
 #pragma once
 
-#include "flow/Error.h"
 #include "flow/Platform.h"
 #include "flow/config.h"
 
@@ -39,6 +38,10 @@
 #include <drd.h>
 #include <memcheck.h>
 bool valgrindPrecise();
+#endif
+
+#ifdef ADDRESS_SANITIZER
+#include <sanitizer/lsan_interface.h>
 #endif
 
 #include "flow/Hash3.h"
@@ -77,7 +80,7 @@ extern std::map<const char*, AllocInstrInfo> allocInstr;
 
 // extern std::map<uint32_t, uint64_t> stackAllocations;
 
-// maps from an address to the hash of the backtrace and the size of the alloction
+// maps from an address to the hash of the backtrace and the size of the allocation
 extern std::unordered_map<int64_t, std::pair<uint32_t, size_t>> memSample;
 
 struct BackTraceAccount {
@@ -176,6 +179,59 @@ extern std::atomic<int64_t> g_hugeArenaMemory;
 void hugeArenaSample(int size);
 void releaseAllThreadMagazines();
 int64_t getTotalUnusedAllocatedMemory();
+
+// Allow temporary overriding of default allocators used by arena to let memory survive deallocation and test
+// correctness of memory policy (e.g. zeroing out sensitive contents after use)
+namespace keepalive_allocator {
+
+namespace detail {
+extern bool g_active;
+} // namespace detail
+
+inline bool isActive() noexcept {
+	return detail::g_active;
+}
+
+// While this scope is active, default allocate() and free() function is overridden for Arena and PacketBuffer to test
+// correct post-use memory policy: e.g. secure deletion of sensitive contents. Any (de)allocation of ArenaBlock and
+// PacketBuffer is tracked while this scope is active. To ensure correct state management, at most one instance of this
+// object may exist at any given time. Any tracked allocation during this scope must be freed BEFORE the scope
+// destructs. Any trackable (ArenaBlock, PacketBuffer) allocation before the scope must be freed AFTER the scope
+// destructs.
+class ActiveScope {
+public:
+	ActiveScope();
+	~ActiveScope();
+};
+
+void* allocate(size_t);
+void invalidate(void*);
+
+void trackWipedArea(const uint8_t* begin, int size);
+std::vector<std::pair<const uint8_t*, int>> const& getWipedAreaSet();
+
+} // namespace keepalive_allocator
+
+force_inline uint8_t* allocateAndMaybeKeepalive(size_t size) {
+	uint8_t* p;
+	if (keepalive_allocator::isActive()) [[unlikely]]
+		p = static_cast<uint8_t*>(keepalive_allocator::allocate(size));
+	else
+		p = new uint8_t[size];
+
+#ifdef ADDRESS_SANITIZER
+	__lsan_ignore_object(p);
+#endif
+
+	return p;
+}
+
+force_inline void freeOrMaybeKeepalive(void* ptr) {
+	if (keepalive_allocator::isActive()) [[unlikely]]
+		keepalive_allocator::invalidate(ptr);
+	else
+		delete[] static_cast<uint8_t*>(ptr);
+}
 
 inline constexpr int nextFastAllocatedSize(int x) {
 	assert(x > 0 && x <= 16384);

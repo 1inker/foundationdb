@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -82,12 +82,12 @@ struct RemoveServersSafelyWorkload : TestWorkload {
 			    .detail("Zoneid", it->locality.zoneId().get().toString())
 			    .detail("MachineId", it->locality.machineId().get().toString());
 
-			if (g_simulator->protectedAddresses.count(it->address) == 0)
+			if (!g_simulator->protectedAddresses.contains(it->address))
 				processAddrs.push_back(pAddr);
 			machineProcesses[machineIp].insert(pAddr);
 
 			// add only one entry for each machine
-			if (!machinesMap.count(it->locality.zoneId()))
+			if (!machinesMap.contains(it->locality.zoneId()))
 				machinesMap[it->locality.zoneId()] = machineIp;
 
 			machine_ids[machineIp] = it->locality.zoneId();
@@ -107,7 +107,7 @@ struct RemoveServersSafelyWorkload : TestWorkload {
 
 			for (auto k1 : toKill1) {
 				AddressExclusion machineIp(k1.ip);
-				ASSERT(machineProcesses.count(machineIp));
+				ASSERT(machineProcesses.contains(machineIp));
 				// kill all processes on this machine even if it has a different ip address
 				std::copy(machineProcesses[machineIp].begin(),
 				          machineProcesses[machineIp].end(),
@@ -118,7 +118,7 @@ struct RemoveServersSafelyWorkload : TestWorkload {
 			processSet.clear();
 			for (auto k2 : toKill2) {
 				AddressExclusion machineIp(k2.ip);
-				ASSERT(machineProcesses.count(machineIp));
+				ASSERT(machineProcesses.contains(machineIp));
 				std::copy(machineProcesses[machineIp].begin(),
 				          machineProcesses[machineIp].end(),
 				          std::inserter(processSet, processSet.end()));
@@ -128,13 +128,13 @@ struct RemoveServersSafelyWorkload : TestWorkload {
 
 		for (AddressExclusion ex : toKill1) {
 			AddressExclusion machineIp(ex.ip);
-			ASSERT(machine_ids.count(machineIp));
+			ASSERT(machine_ids.contains(machineIp));
 			g_simulator->disableSwapToMachine(machine_ids[machineIp]);
 		}
 
 		for (AddressExclusion ex : toKill2) {
 			AddressExclusion machineIp(ex.ip);
-			ASSERT(machine_ids.count(machineIp));
+			ASSERT(machine_ids.contains(machineIp));
 			g_simulator->disableSwapToMachine(machine_ids[machineIp]);
 		}
 
@@ -191,7 +191,7 @@ struct RemoveServersSafelyWorkload : TestWorkload {
 				    .detail("Failed", processInfo->failed)
 				    .detail("Excluded", processInfo->excluded)
 				    .detail("Rebooting", processInfo->rebooting)
-				    .detail("Protected", g_simulator->protectedAddresses.count(processInfo->address));
+				    .detail("Protected", g_simulator->protectedAddresses.contains(processInfo->address));
 			} else {
 				TraceEvent("RemoveAndKill", functionId)
 				    .detail("Step", "ProcessNotToKill")
@@ -200,7 +200,7 @@ struct RemoveServersSafelyWorkload : TestWorkload {
 				    .detail("Failed", processInfo->failed)
 				    .detail("Excluded", processInfo->excluded)
 				    .detail("Rebooting", processInfo->rebooting)
-				    .detail("Protected", g_simulator->protectedAddresses.count(processInfo->address));
+				    .detail("Protected", g_simulator->protectedAddresses.contains(processInfo->address));
 			}
 		}
 		TraceEvent("RemoveAndKill", functionId)
@@ -209,7 +209,7 @@ struct RemoveServersSafelyWorkload : TestWorkload {
 		    .detail("ProcessAddrSize", processAddrs.size())
 		    .detail("NetAddrs", describe(netAddrs))
 		    .detail("ProcessAddrs", describe(processAddrs))
-		    .detail("Proceses", processes.size())
+		    .detail("Processes", processes.size())
 		    .detail("MachineProcesses", machineProcesses.size());
 
 		return processes;
@@ -459,14 +459,14 @@ struct RemoveServersSafelyWorkload : TestWorkload {
 			    .detail("ClusterAvailable", g_simulator->isAvailable())
 			    .detail("RemoveViaClear", removeViaClear);
 			for (auto& killProcess : killProcArray) {
-				if (g_simulator->protectedAddresses.count(killProcess->address))
+				if (g_simulator->protectedAddresses.contains(killProcess->address))
 					TraceEvent("RemoveAndKill", functionId)
 					    .detail("Step", "NoKill Process")
 					    .detail("Process", describe(*killProcess))
 					    .detail("Failed", killProcess->failed)
 					    .detail("Rebooting", killProcess->rebooting)
 					    .detail("ClusterAvailable", g_simulator->isAvailable())
-					    .detail("Protected", g_simulator->protectedAddresses.count(killProcess->address));
+					    .detail("Protected", g_simulator->protectedAddresses.contains(killProcess->address));
 				else if (removeViaClear) {
 					g_simulator->rebootProcess(killProcess, ISimulator::KillType::RebootProcessAndDelete);
 					TraceEvent("RemoveAndKill", functionId)
@@ -475,12 +475,12 @@ struct RemoveServersSafelyWorkload : TestWorkload {
 					    .detail("Failed", killProcess->failed)
 					    .detail("Rebooting", killProcess->rebooting)
 					    .detail("ClusterAvailable", g_simulator->isAvailable())
-					    .detail("Protected", g_simulator->protectedAddresses.count(killProcess->address));
+					    .detail("Protected", g_simulator->protectedAddresses.contains(killProcess->address));
 				}
 				/*
 				                else {
 				                    g_simulator->killProcess( killProcess, ISimulator::KillType::KillInstantly );
-				                    TraceEvent("RemoveAndKill", functionId).detail("Step", "Kill Process").detail("Process", describe(*killProcess)).detail("Failed", killProcess->failed).detail("Rebooting", killProcess->rebooting).detail("ClusterAvailable", g_simulator->isAvailable()).detail("Protected", g_simulator->protectedAddresses.count(killProcess->address));
+				                    TraceEvent("RemoveAndKill", functionId).detail("Step", "Kill Process").detail("Process", describe(*killProcess)).detail("Failed", killProcess->failed).detail("Rebooting", killProcess->rebooting).detail("ClusterAvailable", g_simulator->isAvailable()).detail("Protected", g_simulator->protectedAddresses.contains(killProcess->address));
 				                }
 				*/
 			}
@@ -509,6 +509,45 @@ struct RemoveServersSafelyWorkload : TestWorkload {
 		}
 
 		return killProcArray;
+	}
+
+	// If a process is rebooted, it's processid will change. So we need to monitor
+	// such changes and re-issue the locality-based exclusion again.
+	ACTOR static Future<Void> checkLocalityChange(RemoveServersSafelyWorkload* self,
+	                                              Database cx,
+	                                              std::vector<AddressExclusion> toKillArray,
+	                                              std::unordered_set<std::string> origKillLocalities,
+	                                              bool markExcludeAsFailed) {
+		state std::unordered_set<std::string> killLocalities = origKillLocalities;
+
+		loop {
+			wait(delay(10.0));
+			wait(self->updateProcessIds(cx));
+			std::unordered_set<std::string> toKillLocalities = self->getLocalitiesFromAddresses(toKillArray);
+			if (toKillLocalities == killLocalities) {
+				continue;
+			}
+
+			// The kill localities have changed.
+			TraceEvent("RemoveAndKill")
+			    .detail("Step", "localities changed")
+			    .detail("OrigKillLocalities", describe(origKillLocalities))
+			    .detail("KillLocalities", describe(killLocalities))
+			    .detail("ToKillLocalities", describe(toKillLocalities))
+			    .detail("Failed", markExcludeAsFailed);
+			killLocalities = toKillLocalities;
+
+			// Include back the localities that are no longer in the kill list
+			state bool failed = true;
+			wait(includeLocalities(cx, std::vector<std::string>(), failed, true));
+			wait(includeLocalities(cx, std::vector<std::string>(), !failed, true));
+
+			// Exclude the localities that are now in the kill list
+			wait(excludeLocalities(cx, killLocalities, markExcludeAsFailed));
+			TraceEvent("RemoveAndKill")
+			    .detail("Step", "new localities excluded")
+			    .detail("Localities", describe(killLocalities));
+		}
 	}
 
 	// Attempts to exclude a set of processes, and once the exclusion is successful it kills them.
@@ -636,10 +675,10 @@ struct RemoveServersSafelyWorkload : TestWorkload {
 		    .detail("MarkExcludeAsFailed", markExcludeAsFailed);
 
 		state bool excludeLocalitiesInsteadOfServers = deterministicRandom()->coinflip();
+		state std::unordered_set<std::string> toKillLocalitiesFailed;
 		if (markExcludeAsFailed) {
-			if (excludeLocalitiesInsteadOfServers) {
-				state std::unordered_set<std::string> toKillLocalitiesFailed =
-				    self->getLocalitiesFromAddresses(toKillMarkFailedArray);
+			toKillLocalitiesFailed = self->getLocalitiesFromAddresses(toKillMarkFailedArray);
+			if (excludeLocalitiesInsteadOfServers && toKillLocalitiesFailed.size() > 0) {
 				TraceEvent("RemoveAndKill", functionId)
 				    .detail("Step", "Excluding localities with failed option")
 				    .detail("FailedAddressesSize", toKillMarkFailedArray.size())
@@ -658,8 +697,8 @@ struct RemoveServersSafelyWorkload : TestWorkload {
 			}
 		}
 
-		if (excludeLocalitiesInsteadOfServers) {
-			state std::unordered_set<std::string> toKillLocalities = self->getLocalitiesFromAddresses(toKillArray);
+		state std::unordered_set<std::string> toKillLocalities = self->getLocalitiesFromAddresses(toKillArray);
+		if (excludeLocalitiesInsteadOfServers && toKillLocalities.size() > 0) {
 			TraceEvent("RemoveAndKill", functionId)
 			    .detail("Step", "Excluding localities without failed option")
 			    .detail("AddressesSize", toKillArray.size())
@@ -680,12 +719,19 @@ struct RemoveServersSafelyWorkload : TestWorkload {
 		// We need to skip at least the quorum change if there's nothing to kill, because there might not be enough
 		// servers left alive to do a coordinators auto (?)
 		if (toKill.size()) {
-			if (!excludeLocalitiesInsteadOfServers) {
-				// Wait for removal to be safe
-				TraceEvent("RemoveAndKill", functionId)
-				    .detail("Step", "Wait For Server Exclusion")
-				    .detail("Addresses", describe(toKill))
-				    .detail("ClusterAvailable", g_simulator->isAvailable());
+			// Wait for removal to be safe
+			TraceEvent("RemoveAndKill", functionId)
+			    .detail("Step", "Wait For Server Exclusion")
+			    .detail("Addresses", describe(toKill))
+			    .detail("ClusterAvailable", g_simulator->isAvailable());
+			if (excludeLocalitiesInsteadOfServers) {
+				wait(success(checkForExcludingServers(cx, toKillArray, true /* wait for exclusion */)) ||
+				     checkLocalityChange(self,
+				                         cx,
+				                         toKillArray,
+				                         toKillLocalities,
+				                         markExcludeAsFailed && toKillLocalitiesFailed.size() > 0));
+			} else {
 				wait(success(checkForExcludingServers(cx, toKillArray, true /* wait for exclusion */)));
 			}
 
@@ -752,7 +798,7 @@ struct RemoveServersSafelyWorkload : TestWorkload {
 
 	bool killContainsProcess(AddressExclusion kill, NetworkAddress process) {
 		return kill.excludes(process) || (machineProcesses.find(kill) != machineProcesses.end() &&
-		                                  machineProcesses[kill].count(AddressExclusion(process.ip, process.port)) > 0);
+		                                  machineProcesses[kill].contains(AddressExclusion(process.ip, process.port)));
 	}
 
 	// Finds the localities list that can be excluded from the safe killable addresses list.
@@ -781,6 +827,24 @@ struct RemoveServersSafelyWorkload : TestWorkload {
 		for (const auto& l : killableLocalitiesCount) {
 			if (l.second == allLocalitiesCount[l.first]) {
 				toKillLocalities.insert(l.first);
+			}
+		}
+
+		for (const auto& processInfo : processes) {
+			AddressExclusion pAddr(processInfo->address.ip, processInfo->address.port);
+			if (std::find(addresses.begin(), addresses.end(), pAddr) != addresses.end()) {
+				std::map<std::string, std::string> localityData = processInfo->locality.getAllData();
+				bool found = false;
+				for (const auto& l : localityData) {
+					if (toKillLocalities.contains(LocalityData::ExcludeLocalityPrefix.toString() + l.first + ":" +
+					                              l.second)) {
+						found = true;
+						break;
+					}
+				}
+				if (!found) {
+					return std::unordered_set<std::string>();
+				}
 			}
 		}
 

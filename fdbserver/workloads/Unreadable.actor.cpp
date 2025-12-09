@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -166,13 +166,13 @@ struct UnreadableWorkload : TestWorkload {
 		if ((resolvedBegin.offset >= resolvedEnd.offset && resolvedBegin.getKey() >= resolvedEnd.getKey()) ||
 		    (resolvedBegin.offset >= end.offset && resolvedBegin.getKey() >= end.getKey()) ||
 		    (begin.offset >= resolvedEnd.offset && begin.getKey() >= resolvedEnd.getKey())) {
-			// RYW does not perfectly optimize this scenario, it should be readable but might unnecesarily return as
+			// RYW does not perfectly optimize this scenario, it should be readable but might unnecessarily return as
 			// unreadable
 			return;
 		}
 
 		if (resolvedEnd.getKey() == normalKeys.begin || resolvedBegin.getKey() == normalKeys.end) {
-			// RYW does not perfectly optimize this scenario, it should be readable but might unnecesarily return as
+			// RYW does not perfectly optimize this scenario, it should be readable but might unnecessarily return as
 			// unreadable
 			return;
 		}
@@ -351,7 +351,7 @@ struct UnreadableWorkload : TestWorkload {
 					key = RandomTestImpl::getRandomVersionstampKey(arena);
 					value = RandomTestImpl::getRandomValue(arena);
 					tr.atomicOp(key, value, MutationRef::SetVersionstampedKey);
-					range = getVersionstampKeyRange(arena, key, tr.getCachedReadVersion().orDefault(0), allKeys.end);
+					range = getVersionstampKeyRange(arena, key, tr.getCachedReadVersion(), allKeys.end);
 					unreadableMap.insert(range, true);
 					//TraceEvent("RYWT_SetVersionstampKey").detail("Range", printable(range));
 				} else if (r == 16) {

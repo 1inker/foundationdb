@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -81,7 +81,8 @@ public:
 	// TODO: refactor this to separate out the "deal with blob store" stuff from the backup business logic
 	static Reference<BackupContainerFileSystem> openContainerFS(const std::string& url,
 	                                                            const Optional<std::string>& proxy,
-	                                                            const Optional<std::string>& encryptionKeyFileName);
+	                                                            const Optional<std::string>& encryptionKeyFileName,
+	                                                            bool isBackup = true);
 
 	// Get a list of fileNames and their sizes in the container under the given path
 	// Although not required, an implementation can avoid traversing unwanted subfolders
@@ -180,7 +181,7 @@ private:
 		Future<Void> clear();
 	};
 
-	// To avoid the need to scan the underyling filesystem in many cases, some important version boundaries are stored
+	// To avoid the need to scan the underlying filesystem in many cases, some important version boundaries are stored
 	// in named files. These versions also indicate what version ranges are known to be deleted or partially deleted.
 	//
 	// The values below describe version ranges as follows:

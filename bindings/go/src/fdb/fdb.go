@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2018 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,7 +22,7 @@
 
 package fdb
 
-// #define FDB_API_VERSION 720
+// #define FDB_API_VERSION 740
 // #include <foundationdb/fdb_c.h>
 // #include <stdlib.h>
 import "C"
@@ -31,10 +31,20 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"log"
-	"runtime"
 	"sync"
 	"unsafe"
+)
+
+var (
+	// ErrNetworkAlreadyStopped for multiple calls to StopNetwork().
+	ErrNetworkAlreadyStopped = errors.New("network has already been stopped")
+
+	// ErrNetworkIsStopped is returned when attempting to execute a function which needs to interact
+	// with the network thread while the network thread is no more running.
+	ErrNetworkIsStopped = errors.New("network is stopped")
+
+	// ErrNetworkAlreadyStopped for a too early call to StopNetwork().
+	ErrNetworkNotStarted = errors.New("network has not been started")
 )
 
 // Would put this in futures.go but for the documented issue with
@@ -109,8 +119,9 @@ func (opt NetworkOptions) setOpt(code int, param []byte) error {
 // version is not supported by both the fdb package and the FoundationDB C
 // library, an error will be returned. APIVersion must be called prior to any
 // other functions in the fdb package.
+// This function is safe to be called from multiple goroutines.
 //
-// Currently, this package supports API versions 200 through 720.
+// Currently, this package supports API versions 200 through 740.
 //
 // Warning: When using the multi-version client API, setting an API version that
 // is not supported by a particular client library will prevent that client from
@@ -118,7 +129,7 @@ func (opt NetworkOptions) setOpt(code int, param []byte) error {
 // the API version of your application after upgrading your client until the
 // cluster has also been upgraded.
 func APIVersion(version int) error {
-	headerVersion := 720
+	headerVersion := 740
 
 	networkMutex.Lock()
 	defer networkMutex.Unlock()
@@ -193,44 +204,96 @@ func MustGetAPIVersion() int {
 }
 
 var apiVersion int
-var networkStarted bool
-var networkMutex sync.Mutex
+var networkStarted, networkStopped bool
+var networkMutex sync.RWMutex
+var networkRunning sync.WaitGroup
 
-var openDatabases map[string]Database
+var openDatabases sync.Map
 
-func init() {
-	openDatabases = make(map[string]Database)
-}
+// executeWithRunningNetworkThread starts the internal network event loop, if not already done,
+// then runs the provided function while network thread is running.
+// This function is safe to be called from multiple goroutines.
+func executeWithRunningNetworkThread(f func()) error {
+	networkMutex.RLock()
+	if networkStopped {
+		networkMutex.RUnlock()
 
-func startNetwork() error {
-	if e := C.fdb_setup_network(); e != 0 {
-		return Error{int(e)}
+		return ErrNetworkIsStopped
 	}
 
-	go func() {
-		e := C.fdb_run_network()
-		if e != 0 {
-			log.Printf("Unhandled error in FoundationDB network thread: %v (%v)\n", C.GoString(C.fdb_get_error(e)), e)
-		}
-	}()
+	if networkStarted {
 
-	networkStarted = true
+		// network thread is guaranteed to be running while this user-provided function runs
+		f()
+
+		networkMutex.RUnlock()
+		return nil
+	}
+	// release read lock and acquire write lock
+	networkMutex.RUnlock()
+	networkMutex.Lock()
+	defer networkMutex.Unlock()
+
+	if networkStopped {
+		return ErrNetworkIsStopped
+	}
+
+	// check if meanwhile another goroutine started the network thread
+	if !networkStarted {
+		if e := C.fdb_setup_network(); e != 0 {
+			return Error{int(e)}
+		}
+
+		networkRunning.Add(1)
+		go func() {
+			e := C.fdb_run_network()
+			networkRunning.Done()
+			if e != 0 {
+				panic(fmt.Sprintf("Unhandled error in FoundationDB network thread: %v (%v)\n", C.GoString(C.fdb_get_error(e)), e))
+			}
+		}()
+
+		networkStarted = true
+	}
+
+	// network thread is guaranteed to be running while this user-provided function runs
+	f()
 
 	return nil
 }
 
 // Deprecated: the network is started automatically when a database is opened.
-// StartNetwork initializes the FoundationDB client networking engine. StartNetwork
-// must not be called more than once.
+// StartNetwork does nothing, but it will ensure that the API version is set and return an error otherwise.
 func StartNetwork() error {
-	networkMutex.Lock()
-	defer networkMutex.Unlock()
-
 	if apiVersion == 0 {
 		return errAPIVersionUnset
 	}
 
-	return startNetwork()
+	return nil
+}
+
+// StopNetwork signals the internal network event loop to terminate and waits for its termination.
+// This function is safe to be called from multiple goroutines.
+// This function returns an error if network has not yet started or if network has already been stopped.
+// See also: https://github.com/apple/foundationdb/issues/3015
+func StopNetwork() error {
+	networkMutex.Lock()
+	defer networkMutex.Unlock()
+
+	if !networkStarted {
+		return ErrNetworkNotStarted
+	}
+
+	if networkStopped {
+		return ErrNetworkAlreadyStopped
+	}
+
+	C.fdb_stop_network()
+	networkRunning.Wait()
+
+	networkStopped = true
+
+	return nil
 }
 
 // DefaultClusterFile should be passed to fdb.Open to allow the FoundationDB C
@@ -265,38 +328,21 @@ func MustOpenDefault() Database {
 // clusters simultaneously, with each invocation requiring its own cluster file.
 // To connect to multiple clusters running at different, incompatible versions,
 // the multi-version client API must be used.
+// Caller must call Close() to release resources.
 func OpenDatabase(clusterFile string) (Database, error) {
-	if err := ensureNetworkIsStarted(); err != nil {
-		return Database{}, err
-	}
-
-	db, ok := openDatabases[clusterFile]
-	if !ok {
+	var db Database
+	var okDb bool
+	anyy, exist := openDatabases.Load(clusterFile)
+	if db, okDb = anyy.(Database); !exist || !okDb {
 		var e error
 		db, e = createDatabase(clusterFile)
 		if e != nil {
 			return Database{}, e
 		}
-		openDatabases[clusterFile] = db
+		openDatabases.Store(clusterFile, db)
 	}
 
 	return db, nil
-}
-
-// ensureNetworkIsStarted starts the network if not already done and ensures that the API version is set.
-func ensureNetworkIsStarted() error {
-	networkMutex.Lock()
-	defer networkMutex.Unlock()
-
-	if apiVersion == 0 {
-		return errAPIVersionUnset
-	}
-
-	if !networkStarted {
-		return startNetwork()
-	}
-
-	return nil
 }
 
 // MustOpenDatabase is like OpenDatabase but panics if the default database cannot
@@ -328,7 +374,13 @@ func MustOpen(clusterFile string, dbName []byte) Database {
 	return db
 }
 
+// createDatabase is the internal function used to create a database.
+// Caller must call Close() to release resources.
 func createDatabase(clusterFile string) (Database, error) {
+	if apiVersion == 0 {
+		return Database{}, errAPIVersionUnset
+	}
+
 	var cf *C.char
 
 	if len(clusterFile) != 0 {
@@ -337,22 +389,30 @@ func createDatabase(clusterFile string) (Database, error) {
 	}
 
 	var outdb *C.FDBDatabase
-	if err := C.fdb_create_database(cf, &outdb); err != 0 {
-		return Database{}, Error{int(err)}
+	var createErr error
+	if err := executeWithRunningNetworkThread(func() {
+		if err := C.fdb_create_database(cf, &outdb); err != 0 {
+			createErr = Error{int(err)}
+		}
+	}); err != nil {
+		return Database{}, err
+	}
+	if createErr != nil {
+		return Database{}, createErr
 	}
 
 	db := &database{outdb}
-	runtime.SetFinalizer(db, (*database).destroy)
 
-	return Database{clusterFile, true, db}, nil
+	return Database{clusterFile: clusterFile, isCached: true, database: db}, nil
 }
 
 // OpenWithConnectionString returns a database handle to the FoundationDB cluster identified
 // by the provided connection string. This method can be useful for scenarios where you want to connect
 // to the database only for a short time e.g. to test different connection strings.
+// Caller must call Close() to release resources.
 func OpenWithConnectionString(connectionString string) (Database, error) {
-	if err := ensureNetworkIsStarted(); err != nil {
-		return Database{}, err
+	if apiVersion == 0 {
+		return Database{}, errAPIVersionUnset
 	}
 
 	var cf *C.char
@@ -365,12 +425,19 @@ func OpenWithConnectionString(connectionString string) (Database, error) {
 	defer C.free(unsafe.Pointer(cf))
 
 	var outdb *C.FDBDatabase
-	if err := C.fdb_create_database_from_connection_string(cf, &outdb); err != 0 {
-		return Database{}, Error{int(err)}
+	var createErr error
+	if err := executeWithRunningNetworkThread(func() {
+		if err := C.fdb_create_database_from_connection_string(cf, &outdb); err != 0 {
+			createErr = Error{int(err)}
+		}
+	}); err != nil {
+		return Database{}, err
+	}
+	if createErr != nil {
+		return Database{}, createErr
 	}
 
 	db := &database{outdb}
-	runtime.SetFinalizer(db, (*database).destroy)
 
 	return Database{"", false, db}, nil
 }
@@ -378,6 +445,7 @@ func OpenWithConnectionString(connectionString string) (Database, error) {
 // Deprecated: Use OpenDatabase instead.
 // CreateCluster returns a cluster handle to the FoundationDB cluster identified
 // by the provided cluster file.
+// This function is safe to be called from multiple goroutines.
 func CreateCluster(clusterFile string) (Cluster, error) {
 	networkMutex.Lock()
 	defer networkMutex.Unlock()
@@ -388,6 +456,10 @@ func CreateCluster(clusterFile string) (Cluster, error) {
 
 	if !networkStarted {
 		return Cluster{}, errNetworkNotSetup
+	}
+
+	if networkStopped {
+		return Cluster{}, ErrNetworkIsStopped
 	}
 
 	return Cluster{clusterFile}, nil

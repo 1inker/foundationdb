@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -27,9 +27,6 @@
 #include "flow/serialize.h"
 #include "flow/UnitTest.h"
 
-FDB_DEFINE_BOOLEAN_PARAM(AssignEmptyRange);
-FDB_DEFINE_BOOLEAN_PARAM(UnassignShard);
-
 const KeyRef systemKeysPrefix = "\xff"_sr;
 const KeyRangeRef normalKeys(KeyRef(), systemKeysPrefix);
 const KeyRangeRef systemKeys(systemKeysPrefix, "\xff\xff"_sr);
@@ -37,6 +34,24 @@ const KeyRangeRef nonMetadataSystemKeys("\xff\x02"_sr, "\xff\x03"_sr);
 const KeyRangeRef allKeys = KeyRangeRef(normalKeys.begin, systemKeys.end);
 const KeyRef afterAllKeys = "\xff\xff\x00"_sr;
 const KeyRangeRef specialKeys = KeyRangeRef("\xff\xff"_sr, "\xff\xff\xff"_sr);
+
+SystemKey::SystemKey(Key const& k) : Key(k) {
+	// In simulation, if k is not in the known key set then make sure no known key is a prefix of it, then add it to the
+	// known set.
+	if (g_network->isSimulated()) {
+		static std::unordered_set<Key> knownKeys;
+
+		if (!knownKeys.contains(k)) {
+			for (auto& known : knownKeys) {
+				if (k.startsWith(known) || known.startsWith(k)) {
+					TraceEvent(SevError, "SystemKeyPrefixConflict").detail("NewKey", k).detail("ExistingKey", known);
+					UNSTOPPABLE_ASSERT(false);
+				}
+			}
+			knownKeys.insert(k);
+		}
+	}
+}
 
 // keyServersKeys.contains(k) iff k.startsWith(keyServersPrefix)
 const KeyRangeRef keyServersKeys("\xff/keyServers/"_sr, "\xff/keyServers0"_sr);
@@ -47,8 +62,9 @@ const KeyRangeRef keyServersKeyServersKeys("\xff/keyServers/\xff/keyServers/"_sr
 const KeyRef keyServersKeyServersKey = keyServersKeyServersKeys.begin;
 
 // These constants are selected to be easily recognized during debugging.
+// Note that the last bit of the following constants is 0, indicating that physical shard move is disabled.
 const UID anonymousShardId = UID(0x666666, 0x88888888);
-const uint64_t emptyShardId = 0x7777777;
+const uint64_t emptyShardId = 0x2222222;
 
 const Key keyServersKey(const KeyRef& k) {
 	return k.withPrefix(keyServersPrefix);
@@ -66,31 +82,17 @@ const Value keyServersValue(RangeResult result, const std::vector<UID>& src, con
 	std::vector<Tag> srcTag;
 	std::vector<Tag> destTag;
 
-	bool foundOldLocality = false;
 	for (const KeyValueRef& kv : result) {
 		UID uid = decodeServerTagKey(kv.key);
 		if (std::find(src.begin(), src.end(), uid) != src.end()) {
 			srcTag.push_back(decodeServerTagValue(kv.value));
-			if (srcTag.back().locality == tagLocalityUpgraded) {
-				foundOldLocality = true;
-				break;
-			}
 		}
 		if (std::find(dest.begin(), dest.end(), uid) != dest.end()) {
 			destTag.push_back(decodeServerTagValue(kv.value));
-			if (destTag.back().locality == tagLocalityUpgraded) {
-				foundOldLocality = true;
-				break;
-			}
 		}
 	}
 
-	if (foundOldLocality || src.size() != srcTag.size() || dest.size() != destTag.size()) {
-		ASSERT_WE_THINK(foundOldLocality);
-		BinaryWriter wr(IncludeVersion(ProtocolVersion::withKeyServerValue()));
-		wr << src << dest;
-		return wr.toValue();
-	}
+	ASSERT_WE_THINK(src.size() == srcTag.size() && dest.size() == destTag.size());
 
 	return keyServersValue(srcTag, destTag);
 }
@@ -287,10 +289,25 @@ const KeyRangeRef readConflictRangeKeysRange =
 const KeyRangeRef writeConflictRangeKeysRange = KeyRangeRef("\xff\xff/transaction/write_conflict_range/"_sr,
                                                             "\xff\xff/transaction/write_conflict_range/\xff\xff"_sr);
 
+const KeyRef accumulativeChecksumKey = "\xff\xff/accumulativeChecksum"_sr;
+
+const Value accumulativeChecksumValue(const AccumulativeChecksumState& acsState) {
+	return ObjectWriter::toValue(acsState, IncludeVersion());
+}
+
+AccumulativeChecksumState decodeAccumulativeChecksum(const ValueRef& value) {
+	AccumulativeChecksumState acsState;
+	ObjectReader reader(value.begin(), IncludeVersion());
+	reader.deserialize(acsState);
+	return acsState;
+}
+
 const KeyRangeRef auditKeys = KeyRangeRef("\xff/audits/"_sr, "\xff/audits0"_sr);
 const KeyRef auditPrefix = auditKeys.begin;
 const KeyRangeRef auditRanges = KeyRangeRef("\xff/auditRanges/"_sr, "\xff/auditRanges0"_sr);
 const KeyRef auditRangePrefix = auditRanges.begin;
+const KeyRangeRef auditServers = KeyRangeRef("\xff/auditServers/"_sr, "\xff/auditServers0"_sr);
+const KeyRef auditServerPrefix = auditServers.begin;
 
 const Key auditKey(const AuditType type, const UID& auditId) {
 	BinaryWriter wr(Unversioned());
@@ -309,21 +326,62 @@ const KeyRange auditKeyRange(const AuditType type) {
 	return prefixRange(wr.toValue());
 }
 
-const Key auditRangeKey(const UID& auditId, const KeyRef& key) {
+const Key auditRangeBasedProgressPrefixFor(const AuditType type, const UID& auditId) {
 	BinaryWriter wr(Unversioned());
 	wr.serializeBytes(auditRangePrefix);
-	wr << auditId;
+	wr << static_cast<uint8_t>(type);
 	wr.serializeBytes("/"_sr);
-	wr.serializeBytes(key);
+	wr << bigEndian64(auditId.first());
+	wr.serializeBytes("/"_sr);
 	return wr.toValue();
 }
 
-const Key auditRangePrefixFor(const UID& auditId) {
+const KeyRange auditRangeBasedProgressRangeFor(const AuditType type, const UID& auditId) {
 	BinaryWriter wr(Unversioned());
-	wr.serializeBytes(auditPrefix);
-	wr << auditId;
+	wr.serializeBytes(auditRangePrefix);
+	wr << static_cast<uint8_t>(type);
+	wr.serializeBytes("/"_sr);
+	wr << bigEndian64(auditId.first());
+	wr.serializeBytes("/"_sr);
+	return prefixRange(wr.toValue());
+}
+
+const KeyRange auditRangeBasedProgressRangeFor(const AuditType type) {
+	BinaryWriter wr(Unversioned());
+	wr.serializeBytes(auditRangePrefix);
+	wr << static_cast<uint8_t>(type);
+	wr.serializeBytes("/"_sr);
+	return prefixRange(wr.toValue());
+}
+
+const Key auditServerBasedProgressPrefixFor(const AuditType type, const UID& auditId, const UID& serverId) {
+	BinaryWriter wr(Unversioned());
+	wr.serializeBytes(auditServerPrefix);
+	wr << static_cast<uint8_t>(type);
+	wr.serializeBytes("/"_sr);
+	wr << bigEndian64(auditId.first());
+	wr.serializeBytes("/"_sr);
+	wr << bigEndian64(serverId.first());
 	wr.serializeBytes("/"_sr);
 	return wr.toValue();
+}
+
+const KeyRange auditServerBasedProgressRangeFor(const AuditType type, const UID& auditId) {
+	BinaryWriter wr(Unversioned());
+	wr.serializeBytes(auditServerPrefix);
+	wr << static_cast<uint8_t>(type);
+	wr.serializeBytes("/"_sr);
+	wr << bigEndian64(auditId.first());
+	wr.serializeBytes("/"_sr);
+	return prefixRange(wr.toValue());
+}
+
+const KeyRange auditServerBasedProgressRangeFor(const AuditType type) {
+	BinaryWriter wr(Unversioned());
+	wr.serializeBytes(auditServerPrefix);
+	wr << static_cast<uint8_t>(type);
+	wr.serializeBytes("/"_sr);
+	return prefixRange(wr.toValue());
 }
 
 const Value auditStorageStateValue(const AuditStorageState& auditStorageState) {
@@ -457,7 +515,11 @@ const ValueRef serverKeysTrue = "1"_sr, // compatible with what was serverKeysTr
     serverKeysTrueEmptyRange = "3"_sr, // the server treats the range as empty.
     serverKeysFalse;
 
-const UID newShardId(const uint64_t physicalShardId, AssignEmptyRange assignEmptyRange, UnassignShard unassignShard) {
+const UID newDataMoveId(const uint64_t physicalShardId,
+                        AssignEmptyRange assignEmptyRange,
+                        const DataMoveType type,
+                        const DataMovementReason reason,
+                        UnassignShard unassignShard) {
 	uint64_t split = 0;
 	if (assignEmptyRange) {
 		split = emptyShardId;
@@ -466,6 +528,12 @@ const UID newShardId(const uint64_t physicalShardId, AssignEmptyRange assignEmpt
 	} else {
 		do {
 			split = deterministicRandom()->randomUInt64();
+			// Clear the lower 16 bits
+			split = (~0xFFFF) & split;
+			// Set DataMoveType to the lower [0, 8) bits
+			split = split | static_cast<uint64_t>(type);
+			// Set DataMovementReason to the lower [8, 16) bits
+			split = split | (static_cast<uint64_t>(reason) << 8);
 		} while (split == anonymousShardId.second() || split == 0 || split == emptyShardId);
 	}
 	return UID(physicalShardId, split);
@@ -505,9 +573,11 @@ std::pair<UID, Key> serverKeysDecodeServerBegin(const KeyRef& key) {
 }
 
 bool serverHasKey(ValueRef storedValue) {
-	UID teamId;
+	UID shardId;
 	bool assigned, emptyRange;
-	decodeServerKeysValue(storedValue, assigned, emptyRange, teamId);
+	DataMoveType dataMoveType = DataMoveType::LOGICAL;
+	DataMovementReason dataMoveReason = DataMovementReason::INVALID;
+	decodeServerKeysValue(storedValue, assigned, emptyRange, dataMoveType, shardId, dataMoveReason);
 	return assigned;
 }
 
@@ -521,7 +591,62 @@ const Value serverKeysValue(const UID& id) {
 	return wr.toValue();
 }
 
-void decodeServerKeysValue(const ValueRef& value, bool& assigned, bool& emptyRange, UID& id) {
+void decodeDataMoveId(const UID& id,
+                      bool& assigned,
+                      bool& emptyRange,
+                      DataMoveType& dataMoveType,
+                      DataMovementReason& dataMoveReason) {
+	dataMoveType = DataMoveType::LOGICAL;
+	dataMoveReason = DataMovementReason::INVALID;
+	assigned = id.second() != 0LL;
+	emptyRange = id.second() == emptyShardId;
+	if (assigned && !emptyRange && id != anonymousShardId) {
+		dataMoveType = static_cast<DataMoveType>(0xFF & id.second());
+		if (dataMoveType >= DataMoveType::NUMBER_OF_TYPES || dataMoveType < DataMoveType::LOGICAL) {
+			TraceEvent(SevWarnAlways, "DecodeDataMoveIdError")
+			    .detail("Reason", "DataMoveTypeOutScope")
+			    .detail("Value", dataMoveType)
+			    .detail("DataMoveID", id)
+			    .detail("SplitIDToDecode", id.second());
+			dataMoveType = DataMoveType::LOGICAL;
+			// When upgrade from a release 7.3.x where dataMoveType is not encoded in
+			// datamove id, the decoded dataMoveType can be out of scope.
+			// For this case, we set it to DataMoveType::LOGICAL.
+			// It is possible that the new binary decodes a wrong data move type.
+			// However, it only affects whether dest SSes use physical shard move
+			// to get the data from the source server.
+			// When SS decodes a data move type, SS checks whether its KVStore supports
+			// the data move type. If no, SS will use DataMoveType::LOGICAL by default.
+		}
+		dataMoveReason = static_cast<DataMovementReason>(0xFF & (id.second() >> 8));
+		if (dataMoveReason >= DataMovementReason::NUMBER_OF_REASONS || dataMoveReason < DataMovementReason::INVALID) {
+			TraceEvent(SevWarnAlways, "DecodeDataMoveIdError")
+			    .detail("Reason", "DataMoveReasonOutScope")
+			    .detail("Value", dataMoveReason)
+			    .detail("DataMoveID", id)
+			    .detail("SplitIDToDecode", id.second());
+			dataMoveReason = DataMovementReason::INVALID;
+			// When upgrade from release-7.3 where dataMoveReason is not encoded in
+			// datamove id, the decoded reason can be out of scope.
+			// For this case, we set it to DataMovementReason::INVALID.
+			// Currently, this is only used by priority-based fetchKeys throttling.
+			// It is possible that the new binary decodes a wrong data move reason.
+			// However, it only effects the throttling decison made by the fetchKeys.
+			// If the fetchKeys throttling is enabled and it misbehaves after the upgrading
+			// from release-7.3, users can temporarily disable the feature until the old data moves
+			// have been consumed.
+		}
+	}
+}
+
+void decodeServerKeysValue(const ValueRef& value,
+                           bool& assigned,
+                           bool& emptyRange,
+                           DataMoveType& dataMoveType,
+                           UID& id,
+                           DataMovementReason& dataMoveReason) {
+	dataMoveType = DataMoveType::LOGICAL;
+	dataMoveReason = DataMovementReason::INVALID;
 	if (value.size() == 0) {
 		assigned = false;
 		emptyRange = false;
@@ -542,8 +667,7 @@ void decodeServerKeysValue(const ValueRef& value, bool& assigned, bool& emptyRan
 		BinaryReader rd(value, IncludeVersion());
 		ASSERT(rd.protocolVersion().hasShardEncodeLocationMetaData());
 		rd >> id;
-		assigned = id.second() != 0;
-		emptyRange = id.second() == emptyShardId;
+		decodeDataMoveId(id, assigned, emptyRange, dataMoveType, dataMoveReason);
 	}
 }
 
@@ -610,7 +734,20 @@ UID decodeTssQuarantineKey(KeyRef const& key) {
 
 const KeyRangeRef tssMismatchKeys("\xff/tssMismatch/"_sr, "\xff/tssMismatch0"_sr);
 
+const KeyRef serverMetadataChangeKey = "\xff\x02/serverMetadataChanges"_sr;
 const KeyRangeRef serverMetadataKeys("\xff/serverMetadata/"_sr, "\xff/serverMetadata0"_sr);
+
+UID decodeServerMetadataKey(const KeyRef& key) {
+	// Key is packed by KeyBackedObjectMap::packKey
+	return TupleCodec<UID>::unpack(key.removePrefix(serverMetadataKeys.begin));
+}
+
+StorageMetadataType decodeServerMetadataValue(const KeyRef& value) {
+	StorageMetadataType type;
+	ObjectReader rd(value.begin(), IncludeVersion());
+	rd.deserialize(type);
+	return type;
+}
 
 const KeyRangeRef serverTagKeys("\xff/serverTag/"_sr, "\xff/serverTag0"_sr);
 
@@ -680,21 +817,8 @@ Version decodeServerTagHistoryKey(KeyRef const& key) {
 Tag decodeServerTagValue(ValueRef const& value) {
 	Tag s;
 	BinaryReader reader(value, IncludeVersion());
-	if (!reader.protocolVersion().hasTagLocality()) {
-		int16_t id;
-		reader >> id;
-		if (id == invalidTagOld) {
-			s = invalidTag;
-		} else if (id == txsTagOld) {
-			s = txsTag;
-		} else {
-			ASSERT(id >= 0);
-			s.id = id;
-			s.locality = tagLocalityUpgraded;
-		}
-	} else {
-		reader >> s;
-	}
+	ASSERT_WE_THINK(reader.protocolVersion().hasTagLocality());
+	reader >> s;
 	return s;
 }
 
@@ -819,10 +943,7 @@ StorageServerInterface decodeServerListValue(ValueRef const& value) {
 	StorageServerInterface s;
 	BinaryReader reader(value, IncludeVersion());
 
-	if (!reader.protocolVersion().hasStorageInterfaceReadiness()) {
-		reader >> s;
-		return s;
-	}
+	ASSERT_WE_THINK(reader.protocolVersion().hasStorageInterfaceReadiness());
 
 	return decodeServerListValueFB(value);
 }
@@ -893,8 +1014,6 @@ const KeyRef perpetualStorageWiggleStatsPrefix("\xff/storageWiggleStats/"_sr); /
 const KeyRef perpetualStorageWigglePrefix("\xff/storageWiggle/"_sr);
 
 const KeyRef triggerDDTeamInfoPrintKey("\xff/triggerDDTeamInfoPrint"_sr);
-
-const KeyRef consistencyScanInfoKey = "\xff/consistencyScanInfo"_sr;
 
 const KeyRef encryptionAtRestModeConfKey("\xff/conf/encryption_at_rest_mode"_sr);
 const KeyRef tenantModeConfKey("\xff/conf/tenant_mode"_sr);
@@ -1063,6 +1182,7 @@ const KeyRef primaryLocalityKey = "\xff/globals/primaryLocality"_sr;
 const KeyRef primaryLocalityPrivateKey = "\xff\xff/globals/primaryLocality"_sr;
 const KeyRef fastLoggingEnabled = "\xff/globals/fastLoggingEnabled"_sr;
 const KeyRef fastLoggingEnabledPrivateKey = "\xff\xff/globals/fastLoggingEnabled"_sr;
+const KeyRef constructDataKey = "\xff/globals/constructData"_sr;
 
 // Whenever configuration changes or DD related system keyspace is changed(e.g.., serverList),
 // actor must grab the moveKeysLockOwnerKey and update moveKeysLockWriteKey.
@@ -1073,6 +1193,67 @@ const KeyRef moveKeysLockWriteKey = "\xff/moveKeysLock/Write"_sr;
 
 const KeyRef dataDistributionModeKey = "\xff/dataDistributionMode"_sr;
 const UID dataDistributionModeLock = UID(6345, 3425);
+
+// Bulk loading keys
+const KeyRef bulkLoadModeKey = "\xff/bulkLoadMode"_sr;
+const KeyRangeRef bulkLoadKeys = KeyRangeRef("\xff/bulkLoad/"_sr, "\xff/bulkLoad0"_sr);
+const KeyRef bulkLoadPrefix = bulkLoadKeys.begin;
+
+const Value bulkLoadStateValue(const BulkLoadState& bulkLoadState) {
+	return ObjectWriter::toValue(bulkLoadState, IncludeVersion());
+}
+
+BulkLoadState decodeBulkLoadState(const ValueRef& value) {
+	BulkLoadState bulkLoadState;
+	ObjectReader reader(value.begin(), IncludeVersion());
+	reader.deserialize(bulkLoadState);
+	return bulkLoadState;
+}
+
+// Range Lock
+const std::string rangeLockNameForBulkLoad = "BulkLoad";
+
+const KeyRangeRef rangeLockKeys = KeyRangeRef("\xff/rangeLock/"_sr, "\xff/rangeLock0"_sr);
+const KeyRef rangeLockPrefix = rangeLockKeys.begin;
+
+const Value rangeLockStateSetValue(const RangeLockStateSet& rangeLockStateSet) {
+	return ObjectWriter::toValue(rangeLockStateSet, IncludeVersion());
+}
+
+RangeLockStateSet decodeRangeLockStateSet(const ValueRef& value) {
+	RangeLockStateSet rangeLockStateSet;
+	ObjectReader reader(value.begin(), IncludeVersion());
+	reader.deserialize(rangeLockStateSet);
+	return rangeLockStateSet;
+}
+
+const KeyRangeRef rangeLockOwnerKeys = KeyRangeRef("\xff/rangeLockOwner/"_sr, "\xff/rangeLockOwner0"_sr);
+const KeyRef rangeLockOwnerPrefix = rangeLockOwnerKeys.begin;
+
+const Key rangeLockOwnerKeyFor(const RangeLockOwnerName& ownerUniqueID) {
+	BinaryWriter wr(Unversioned());
+	wr.serializeBytes(rangeLockOwnerPrefix);
+	wr.serializeBytes(StringRef(ownerUniqueID));
+	return wr.toValue();
+}
+
+const RangeLockOwnerName decodeRangeLockOwnerKey(const KeyRef& key) {
+	std::string ownerUniqueID;
+	BinaryReader rd(key.removePrefix(rangeLockOwnerPrefix), Unversioned());
+	rd >> ownerUniqueID;
+	return ownerUniqueID;
+}
+
+const Value rangeLockOwnerValue(const RangeLockOwner& rangeLockOwner) {
+	return ObjectWriter::toValue(rangeLockOwner, IncludeVersion());
+}
+
+RangeLockOwner decodeRangeLockOwner(const ValueRef& value) {
+	RangeLockOwner rangeLockOwner;
+	ObjectReader reader(value.begin(), IncludeVersion());
+	reader.deserialize(rangeLockOwner);
+	return rangeLockOwner;
+}
 
 // Keys to view and control tag throttling
 const KeyRangeRef tagThrottleKeys = KeyRangeRef("\xff\x02/throttledTags/tag/"_sr, "\xff\x02/throttledTags/tag0"_sr);
@@ -1110,6 +1291,9 @@ const KeyRangeRef applyLogKeys("\xff\x02/alog/"_sr, "\xff\x02/alog0"_sr);
 bool isBackupLogMutation(const MutationRef& m) {
 	return isSingleKeyMutation((MutationRef::Type)m.type) &&
 	       (backupLogKeys.contains(m.param1) || applyLogKeys.contains(m.param1));
+}
+bool isAccumulativeChecksumMutation(const MutationRef& m) {
+	return m.type == MutationRef::SetValue && m.param1 == accumulativeChecksumKey;
 }
 // static_assert( backupLogKeys.begin.size() == backupLogPrefixBytes, "backupLogPrefixBytes incorrect" );
 const KeyRef backupVersionKey = "\xff/backupDataFormat"_sr;
@@ -1189,6 +1373,26 @@ Key uidPrefixKey(KeyRef keyPrefix, UID logUid) {
 	bw.serializeBytes(keyPrefix);
 	bw << logUid;
 	return bw.toValue();
+}
+
+std::tuple<Standalone<StringRef>, uint64_t, uint64_t, uint64_t> decodeConstructKeys(ValueRef value) {
+	StringRef keyStart;
+	uint64_t valSize, keyCount, seed;
+	BinaryReader rd(value, Unversioned());
+	rd >> keyStart;
+	rd >> valSize;
+	rd >> keyCount;
+	rd >> seed;
+	return std::make_tuple(keyStart, valSize, keyCount, seed);
+}
+
+Value encodeConstructValue(StringRef keyStart, uint64_t valSize, uint64_t keyCount, uint64_t seed) {
+	BinaryWriter wr(Unversioned());
+	wr << keyStart;
+	wr << valSize;
+	wr << keyCount;
+	wr << seed;
+	return wr.toValue();
 }
 
 // Apply mutations constant variables
@@ -1348,6 +1552,79 @@ std::pair<Standalone<VectorRef<MutationRef>>, Version> decodeChangeFeedDurableVa
 	return std::make_pair(mutations, knownCommittedVersion);
 }
 
+const KeyRangeRef changeFeedCacheKeys("\xff\xff/cc/"_sr, "\xff\xff/cc0"_sr);
+const KeyRef changeFeedCachePrefix = changeFeedCacheKeys.begin;
+
+const Value changeFeedCacheKey(Key const& prefix, Key const& feed, KeyRange const& range, Version version) {
+	BinaryWriter wr(AssumeVersion(ProtocolVersion::withChangeFeed()));
+	wr.serializeBytes(prefix);
+	wr.serializeBytes(changeFeedCachePrefix);
+	wr << feed;
+	wr << range;
+	wr << bigEndian64(version);
+	return wr.toValue();
+}
+std::tuple<Key, KeyRange, Version> decodeChangeFeedCacheKey(KeyRef const& prefix, ValueRef const& key) {
+	Key feed;
+	KeyRange range;
+	Version version;
+	BinaryReader reader(key.removePrefix(prefix).removePrefix(changeFeedCachePrefix),
+	                    AssumeVersion(ProtocolVersion::withChangeFeed()));
+	reader >> feed;
+	reader >> range;
+	reader >> version;
+	return std::make_tuple(feed, range, bigEndian64(version));
+}
+
+// The versions of these mutations must be less than or equal to the version in the changeFeedCacheKey
+const Value changeFeedCacheValue(Standalone<VectorRef<MutationsAndVersionRef>> const& mutations) {
+	BinaryWriter wr(IncludeVersion(ProtocolVersion::withChangeFeed()));
+	wr << mutations;
+	return wr.toValue();
+}
+Standalone<VectorRef<MutationsAndVersionRef>> decodeChangeFeedCacheValue(ValueRef const& value) {
+	Standalone<VectorRef<MutationsAndVersionRef>> mutations;
+	BinaryReader reader(value, IncludeVersion());
+	reader >> mutations;
+	return mutations;
+}
+
+const KeyRangeRef changeFeedCacheFeedKeys("\xff\xff/ccd/"_sr, "\xff\xff/ccd0"_sr);
+const KeyRef changeFeedCacheFeedPrefix = changeFeedCacheFeedKeys.begin;
+
+const Value changeFeedCacheFeedKey(Key const& prefix, Key const& feed, KeyRange const& range) {
+	BinaryWriter wr(AssumeVersion(ProtocolVersion::withChangeFeed()));
+	wr.serializeBytes(changeFeedCacheFeedPrefix);
+	wr << prefix;
+	wr << feed;
+	wr << range;
+	return wr.toValue();
+}
+std::tuple<Key, Key, KeyRange> decodeChangeFeedCacheFeedKey(ValueRef const& key) {
+	Key prefix;
+	Key feed;
+	KeyRange range;
+	BinaryReader reader(key.removePrefix(changeFeedCacheFeedPrefix), AssumeVersion(ProtocolVersion::withChangeFeed()));
+	reader >> prefix;
+	reader >> feed;
+	reader >> range;
+	return std::make_tuple(prefix, feed, range);
+}
+const Value changeFeedCacheFeedValue(Version const& version, Version const& popped) {
+	BinaryWriter wr(IncludeVersion(ProtocolVersion::withChangeFeed()));
+	wr << version;
+	wr << popped;
+	return wr.toValue();
+}
+std::pair<Version, Version> decodeChangeFeedCacheFeedValue(ValueRef const& value) {
+	Version version;
+	Version popped;
+	BinaryReader reader(value, IncludeVersion());
+	reader >> version;
+	reader >> popped;
+	return std::make_pair(version, popped);
+}
+
 const KeyRef configTransactionDescriptionKey = "\xff\xff/description"_sr;
 const KeyRange globalConfigKnobKeys = singleKeyRange("\xff\xff/globalKnobs"_sr);
 const KeyRangeRef configKnobKeys("\xff\xff/knobs/"_sr, "\xff\xff/knobs0"_sr);
@@ -1357,6 +1634,7 @@ const KeyRangeRef configClassKeys("\xff\xff/configClasses/"_sr, "\xff\xff/config
 // Blob Manager + Worker stuff is all \xff\x02 to avoid Transaction State Store
 const KeyRef blobRangeChangeKey = "\xff\x02/blobRangeChange"_sr;
 const KeyRangeRef blobRangeKeys("\xff\x02/blobRange/"_sr, "\xff\x02/blobRange0"_sr);
+const KeyRangeRef blobRangeChangeLogKeys("\xff\x02/blobRangeLog/"_sr, "\xff\x02/blobRangeLog0"_sr);
 const KeyRef blobManagerEpochKey = "\xff\x02/blobManagerEpoch"_sr;
 
 const Value blobManagerEpochValueFor(int64_t epoch) {
@@ -1375,6 +1653,31 @@ int64_t decodeBlobManagerEpochValue(ValueRef const& value) {
 // blob granule data
 const KeyRef blobRangeActive = "1"_sr;
 const KeyRef blobRangeInactive = StringRef();
+
+bool isBlobRangeActive(const ValueRef& blobRangeValue) {
+	// Empty or "0" is inactive
+	// "1" is active
+	// Support future change where serialized metadata struct is also active
+	return !blobRangeValue.empty() && blobRangeValue != blobRangeInactive;
+}
+
+const Key blobRangeChangeLogReadKeyFor(Version version) {
+	BinaryWriter wr(AssumeVersion(ProtocolVersion::withBlobRangeChangeLog()));
+	wr.serializeBytes(blobRangeChangeLogKeys.begin);
+	wr << bigEndian64(version);
+	return wr.toValue();
+}
+
+const Value blobRangeChangeLogValueFor(const Standalone<BlobRangeChangeLogRef>& value) {
+	return ObjectWriter::toValue(value, IncludeVersion(ProtocolVersion::withBlobRangeChangeLog()));
+}
+
+Standalone<BlobRangeChangeLogRef> decodeBlobRangeChangeLogValue(ValueRef const& value) {
+	Standalone<BlobRangeChangeLogRef> result;
+	ObjectReader reader(value.begin(), IncludeVersion());
+	reader.deserialize(result);
+	return result;
+}
 
 const KeyRangeRef blobGranuleFileKeys("\xff\x02/bgf/"_sr, "\xff\x02/bgf0"_sr);
 const KeyRangeRef blobGranuleMappingKeys("\xff\x02/bgm/"_sr, "\xff\x02/bgm0"_sr);
@@ -1424,22 +1727,30 @@ const Value blobGranuleFileValueFor(StringRef const& filename,
                                     int64_t offset,
                                     int64_t length,
                                     int64_t fullFileLength,
+                                    int64_t logicalSize,
                                     Optional<BlobGranuleCipherKeysMeta> cipherKeysMeta) {
-	BinaryWriter wr(IncludeVersion(ProtocolVersion::withBlobGranule()));
+	auto protocolVersion = CLIENT_KNOBS->ENABLE_BLOB_GRANULE_FILE_LOGICAL_SIZE
+	                           ? ProtocolVersion::withBlobGranuleFileLogicalSize()
+	                           : ProtocolVersion::withBlobGranule();
+	BinaryWriter wr(IncludeVersion(protocolVersion));
 	wr << filename;
 	wr << offset;
 	wr << length;
 	wr << fullFileLength;
 	wr << cipherKeysMeta;
+	if (CLIENT_KNOBS->ENABLE_BLOB_GRANULE_FILE_LOGICAL_SIZE) {
+		wr << logicalSize;
+	}
 	return wr.toValue();
 }
 
-std::tuple<Standalone<StringRef>, int64_t, int64_t, int64_t, Optional<BlobGranuleCipherKeysMeta>>
+std::tuple<Standalone<StringRef>, int64_t, int64_t, int64_t, int64_t, Optional<BlobGranuleCipherKeysMeta>>
 decodeBlobGranuleFileValue(ValueRef const& value) {
 	StringRef filename;
 	int64_t offset;
 	int64_t length;
 	int64_t fullFileLength;
+	int64_t logicalSize;
 	Optional<BlobGranuleCipherKeysMeta> cipherKeysMeta;
 
 	BinaryReader reader(value, IncludeVersion());
@@ -1448,7 +1759,13 @@ decodeBlobGranuleFileValue(ValueRef const& value) {
 	reader >> length;
 	reader >> fullFileLength;
 	reader >> cipherKeysMeta;
-	return std::tuple(filename, offset, length, fullFileLength, cipherKeysMeta);
+	if (reader.protocolVersion().hasBlobGranuleFileLogicalSize()) {
+		reader >> logicalSize;
+	} else {
+		// fall back to estimating logical size as physical size
+		logicalSize = length;
+	}
+	return std::tuple(filename, offset, length, fullFileLength, logicalSize, cipherKeysMeta);
 }
 
 const Value blobGranulePurgeValueFor(Version version, KeyRange range, bool force) {
@@ -1718,67 +2035,7 @@ UID decodeBlobWorkerAffinityValue(ValueRef const& value) {
 	return id;
 }
 
-const KeyRangeRef blobRestoreCommandKeys("\xff\x02/blobRestoreCommand/"_sr, "\xff\x02/blobRestoreCommand0"_sr);
-
-const Value blobRestoreCommandKeyFor(const KeyRangeRef range) {
-	BinaryWriter wr(AssumeVersion(ProtocolVersion::withBlobGranule()));
-	wr.serializeBytes(blobRestoreCommandKeys.begin);
-	wr << range;
-	return wr.toValue();
-}
-
-const KeyRange decodeBlobRestoreCommandKeyFor(const KeyRef key) {
-	KeyRange range;
-	BinaryReader reader(key.removePrefix(blobRestoreCommandKeys.begin),
-	                    AssumeVersion(ProtocolVersion::withBlobGranule()));
-	reader >> range;
-	return range;
-}
-
-const Value blobRestoreCommandValueFor(BlobRestoreState restoreState) {
-	BinaryWriter wr(IncludeVersion(ProtocolVersion::withBlobGranule()));
-	wr << restoreState;
-	return wr.toValue();
-}
-
-Standalone<BlobRestoreState> decodeBlobRestoreState(ValueRef const& value) {
-	Standalone<BlobRestoreState> restoreState;
-	BinaryReader reader(value, IncludeVersion());
-	reader >> restoreState;
-	return restoreState;
-}
-
-const KeyRangeRef blobRestoreArgKeys("\xff\x02/blobRestoreArgs/"_sr, "\xff\x02/blobRestoreArgs0"_sr);
-
-const Value blobRestoreArgKeyFor(const KeyRangeRef range) {
-	BinaryWriter wr(AssumeVersion(ProtocolVersion::withBlobGranule()));
-	wr.serializeBytes(blobRestoreArgKeys.begin);
-	wr << range;
-	return wr.toValue();
-}
-
-const KeyRange decodeBlobRestoreArgKeyFor(const KeyRef key) {
-	KeyRange range;
-	BinaryReader reader(key.removePrefix(blobRestoreArgKeys.begin), AssumeVersion(ProtocolVersion::withBlobGranule()));
-	reader >> range;
-	return range;
-}
-
-const Value blobRestoreArgValueFor(BlobRestoreArg args) {
-	BinaryWriter wr(IncludeVersion(ProtocolVersion::withBlobGranule()));
-	wr << args;
-	return wr.toValue();
-}
-
-Standalone<BlobRestoreArg> decodeBlobRestoreArg(ValueRef const& value) {
-	Standalone<BlobRestoreArg> args;
-	BinaryReader reader(value, IncludeVersion());
-	reader >> args;
-	return args;
-}
-
 const Key blobManifestVersionKey = "\xff\x02/blobManifestVersion"_sr;
-const Key blobGranulesLastFlushKey = "\xff\x02/blobGranulesLastFlushTs"_sr;
 
 const KeyRangeRef idempotencyIdKeys("\xff\x02/idmp/"_sr, "\xff\x02/idmp0"_sr);
 const KeyRef idempotencyIdsExpiredVersion("\xff\x02/idmpExpiredVersion"_sr);
@@ -1924,6 +2181,27 @@ TEST_CASE("noSim/SystemData/compat/KeyServers") {
 	decodeAndVerify(v, anonymousShardId, UID());
 
 	printf("ssi serdes test complete\n");
+
+	return Void();
+}
+
+TEST_CASE("noSim/SystemData/DataMoveId") {
+	printf("testing data move ID encoding/decoding\n");
+	const uint64_t physicalShardId = deterministicRandom()->randomUInt64();
+	const DataMoveType type =
+	    static_cast<DataMoveType>(deterministicRandom()->randomInt(0, static_cast<int>(DataMoveType::NUMBER_OF_TYPES)));
+	const DataMovementReason reason = static_cast<DataMovementReason>(
+	    deterministicRandom()->randomInt(1, static_cast<int>(DataMovementReason::NUMBER_OF_REASONS)));
+	const UID dataMoveId = newDataMoveId(physicalShardId, AssignEmptyRange(false), type, reason, UnassignShard(false));
+
+	bool assigned, emptyRange;
+	DataMoveType decodeType;
+	DataMovementReason decodeReason = DataMovementReason::INVALID;
+	decodeDataMoveId(dataMoveId, assigned, emptyRange, decodeType, decodeReason);
+
+	ASSERT(type == decodeType && reason == decodeReason);
+
+	printf("testing data move ID encoding/decoding complete\n");
 
 	return Void();
 }

@@ -4,7 +4,7 @@
 #
 # This source file is part of the FoundationDB open source project
 #
-# Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+# Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -27,6 +27,7 @@ import base64
 import glob
 import time
 import ipaddress
+import random
 from local_cluster import TLSConfig
 from tmp_cluster import TempCluster
 from typing import Union
@@ -188,7 +189,7 @@ def cluster(
                 ):
                     apply_trace_time = float(entry.attrib["Time"])
                 if bad_trace_time is None and ev_type == bad_ev_type:
-                    bad_trace_found = float(entry.attrib["Time"])
+                    bad_trace_time = float(entry.attrib["Time"])
             if apply_trace_time is None:
                 pytest.fail(
                     f"failed to find '{keyset_apply_ev_type}' event with >0 public keys"
@@ -222,7 +223,7 @@ def cluster(
                             f"{ev_target} trace entry's FromAddr does not have a valid ':tls' suffix: found '{tls_suffix}'"
                         )
                     try:
-                        ip = ipaddress.ip_address(client_ip)
+                        ipaddress.ip_address(client_ip)
                     except ValueError as e:
                         pytest.fail(
                             f"{ev_target} trace entry's FromAddr '{client_ip}' has an invalid IP format: {e}"
@@ -304,8 +305,17 @@ def tenant_tr_gen(db, use_grv_cache):
 @pytest.fixture
 def tenant_id_from_name(db):
     def fn(tenant_name):
-        tenant = db.open_tenant(to_bytes(tenant_name))
-        return tenant.get_id().wait()  # returns int
+        while True:
+            try:
+                tenant = db.open_tenant(to_bytes(tenant_name))
+                return tenant.get_id().wait()  # returns int
+            except fdb.FDBError as e:
+                print(
+                    "retrying tenant id fetch after 0.5 second backoff due to {}".format(
+                        e
+                    )
+                )
+                time.sleep(0.5)
 
     return fn
 
@@ -319,7 +329,9 @@ def token_claim_1h(tenant_id_from_name):
         return {
             "iss": "fdb-authz-tester",
             "sub": "authz-test",
-            "aud": ["tmp-cluster"],
+            "aud": ["tmp-cluster"]
+            if random.choice([True, False])
+            else "tmp-cluster",  # too expensive to parameterize just for this
             "iat": now,
             "nbf": now - 1,
             "exp": now + 60 * 60,

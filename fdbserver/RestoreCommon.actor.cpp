@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -26,7 +26,7 @@
 // Backup agent header
 #include "fdbclient/BackupAgent.actor.h"
 #include "fdbclient/BackupContainer.h"
-#include "fdbclient/KeyBackedTypes.h"
+#include "fdbclient/KeyBackedTypes.actor.h"
 #include "fdbclient/ManagementAPI.actor.h"
 #include "fdbclient/MutationList.h"
 #include "fdbclient/NativeAPI.actor.h"
@@ -113,7 +113,7 @@ KeyBackedSet<RestoreConfigFR::RestoreFile> RestoreConfigFR::fileSet() {
 
 Future<bool> RestoreConfigFR::isRunnable(Reference<ReadYourWritesTransaction> tr) {
 	return map(stateEnum().getD(tr), [](ERestoreState s) -> bool {
-		return s != ERestoreState::ABORTED && s != ERestoreState::COMPLETED && s != ERestoreState::UNITIALIZED;
+		return s != ERestoreState::ABORTED && s != ERestoreState::COMPLETED && s != ERestoreState::UNINITIALIZED;
 	});
 }
 
@@ -303,7 +303,7 @@ Future<std::string> RestoreConfigFR::getFullStatus(Reference<ReadYourWritesTrans
 
 std::string RestoreConfigFR::toString() {
 	std::stringstream ss;
-	ss << "uid:" << uid.toString() << " prefix:" << prefix.contents().toString();
+	ss << "uid:" << uid.toString() << " prefix:" << subspace.key().contents().toString();
 	return ss.str();
 }
 

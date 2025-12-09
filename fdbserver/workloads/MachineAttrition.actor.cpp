@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -219,7 +219,7 @@ struct MachineAttritionWorkload : FailureInjectionWorkload {
 		for (const auto& worker : workers) {
 			// kill all matching workers
 			if (idAccess(worker).present() &&
-			    std::count(targets.begin(), targets.end(), idAccess(worker).get().toString())) {
+			    std::find(targets.begin(), targets.end(), idAccess(worker).get().toString()) != targets.end()) {
 				TraceEvent("SendingRebootRequest").detail("TargetWorker", worker.interf.locality.toString());
 				worker.interf.clientInterface.reboot.send(rbReq);
 			}
@@ -409,7 +409,9 @@ struct MachineAttritionWorkload : FailureInjectionWorkload {
 						CODE_PROBE(true, "Marked a zone for maintenance before killing it");
 						wait(success(
 						    setHealthyZone(cx, targetMachine.zoneId().get(), deterministicRandom()->random01() * 20)));
-					} else if (BUGGIFY_WITH_PROB(0.005)) {
+					} else if (!g_simulator->willRestart && BUGGIFY_WITH_PROB(0.005)) {
+						// don't do this in restarting test, since test could exit before it is unset, and restarted
+						// test would never unset it
 						CODE_PROBE(true, "Disable DD for all storage server failures");
 						self->ignoreSSFailures =
 						    uncancellable(ignoreSSFailuresForDuration(cx, deterministicRandom()->random01() * 5));

@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -159,7 +159,7 @@ struct VersionStampWorkload : TestWorkload {
 			cx = Database::createSimulatedExtraDatabase(g_simulator->extraDatabases[0], cx->defaultTenant);
 		}
 		state ReadYourWritesTransaction tr(cx);
-		// We specifically wish to grab the smalles read version that we can get and maintain it, to
+		// We specifically wish to grab the smallest read version that we can get and maintain it, to
 		// have the strictest check we can on versionstamps monotonically increasing.
 		state Version readVersion;
 		loop {
@@ -195,7 +195,7 @@ struct VersionStampWorkload : TestWorkload {
 				RangeResult result_ = wait(tr.getRange(
 				    KeyRangeRef(self->vsValuePrefix, endOfRange(self->vsValuePrefix)), self->nodeCount + 1));
 				result = result_;
-				if (self->allowMetadataVersionKey && self->key_commit.count(metadataVersionKey)) {
+				if (self->allowMetadataVersionKey && self->key_commit.contains(metadataVersionKey)) {
 					Optional<Value> mVal = wait(tr.get(metadataVersionKey));
 					if (mVal.present()) {
 						result.push_back_deep(result.arena(), KeyValueRef(metadataVersionKey, mVal.get()));

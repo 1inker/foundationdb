@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -69,8 +69,8 @@ private:
 					    auto val = f.get<fdb::future_var::ValueRef>();
 					    if (expectedVal != val) {
 						    error(fmt::format("cancelAfterFirstResTx mismatch. expected: {:.80} actual: {:.80}",
-						                      fdb::toCharsRef(expectedVal.value()),
-						                      fdb::toCharsRef(val.value())));
+						                      fdb::toCharsRef(expectedVal),
+						                      fdb::toCharsRef(val)));
 					    }
 					    ctx->done();
 				    });

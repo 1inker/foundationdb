@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -21,6 +21,7 @@
 #include "flow/ApiVersion.h"
 #include "fmt/format.h"
 #include "fdbbackup/BackupTLSConfig.h"
+#include "fdbbackup/Decode.h"
 #include "fdbclient/JsonBuilder.h"
 #include "flow/Arena.h"
 #include "flow/ArgParseUtil.h"
@@ -43,7 +44,7 @@
 #include "fdbclient/Status.h"
 #include "fdbclient/BackupContainer.h"
 #include "fdbclient/ClusterConnectionFile.h"
-#include "fdbclient/KeyBackedTypes.h"
+#include "fdbclient/KeyBackedTypes.actor.h"
 #include "fdbclient/IKnobCollection.h"
 #include "fdbclient/RunRYWTransaction.actor.h"
 #include "fdbclient/S3BlobStore.h"
@@ -193,6 +194,9 @@ enum {
 	OPT_DSTONLY,
 
 	OPT_TRACE_FORMAT,
+
+	// blob granules backup/restore
+	OPT_BLOB_MANIFEST_URL,
 };
 
 // Top level binary commands.
@@ -231,6 +235,7 @@ CSimpleOpt::SOption g_rgAgentOptions[] = {
 	{ OPT_HELP, "--help", SO_NONE },
 	{ OPT_DEVHELP, "--dev-help", SO_NONE },
 	{ OPT_BLOB_CREDENTIALS, "--blob-credentials", SO_REQ_SEP },
+	{ OPT_PROXY, "--proxy", SO_REQ_SEP },
 	TLS_OPTION_FLAGS,
 	SO_END_OF_OPTIONS
 };
@@ -280,6 +285,7 @@ CSimpleOpt::SOption g_rgBackupStartOptions[] = {
 	{ OPT_INCREMENTALONLY, "--incremental", SO_NONE },
 	{ OPT_ENCRYPTION_KEY_FILE, "--encryption-key-file", SO_REQ_SEP },
 	{ OPT_ENCRYPT_FILES, "--encrypt-files", SO_REQ_SEP },
+	{ OPT_BLOB_MANIFEST_URL, "--blob-manifest-url", SO_REQ_SEP },
 	TLS_OPTION_FLAGS,
 	SO_END_OF_OPTIONS
 };
@@ -314,7 +320,7 @@ CSimpleOpt::SOption g_rgBackupModifyOptions[] = {
 	{ OPT_SNAPSHOTINTERVAL, "-s", SO_REQ_SEP },
 	{ OPT_SNAPSHOTINTERVAL, "--snapshot-interval", SO_REQ_SEP },
 	{ OPT_MOD_ACTIVE_INTERVAL, "--active-snapshot-interval", SO_REQ_SEP },
-
+	TLS_OPTION_FLAGS,
 	SO_END_OF_OPTIONS
 };
 
@@ -735,6 +741,7 @@ CSimpleOpt::SOption g_rgRestoreOptions[] = {
 	{ OPT_RESTORE_BEGIN_VERSION, "--begin-version", SO_REQ_SEP },
 	{ OPT_RESTORE_INCONSISTENT_SNAPSHOT_ONLY, "--inconsistent-snapshot-only", SO_NONE },
 	{ OPT_ENCRYPTION_KEY_FILE, "--encryption-key-file", SO_REQ_SEP },
+	{ OPT_BLOB_MANIFEST_URL, "--blob-manifest-url", SO_REQ_SEP },
 	TLS_OPTION_FLAGS,
 	SO_END_OF_OPTIONS
 };
@@ -980,7 +987,7 @@ static void printAgentUsage(bool devhelp) {
 	       "                 then `%s'.\n",
 	       platform::getDefaultClusterFilePath().c_str());
 	printf("  --log          Enables trace file logging for the CLI session.\n"
-	       "  --logdir PATH  Specifes the output directory for trace files. If\n"
+	       "  --logdir PATH  Specifies the output directory for trace files. If\n"
 	       "                 unspecified, defaults to the current directory. Has\n"
 	       "                 no effect unless --log is specified.\n");
 	printf("  --loggroup LOG_GROUP\n"
@@ -1106,7 +1113,7 @@ static void printBackupUsage(bool devhelp) {
 	printf("  --partitioned-log-experimental  Starts with new type of backup system using partitioned logs.\n");
 	printf("  -n, --dryrun   For backup start or restore start, performs a trial run with no actual changes made.\n");
 	printf("  --log          Enables trace file logging for the CLI session.\n"
-	       "  --logdir PATH  Specifes the output directory for trace files. If\n"
+	       "  --logdir PATH  Specifies the output directory for trace files. If\n"
 	       "                 unspecified, defaults to the current directory. Has\n"
 	       "                 no effect unless --log is specified.\n");
 	printf("  --loggroup LOG_GROUP\n"
@@ -1131,6 +1138,10 @@ static void printBackupUsage(bool devhelp) {
 	       "either enable (1) or disable (0) encryption at rest with snapshot backups. This option refers to block "
 	       "level encryption of snapshot backups while --encryption-key-file (above) refers to file level encryption. "
 	       "Generally, these two options should not be used together.\n");
+	printf("  --blob-manifest-url URL\n"
+	       "                 Perform blob manifest backup. Manifest files are stored to the destination URL.\n"
+	       "                 Blob granules should be enabled first for manifest backup.\n");
+
 	printf(TLS_HELP);
 	printf("  -w, --wait     Wait for the backup to complete (allowed with `start' and `discontinue').\n");
 	printf("  -z, --no-stop-when-done\n"
@@ -1206,6 +1217,8 @@ static void printRestoreUsage(bool devhelp) {
 	       "instead of the entire set.\n");
 	printf("  --encryption-key-file"
 	       "                 The AES-128-GCM key in the provided file is used for decrypting backup files.\n");
+	printf("  --blob-manifest-url URL\n"
+	       "                 Restore from blob granules. Manifest files are stored to the destination URL.\n");
 	printf(TLS_HELP);
 	printf("  -v DBVERSION   The version at which the database will be restored.\n");
 	printf("  --timestamp    Instead of a numeric version, use this to specify a timestamp in %s\n",
@@ -1258,7 +1271,7 @@ static void printDBAgentUsage(bool devhelp) {
 	       "                 The path of a file containing the connection string for the\n"
 	       "                 source FoundationDB cluster.\n");
 	printf("  --log          Enables trace file logging for the CLI session.\n"
-	       "  --logdir PATH  Specifes the output directory for trace files. If\n"
+	       "  --logdir PATH  Specifies the output directory for trace files. If\n"
 	       "                 unspecified, defaults to the current directory. Has\n"
 	       "                 no effect unless --log is specified.\n");
 	printf("  --loggroup LOG_GROUP\n"
@@ -1313,7 +1326,7 @@ static void printDBBackupUsage(bool devhelp) {
 	printf("  --dstonly      Abort will not make any changes on the source cluster.\n");
 	printf(TLS_HELP);
 	printf("  --log          Enables trace file logging for the CLI session.\n"
-	       "  --logdir PATH  Specifes the output directory for trace files. If\n"
+	       "  --logdir PATH  Specifies the output directory for trace files. If\n"
 	       "                 unspecified, defaults to the current directory. Has\n"
 	       "                 no effect unless --log is specified.\n");
 	printf("  --loggroup LOG_GROUP\n"
@@ -1509,6 +1522,7 @@ DBType getDBType(std::string dbType) {
 }
 
 ACTOR Future<std::string> getLayerStatus(Reference<ReadYourWritesTransaction> tr,
+                                         IPAddress localIP,
                                          std::string name,
                                          std::string id,
                                          ProgramExe exe,
@@ -1544,6 +1558,9 @@ ACTOR Future<std::string> getLayerStatus(Reference<ReadYourWritesTransaction> tr
 	o.create("main_thread_cpu_seconds") = getProcessorTimeThread();
 	o.create("process_cpu_seconds") = getProcessorTimeProcess();
 	o.create("configured_workers") = CLIENT_KNOBS->BACKUP_TASKS_PER_AGENT;
+	o.create("processID") = ::getpid();
+	o.create("locality") = tr->getDatabase()->clientLocality.toJSON<json_spirit::mObject>();
+	o.create("networkAddress") = localIP.toString();
 
 	if (exe == ProgramExe::AGENT) {
 		static S3BlobStoreEndpoint::Stats last_stats;
@@ -1737,12 +1754,14 @@ ACTOR Future<json_spirit::mObject> getLayerStatus(Database src, std::string root
 			tr.setOption(FDBTransactionOptions::LOCK_AWARE);
 			state RangeResult kvPairs =
 			    wait(tr.getRange(KeyRangeRef(rootKey, strinc(rootKey)), GetRangeLimits::ROW_LIMIT_UNLIMITED));
-			json_spirit::mObject statusDoc;
-			JSONDoc modifier(statusDoc);
+			state json_spirit::mObject statusDoc;
+			state JSONDoc modifier(statusDoc);
 			for (auto& kv : kvPairs) {
-				json_spirit::mValue docValue;
+				state json_spirit::mValue docValue;
 				json_spirit::read_string(kv.value.toString(), docValue);
+				wait(yield());
 				modifier.absorb(docValue);
+				wait(yield());
 			}
 			JSONDoc::expires_reference_version = (uint64_t)tr.getReadVersion().get();
 			modifier.cleanOps();
@@ -1789,6 +1808,21 @@ ACTOR Future<Void> statusUpdateActor(Database statusUpdateDest,
 	state Reference<ReadYourWritesTransaction> tr(new ReadYourWritesTransaction(statusUpdateDest));
 	state Future<Void> pollRateUpdater;
 
+	// In order to report a useful networkAddress to the cluster's layer status JSON object, determine which local
+	// network interface IP will be used to talk to the cluster.  This is a blocking call, so it is only done once,
+	// and in a retry loop because if we can't connect to the cluster we can't do any work anyway.
+	state IPAddress localIP;
+
+	loop {
+		try {
+			localIP = statusUpdateDest->getConnectionRecord()->getConnectionString().determineLocalSourceIP();
+			break;
+		} catch (Error& e) {
+			TraceEvent(SevWarn, "AgentCouldNotDetermineLocalIP").error(e);
+			wait(delay(1.0));
+		}
+	}
+
 	// Register the existence of this layer in the meta key space
 	loop {
 		try {
@@ -1811,7 +1845,7 @@ ACTOR Future<Void> statusUpdateActor(Database statusUpdateDest,
 					tr->setOption(FDBTransactionOptions::ACCESS_SYSTEM_KEYS);
 					tr->setOption(FDBTransactionOptions::LOCK_AWARE);
 					state Future<std::string> futureStatusDoc =
-					    getLayerStatus(tr, name, id, exe, taskDest, Snapshot::True);
+					    getLayerStatus(tr, localIP, name, id, exe, taskDest, Snapshot::True);
 					wait(cleanupStatus(tr, rootKey, name, id));
 					std::string statusdoc = wait(futureStatusDoc);
 					tr->set(instanceKey, statusdoc);
@@ -1946,7 +1980,8 @@ ACTOR Future<Void> submitBackup(Database db,
                                 WaitForComplete waitForCompletion,
                                 StopWhenDone stopWhenDone,
                                 UsePartitionedLog usePartitionedLog,
-                                IncrementalBackupOnly incrementalBackupOnly) {
+                                IncrementalBackupOnly incrementalBackupOnly,
+                                Optional<std::string> blobManifestUrl) {
 	try {
 		state FileBackupAgent backupAgent;
 		ASSERT(!backupRanges.empty());
@@ -1999,7 +2034,9 @@ ACTOR Future<Void> submitBackup(Database db,
 			                              encryptionEnabled,
 			                              stopWhenDone,
 			                              usePartitionedLog,
-			                              incrementalBackupOnly));
+			                              incrementalBackupOnly,
+			                              {},
+			                              blobManifestUrl));
 
 			// Wait for the backup to complete, if requested
 			if (waitForCompletion) {
@@ -2316,7 +2353,8 @@ ACTOR Future<Void> runRestore(Database db,
                               std::string removePrefix,
                               OnlyApplyMutationLogs onlyApplyMutationLogs,
                               InconsistentSnapshotOnly inconsistentSnapshotOnly,
-                              Optional<std::string> encryptionKeyFile) {
+                              Optional<std::string> encryptionKeyFile,
+                              Optional<std::string> blobManifestUrl) {
 	ASSERT(!ranges.empty());
 
 	if (targetVersion != invalidVersion && !targetTimestamp.empty()) {
@@ -2360,6 +2398,9 @@ ACTOR Future<Void> runRestore(Database db,
 				    "No restore target version given, will use maximum restorable version from backup description.\n");
 
 			BackupDescription desc = wait(bc->describeBackup());
+			if (blobManifestUrl.present()) {
+				onlyApplyMutationLogs = OnlyApplyMutationLogs::True;
+			}
 
 			if (onlyApplyMutationLogs && desc.contiguousLogEnd.present()) {
 				targetVersion = desc.contiguousLogEnd.get() - 1;
@@ -2371,7 +2412,7 @@ ACTOR Future<Void> runRestore(Database db,
 			}
 
 			if (verbose) {
-				fmt::print("Ussing target restore version {}\n", targetVersion);
+				fmt::print("Using target restore version {}\n", targetVersion);
 			}
 		}
 
@@ -2392,7 +2433,8 @@ ACTOR Future<Void> runRestore(Database db,
 			                                                   onlyApplyMutationLogs,
 			                                                   inconsistentSnapshotOnly,
 			                                                   beginVersion,
-			                                                   encryptionKeyFile));
+			                                                   encryptionKeyFile,
+			                                                   blobManifestUrl));
 
 			if (waitForDone && verbose) {
 				// If restore is now complete then report version restored
@@ -2727,7 +2769,7 @@ std::pair<Version, Version> getMaxMinRestorableVersions(const BackupDescription&
 }
 
 // If restoreVersion is invalidVersion or latestVersion, use the maximum or minimum restorable version respectively for
-// selected key ranges. If restoreTimestamp is specified, any specified restoreVersion will be overriden to the version
+// selected key ranges. If restoreTimestamp is specified, any specified restoreVersion will be overridden to the version
 // resolved to that timestamp.
 ACTOR Future<Void> queryBackup(const char* name,
                                std::string destinationContainer,
@@ -3512,6 +3554,7 @@ int main(int argc, char* argv[]) {
 		bool jsonOutput = false;
 		DeleteData deleteData{ false };
 		Optional<std::string> encryptionKeyFile;
+		Optional<std::string> blobManifestUrl;
 
 		BackupModifyOptions modifyOptions;
 
@@ -3805,12 +3848,26 @@ int main(int argc, char* argv[]) {
 			case OPT_DESCRIBE_TIMESTAMPS:
 				describeTimestamps = true;
 				break;
-			case OPT_PREFIX_ADD:
-				addPrefix = args->OptionArg();
+			case OPT_PREFIX_ADD: {
+				bool err = false;
+				addPrefix = decode_hex_string(args->OptionArg(), err);
+				if (err) {
+					fprintf(stderr, "ERROR: Could not parse add prefix\n");
+					printHelpTeaser(argv[0]);
+					return FDB_EXIT_ERROR;
+				}
 				break;
-			case OPT_PREFIX_REMOVE:
-				removePrefix = args->OptionArg();
+			}
+			case OPT_PREFIX_REMOVE: {
+				bool err = false;
+				removePrefix = decode_hex_string(args->OptionArg(), err);
+				if (err) {
+					fprintf(stderr, "ERROR: Could not parse remove prefix\n");
+					printHelpTeaser(argv[0]);
+					return FDB_EXIT_ERROR;
+				}
 				break;
+			}
 			case OPT_ERRORLIMIT: {
 				const char* a = args->OptionArg();
 				if (!sscanf(a, "%d", &maxErrors)) {
@@ -3934,6 +3991,10 @@ int main(int argc, char* argv[]) {
 			case OPT_JSON:
 				jsonOutput = true;
 				break;
+			case OPT_BLOB_MANIFEST_URL: {
+				blobManifestUrl = args->OptionArg();
+				break;
+			}
 			}
 		}
 
@@ -4073,6 +4134,7 @@ int main(int argc, char* argv[]) {
 		    .detail("CommandLine", commandLine)
 		    .setMaxFieldLength(0)
 		    .detail("MemoryLimit", memLimit)
+		    .detail("Proxy", proxy.orDefault(""))
 		    .trackLatest("ProgramStart");
 
 		// Ordinarily, this is done when the network is run. However, network thread should be set before TraceEvents
@@ -4094,6 +4156,16 @@ int main(int argc, char* argv[]) {
 			Optional<Database> result = connectToCluster(clusterFile, localities, quiet);
 			if (result.present()) {
 				db = result.get();
+				// Make sure we are setting a transaction timeout and retry limit to prevent cases
+				// where the fdbbackup command hangs infinitely. 60 seconds should be more than
+				// enough for all cases to finish and 5 retries should also be good enough for
+				// most cases.
+				int64_t timeout = 60000;
+				db->setOption(FDBDatabaseOptions::TRANSACTION_TIMEOUT,
+				              Optional<StringRef>(StringRef((const uint8_t*)&timeout, sizeof(timeout))));
+				int64_t retryLimit = 5;
+				db->setOption(FDBDatabaseOptions::TRANSACTION_RETRY_LIMIT,
+				              Optional<StringRef>(StringRef((const uint8_t*)&retryLimit, sizeof(retryLimit))));
 			}
 
 			return result.present();
@@ -4110,6 +4182,16 @@ int main(int argc, char* argv[]) {
 			Optional<Database> result = connectToCluster(sourceClusterFile, localities, quiet);
 			if (result.present()) {
 				sourceDb = result.get();
+				// Make sure we are setting a transaction timeout and retry limit to prevent cases
+				// where the fdbbackup command hangs infinitely. 60 seconds should be more than
+				// enough for all cases to finish and 5 retries should also be good enough for
+				// most cases.
+				int64_t timeout = 60000;
+				sourceDb->setOption(FDBDatabaseOptions::TRANSACTION_TIMEOUT,
+				                    Optional<StringRef>(StringRef((const uint8_t*)&timeout, sizeof(timeout))));
+				int64_t retryLimit = 5;
+				sourceDb->setOption(FDBDatabaseOptions::TRANSACTION_RETRY_LIMIT,
+				                    Optional<StringRef>(StringRef((const uint8_t*)&retryLimit, sizeof(retryLimit))));
 			}
 
 			return result.present();
@@ -4145,6 +4227,7 @@ int main(int argc, char* argv[]) {
 		case ProgramExe::AGENT:
 			if (!initCluster())
 				return FDB_EXIT_ERROR;
+			fileBackupAgentProxy = proxy;
 			f = stopAfter(runAgent(db));
 			break;
 		case ProgramExe::BACKUP:
@@ -4166,7 +4249,8 @@ int main(int argc, char* argv[]) {
 				                           waitForDone,
 				                           stopWhenDone,
 				                           usePartitionedLog,
-				                           incrementalBackupOnly));
+				                           incrementalBackupOnly,
+				                           blobManifestUrl));
 				break;
 			}
 
@@ -4351,7 +4435,9 @@ int main(int argc, char* argv[]) {
 				                         removePrefix,
 				                         onlyApplyMutationLogs,
 				                         inconsistentSnapshotOnly,
-				                         encryptionKeyFile));
+				                         encryptionKeyFile,
+				                         blobManifestUrl));
+
 				break;
 			case RestoreType::WAIT:
 				f = stopAfter(success(ba.waitRestore(db, KeyRef(tagName), Verbose::True)));

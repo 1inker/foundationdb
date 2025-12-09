@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -26,6 +26,7 @@
 #include <map>
 #include <boost/preprocessor/facilities/is_empty.hpp>
 #include <boost/preprocessor/control/if.hpp>
+#include "flow/ActorContext.h"
 #include "flow/Platform.h"
 #include "flow/Knobs.h"
 #include "flow/FileIdentifier.h"
@@ -57,7 +58,7 @@ public:
 		serializer(ar, error_code);
 	}
 
-	Error() : error_code(invalid_error_code), flags(0) {}
+	Error();
 	explicit Error(int error_code);
 
 	static void init();
@@ -89,6 +90,19 @@ extern const std::set<int> transactionRetryableErrors;
 
 #include "error_definitions.h"
 
+class AttributeNotFoundError : public Error {
+	std::string missingAttribute;
+
+public:
+	AttributeNotFoundError(const std::string&);
+
+	const std::string& getMissingAttribute() const;
+};
+
+inline AttributeNotFoundError attribute_not_found_error(const std::string& attribute) {
+	return AttributeNotFoundError(attribute);
+}
+
 // actor_cancelled has been renamed
 inline Error actor_cancelled() {
 	return Error(error_code_operation_cancelled);
@@ -112,20 +126,20 @@ extern bool isAssertDisabled(int line);
 // #define ASSERT( condition ) ((void)0)
 #define ASSERT(condition)                                                                                              \
 	do {                                                                                                               \
-		if (!((condition) || isAssertDisabled(__LINE__))) {                                                            \
+		if (!((condition) || isAssertDisabled(__LINE__))) [[unlikely]] {                                               \
 			throw internal_error_impl(#condition, __FILE__, __LINE__);                                                 \
 		}                                                                                                              \
 	} while (false)
 #define ASSERT_ABORT(condition)                                                                                        \
 	do {                                                                                                               \
-		if (!((condition) || isAssertDisabled(__LINE__))) {                                                            \
+		if (!((condition) || isAssertDisabled(__LINE__))) [[unlikely]] {                                               \
 			internal_error_impl(#condition, __FILE__, __LINE__);                                                       \
 			abort();                                                                                                   \
 		}                                                                                                              \
 	} while (false) // For use in destructors, where throwing exceptions is extremely dangerous
 #define UNSTOPPABLE_ASSERT(condition)                                                                                  \
 	do {                                                                                                               \
-		if (!(condition)) {                                                                                            \
+		if (!(condition)) [[unlikely]] {                                                                               \
 			throw internal_error_impl(#condition, __FILE__, __LINE__);                                                 \
 		}                                                                                                              \
 	} while (false)

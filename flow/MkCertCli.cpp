@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -216,7 +216,8 @@ int main(int argc, char** argv) {
 				fmt::print(stderr, "ERROR: unknown option '{}'\n", args.OptionText());
 				return FDB_EXIT_ERROR;
 			default:
-				fmt::print(stderr, "ERROR: unknown error {} with option '{}'\n", err, args.OptionText());
+				fmt::print(
+				    stderr, "ERROR: unknown error {} with option '{}'\n", static_cast<int>(err), args.OptionText());
 				return FDB_EXIT_ERROR;
 			}
 		} else {

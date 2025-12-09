@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -127,6 +127,10 @@ class FDBTenant extends NativeObjectWrapper implements Tenant {
 		Transaction tr = null;
 		try {
 			tr = new FDBTransaction(Tenant_createTransaction(getPtr()), database, e, eventKeeper);
+			// In newer versions, this option is set as a default option on the database
+			if (FDB.instance().getAPIVersion() < 730) {
+				tr.options().setUsedDuringCommitProtectionDisable();
+			}
 			return tr;
 		} catch (RuntimeException err) {
 			if (tr != null) {

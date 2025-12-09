@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -26,6 +26,7 @@
 
 #include "fdbserver/Knobs.h"
 #include "fdbserver/ServerDBInfo.actor.h"
+#include "fdbserver/Status.actor.h"
 #include "fdbserver/WorkerInterface.actor.h"
 #include "fdbserver/workloads/workloads.actor.h"
 
@@ -192,10 +193,24 @@ struct EncryptKeyProxyTestWorkload : TestWorkload {
 			// BlobCipherKeyCache is 'empty'; fetching invalid cipher from KMS must through 'encrypt_key_not_found'
 			ASSERT(false);
 		} catch (Error& e) {
-			ASSERT(e.code() == error_code_encrypt_keys_fetch_failed);
+			ASSERT(e.code() == error_code_encrypt_key_not_found);
 		}
 
 		TraceEvent("SimLookupInvalidKeyIdDone");
+		return Void();
+	}
+
+	ACTOR Future<Void> simHealthyKms(EncryptKeyProxyTestWorkload* self) {
+		TraceEvent("SimHealthyKmsStart").log();
+		loop {
+			KMSHealthStatus status = wait(getKMSHealthStatus(self->dbInfo));
+			if (status.canConnectToKms && status.canConnectToEKP) {
+				ASSERT_GE(status.lastUpdatedTS, 0);
+				ASSERT_GE(now(), status.lastUpdatedTS);
+				break;
+			}
+			wait(delay(20.0));
+		}
 		return Void();
 	}
 
@@ -209,7 +224,7 @@ struct EncryptKeyProxyTestWorkload : TestWorkload {
 		// Ensure EncryptKeyProxy role is recruited (a singleton role)
 		self->numDomains = self->maxDomainId - self->minDomainId;
 
-		while (!self->dbInfo->get().encryptKeyProxy.present()) {
+		while (!self->dbInfo->get().client.encryptKeyProxy.present()) {
 			wait(self->dbInfo->onChange());
 		}
 
@@ -224,6 +239,11 @@ struct EncryptKeyProxyTestWorkload : TestWorkload {
 
 		// Simulate lookup BaseCipherIds which aren't yet cached
 		wait(self->simLookupInvalidKeyId(self));
+
+		// Simulate getting health status for healthy KMS
+		wait(self->simHealthyKms(self));
+
+		// TODO: Test unhealthy kms status when we implement kms http server in simulation
 
 		return Void();
 	}

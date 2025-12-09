@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -52,7 +52,7 @@ struct BlobWorkerStats {
 	int64_t numRangesAssigned;
 	int64_t mutationBytesBuffered;
 	int activeReadRequests;
-	// TODO: add gauge for granules blocking on old snapshots, once this guage is fixed
+	// TODO: add gauge for granules blocking on old snapshots, once this gauge is fixed
 	int granulesPendingSplitCheck;
 	Version minimumCFVersion;
 	Version cfVersionLag;

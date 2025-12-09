@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -148,7 +148,7 @@ struct BulkSetupWorkload : TestWorkload {
 		for (i = 0; i < workload->tenants.size(); i++) {
 			state Reference<Tenant> tenant = workload->tenants[i];
 			std::vector<KeyValueRef> keysForCurTenant = wait(getKVPairsForTenant(workload, tenant, cx));
-			if (tenantIdsToDrop.count(tenant->id())) {
+			if (tenantIdsToDrop.contains(tenant->id())) {
 				// Don't check the tenants that the EKP would throw errors for
 				continue;
 			}

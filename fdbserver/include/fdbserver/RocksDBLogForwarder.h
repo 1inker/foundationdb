@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -24,9 +24,8 @@
 #include <cstdarg>
 #include <thread>
 
-#ifdef SSD_ROCKSDB_EXPERIMENTAL
+#ifdef WITH_ROCKSDB
 #include <rocksdb/env.h>
-#endif
 
 #include "flow/genericactors.actor.h"
 #include "flow/IRandom.h"
@@ -43,7 +42,7 @@ struct RocksDBLogRecord {
 	std::vector<std::pair<std::string, std::string>> kvPairs;
 };
 
-// Stores RocksDB log lines for furthur consumption.
+// Stores RocksDB log lines for further consumption.
 // *NOTE* This logger *MUST* run in a thread that is able to generate TraceEvents, e.g. in the event loop thread.
 class RocksDBLogger {
 	// The mutex that protects log records, as RocksDB is multi-threaded
@@ -92,8 +91,10 @@ public:
 	// Writes an entry to the log file
 	virtual void Logv(const char* format, va_list ap);
 
-	// Writes an entry to the log file, with a specificied log level
+	// Writes an entry to the log file, with a specified log level
 	virtual void Logv(const rocksdb::InfoLogLevel log_level, const char* format, va_list ap);
 };
+
+#endif // WITH_ROCKSDB
 
 #endif // __ROCKSDB_LOG_FORWARDER_H__

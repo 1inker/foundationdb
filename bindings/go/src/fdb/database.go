@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2018 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,7 +22,7 @@
 
 package fdb
 
-// #define FDB_API_VERSION 720
+// #define FDB_API_VERSION 740
 // #include <foundationdb/fdb_c.h>
 import "C"
 
@@ -61,29 +61,27 @@ type DatabaseOptions struct {
 }
 
 // Close will close the Database and clean up all resources.
-// You have to ensure that you're not resuing this database.
-func (d *Database) Close() {
+// It must be called exactly once for each created database.
+// You have to ensure that you're not reusing this database
+// after it has been closed.
+func (d Database) Close() {
 	// Remove database object from the cached databases
 	if d.isCached {
-		delete(openDatabases, d.clusterFile)
+		openDatabases.Delete(d.clusterFile)
+	}
+
+	if d.ptr == nil {
+		return
 	}
 
 	// Destroy the database
-	d.destroy()
+	C.fdb_database_destroy(d.ptr)
 }
 
 func (opt DatabaseOptions) setOpt(code int, param []byte) error {
 	return setOpt(func(p *C.uint8_t, pl C.int) C.fdb_error_t {
 		return C.fdb_database_set_option(opt.d.ptr, C.FDBDatabaseOption(code), p, pl)
 	}, param)
-}
-
-func (d *database) destroy() {
-	if d.ptr == nil {
-		return
-	}
-
-	C.fdb_database_destroy(d.ptr)
 }
 
 // CreateTransaction returns a new FoundationDB transaction. It is generally
@@ -98,6 +96,9 @@ func (d Database) CreateTransaction() (Transaction, error) {
 	}
 
 	t := &transaction{outt, d}
+	// transactions cannot be destroyed explicitly if any future is still potentially used
+	// thus the GC is used to figure out when all Go wrapper objects for futures have gone out of scope,
+	// making the transaction ready to be garbage-collected.
 	runtime.SetFinalizer(t, (*transaction).destroy)
 
 	return Transaction{t}, nil
@@ -110,13 +111,16 @@ func (d Database) CreateTransaction() (Transaction, error) {
 // process address is the form of IP:Port pair.
 func (d Database) RebootWorker(address string, checkFile bool, suspendDuration int) error {
 	t := &futureInt64{
-		future: newFuture(C.fdb_database_reboot_worker(
-			d.ptr,
-			byteSliceToPtr([]byte(address)),
-			C.int(len(address)),
-			C.fdb_bool_t(boolToInt(checkFile)),
-			C.int(suspendDuration),
-		),
+		future: newFutureWithDb(
+			d.database,
+			nil,
+			C.fdb_database_reboot_worker(
+				d.ptr,
+				byteSliceToPtr([]byte(address)),
+				C.int(len(address)),
+				C.fdb_bool_t(boolToInt(checkFile)),
+				C.int(suspendDuration),
+			),
 		),
 	}
 
@@ -209,6 +213,7 @@ func (d Database) Transact(f func(Transaction) (interface{}, error)) (interface{
 //
 // The transaction is retried if the error is or wraps a retryable Error.
 // The error is unwrapped.
+// Read transactions are never committed and destroyed before returning to caller.
 //
 // Do not return Future objects from the function provided to ReadTransact. The
 // Transaction created by ReadTransact may be finalized at any point after
@@ -220,8 +225,8 @@ func (d Database) Transact(f func(Transaction) (interface{}, error)) (interface{
 // Transaction, Snapshot and Database objects.
 func (d Database) ReadTransact(f func(ReadTransaction) (interface{}, error)) (interface{}, error) {
 	tr, e := d.CreateTransaction()
-	// Any error here is non-retryable
 	if e != nil {
+		// Any error here is non-retryable
 		return nil, e
 	}
 
@@ -230,9 +235,8 @@ func (d Database) ReadTransact(f func(ReadTransaction) (interface{}, error)) (in
 
 		ret, e = f(tr)
 
-		if e == nil {
-			e = tr.Commit().Get()
-		}
+		// read-only transactions are not committed and will be destroyed automatically via GC,
+		// once all the futures go out of scope
 
 		return
 	}

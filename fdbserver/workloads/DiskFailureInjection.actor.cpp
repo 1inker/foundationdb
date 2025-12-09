@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -181,7 +181,7 @@ struct DiskFailureInjectionWorkload : FailureInjectionWorkload {
 		}
 	}
 
-	// Resend the chaos event to previosuly chosen workers, in case some workers got restarted and lost their chaos
+	// Resend the chaos event to previously chosen workers, in case some workers got restarted and lost their chaos
 	// config
 	ACTOR static Future<Void> reSendChaos(DiskFailureInjectionWorkload* self) {
 		state int throttledWorkers = 0;
@@ -194,11 +194,10 @@ struct DiskFailureInjectionWorkload : FailureInjectionWorkload {
 		TraceEvent("ResendChaos")
 		    .detail("ChosenWorkersSize", self->chosenWorkers.size())
 		    .detail("FoundWorkers", workersMap.size())
-		    .detail(
-		        "ResendToNumber",
-		        std::count_if(self->chosenWorkers.begin(),
-		                      self->chosenWorkers.end(),
-		                      [&map = std::as_const(workersMap)](auto const& addr) { return map.count(addr) > 0; }));
+		    .detail("ResendToNumber",
+		            std::count_if(self->chosenWorkers.begin(),
+		                          self->chosenWorkers.end(),
+		                          [&map = std::as_const(workersMap)](auto const& addr) { return map.contains(addr); }));
 		for (auto& workerAddress : self->chosenWorkers) {
 			auto itr = workersMap.find(workerAddress);
 			if (itr != workersMap.end()) {

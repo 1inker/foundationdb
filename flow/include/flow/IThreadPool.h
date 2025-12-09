@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -108,6 +108,7 @@ public:
 		                                                    : TaskPriority::DefaultOnMainThread);
 	}
 	bool isValid() const { return promise.isValid(); }
+	bool canBeSet() const { return promise.canBeSet(); }
 
 private:
 	Promise<T> promise;
@@ -153,6 +154,7 @@ public:
 	void addThread(IThreadPoolReceiver* userData, const char* name = nullptr) override {
 		ASSERT(!thread);
 		thread = userData;
+		userData->init();
 	}
 	void post(PThreadAction action) override {
 		try {
